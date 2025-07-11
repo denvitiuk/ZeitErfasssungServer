@@ -22,8 +22,12 @@ fun Application.configureDatabases() {
     }
     val ds = HikariDataSource(config)
     Database.connect(ds)
-    Flyway.configure()
-        .dataSource(ds)
-        .load()
-        .migrate()
+    try {
+        Flyway.configure()
+            .dataSource(ds)
+            .load()
+            .migrate()
+    } catch (e: Exception) {
+        log.warn("Flyway skipped: ${e.message}")
+    }
 }
