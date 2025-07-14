@@ -12,10 +12,10 @@ import com.yourcompany.zeiterfassung.dto.SendCodeDTO
 import com.yourcompany.zeiterfassung.dto.VerifyCodeDTO
 import com.yourcompany.zeiterfassung.dto.RegisterDTO
 import com.yourcompany.zeiterfassung.dto.LoginDTO
-import com.yourcompany.zeiterfassung.verificationCodeCache
-
 import com.twilio.rest.api.v2010.account.Message
 import com.twilio.type.PhoneNumber
+import com.twilio.rest.verify.v2.service.Verification
+import com.twilio.rest.verify.v2.service.VerificationCheck
 
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.insertAndGetId
@@ -37,31 +37,35 @@ import java.util.Date
 /**
  * Handles user registration, phone verification, and login routes.
  */
-fun Route.authRoutes(fromNumber: String) {
+fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
     // 1) Send verification code
     route("/send-code") {
         post {
             val dto = call.receive<SendCodeDTO>()
-            val code = (100000..999999).random().toString()
-            verificationCodeCache.put(dto.phone, code)
 
-            Message.creator(
-                PhoneNumber(dto.phone),
-                PhoneNumber(fromNumber),
-                "Ihr Verifizierungscode Scheiße: $code"
+            // Use Twilio Verify service to send SMS code
+            Verification.creator(
+                verifyServiceSid,
+                dto.phone,
+                "sms"
             ).create()
 
             call.respond(HttpStatusCode.OK, mapOf("sent" to true))
         }
     }
 
-    // 2) Verify code
+    // 2) Verify code via Twilio Verify API
     route("/verify-code") {
         post {
             val dto = call.receive<VerifyCodeDTO>()
-            val cached = verificationCodeCache.getIfPresent(dto.phone)
-            if (cached == dto.code) {
-                verificationCodeCache.invalidate(dto.phone)
+
+            // Call Twilio Verify to check the code
+            val check = VerificationCheck.creator(verifyServiceSid)
+                .setTo(dto.phone)
+                .setCode(dto.code)
+                .create()
+
+            if (check.status == "approved") {
                 transaction {
                     Users.update({ Users.phone eq dto.phone }) {
                         it[Users.phoneVerified] = true

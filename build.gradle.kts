@@ -15,6 +15,10 @@ plugins {
     application
 }
 
+tasks.test {
+    environment("JWT_REALM", "zeiterfassung")
+}
+
 group = "com.yourcompany.zeiterfassung"
 version = "0.0.1"
 
@@ -77,4 +81,7 @@ dependencies {
     implementation("org.jetbrains.exposed:exposed-java-time:$exposed_version")
 
     implementation("at.favre.lib:bcrypt:0.9.0")
+
+    implementation("io.ktor:ktor-server-status-pages-jvm:${ktor_version}")
+
 }

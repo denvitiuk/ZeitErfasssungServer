@@ -1,4 +1,3 @@
-
 package com.yourcompany.zeiterfassung
 
 import io.github.cdimascio.dotenv.dotenv
@@ -23,6 +22,17 @@ import com.yourcompany.zeiterfassung.routes.authRoutes
 import com.yourcompany.zeiterfassung.routes.qrRoutes
 import com.yourcompany.zeiterfassung.routes.scanRoutes
 import com.yourcompany.zeiterfassung.routes.logsRoutes
+import io.ktor.http.HttpStatusCode
+import io.ktor.server.plugins.BadRequestException
+import io.ktor.server.plugins.statuspages.*
+import io.ktor.server.response.*
+
+
+
+
+
+
+
 
 // In-memory cache for phone verification codes (5-minute TTL)
 val verificationCodeCache: Cache<String, String> = Caffeine.newBuilder()
@@ -47,7 +57,23 @@ fun Application.module() {
         allowHeader(HttpHeaders.Authorization)
     }
 
-    // Load environment variables (.env or system) and Twilio configuration
+    // ✅ 3. Error handling
+    install(StatusPages) {
+        exception<BadRequestException> { call, cause ->
+            call.respond(
+                HttpStatusCode.BadRequest,
+                mapOf("error" to (cause.message ?: "Некорректный запрос"))
+            )
+        }
+        exception<Throwable> { call, cause ->
+            call.respond(
+                HttpStatusCode.InternalServerError,
+                mapOf("error" to (cause.message ?: "Неизвестная ошибка"))
+            )
+        }
+    }
+
+    // 4. Load environment variables and Twilio configuration
     val env = dotenv {
         ignoreIfMalformed = true
         ignoreIfMissing   = true
@@ -55,23 +81,26 @@ fun Application.module() {
     val config = environment.config
     val twilioSid   = config.propertyOrNull("twilio.accountSid")?.getString()
         ?: env["TWILIO_SID"] ?: error("TWILIO_SID is not configured")
+    val verifyServiceSid = env["TWILIO_VERIFY_SERVICE_SID"]
+        ?: error("TWILIO_VERIFY_SERVICE_SID is not configured")
     val twilioToken = config.propertyOrNull("twilio.authToken")?.getString()
         ?: env["TWILIO_TOKEN"] ?: error("TWILIO_TOKEN is not configured")
     val twilioFrom  = config.propertyOrNull("twilio.fromNumber")?.getString()
-        ?: env["TWILIO_FROM"] ?: error("TWILIO_FROM is not configured")
-    // Initialize Twilio SDK
+        ?: env["TWILIO_PHONE_NUMBER"] ?: error("TWILIO_PHONE_NUMBER is not configured")
+
     Twilio.init(twilioSid, twilioToken)
 
-    // 3. JWT authentication
+    // 5. JWT authentication
     install(Authentication) {
         jwt("bearerAuth") {
-            realm = this@module.environment.config.property("ktor.jwt.realm").getString()
-            // Read JWT settings from HOCON
+            realm = config.propertyOrNull("ktor.jwt.realm")?.getString()
+                ?: env["JWT_REALM"] ?: error("ktor.jwt.realm is not configured")
+
             val jwtConfig = this@module.environment.config.config("ktor.jwt")
             val secret = jwtConfig.property("secret").getString()
             val issuer = jwtConfig.property("issuer").getString()
             val audience = jwtConfig.property("audience").getString()
-            // Configure the JWT verifier
+
             verifier(
                 JWT.require(Algorithm.HMAC256(secret))
                     .withIssuer(issuer)
@@ -79,20 +108,20 @@ fun Application.module() {
                     .build()
             )
             validate { credential ->
-                if (credential.payload.getClaim("id").asString() != null) JWTPrincipal(credential.payload) else null
+                if (credential.payload.getClaim("id").asString() != null)
+                    JWTPrincipal(credential.payload)
+                else null
             }
         }
     }
 
-    // 4. Database initialization
+    // 6. Database initialization
     configureDatabases()
 
-    // 5. Routing
+    // 7. Routing
     routing {
-        // Public
-        authRoutes(twilioFrom)
+        authRoutes(twilioFrom, verifyServiceSid)
 
-        // Protected
         authenticate("bearerAuth") {
             qrRoutes()
             scanRoutes()
@@ -100,3 +129,4 @@ fun Application.module() {
         }
     }
 }
+
