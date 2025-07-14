@@ -10,15 +10,15 @@ import io.ktor.http.HttpStatusCode
 
 import com.yourcompany.zeiterfassung.dto.SendCodeDTO
 import com.yourcompany.zeiterfassung.dto.VerifyCodeDTO
-import com.yourcompany.zeiterfassung.dto.RegisterDTO
+import com.yourcompany.zeiterfassung.dto.RegisterUnverifiedDTO
+import com.yourcompany.zeiterfassung.dto.RegisterUnverifiedResponse
+import com.yourcompany.zeiterfassung.dto.CompleteRegistrationDTO
 import com.yourcompany.zeiterfassung.dto.LoginDTO
-import com.twilio.rest.api.v2010.account.Message
-import com.twilio.type.PhoneNumber
 import com.twilio.rest.verify.v2.service.Verification
 import com.twilio.rest.verify.v2.service.VerificationCheck
 
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.sql.insertAndGetId
+import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.update
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -26,40 +26,43 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import com.yourcompany.zeiterfassung.db.Users
 import at.favre.lib.crypto.bcrypt.BCrypt
 import java.time.LocalDate
-import org.jetbrains.exposed.exceptions.ExposedSQLException
-
 import com.auth0.jwt.JWT
 import com.auth0.jwt.algorithms.Algorithm
 import java.util.Date
 
-
-
-/**
- * Handles user registration, phone verification, and login routes.
- */
 fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
-    // 1) Send verification code
+
+    // Phase 1: Register unverified user
+    route("/register-unverified") {
+        post {
+            val dto = call.receive<RegisterUnverifiedDTO>()
+            val phone = dto.phone.takeIf { it.isNotBlank() }
+                ?: return@post call.respond(HttpStatusCode.BadRequest, "Phone is required")
+
+            transaction {
+                Users.insert {
+                    it[Users.phone] = phone
+                    it[Users.phoneVerified] = false
+                }
+            }
+
+            call.respond(HttpStatusCode.Created, RegisterUnverifiedResponse(phone))
+        }
+    }
+
+    // Phase 2: Send verification code
     route("/send-code") {
         post {
             val dto = call.receive<SendCodeDTO>()
-
-            // Use Twilio Verify service to send SMS code
-            Verification.creator(
-                verifyServiceSid,
-                dto.phone,
-                "sms"
-            ).create()
-
+            val resp = Verification.creator(verifyServiceSid, dto.phone, "sms").create()
             call.respond(HttpStatusCode.OK, mapOf("sent" to true))
         }
     }
 
-    // 2) Verify code via Twilio Verify API
+    // Phase 3: Verify code and mark phoneVerified = true
     route("/verify-code") {
         post {
             val dto = call.receive<VerifyCodeDTO>()
-
-            // Call Twilio Verify to check the code
             val check = VerificationCheck.creator(verifyServiceSid)
                 .setTo(dto.phone)
                 .setCode(dto.code)
@@ -78,99 +81,71 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
         }
     }
 
-    // 3) User registration
-    route("/register") {
+    // Phase 4: Complete registration with full profile
+    route("/complete-registration") {
         post {
-            val dto = call.receive<RegisterDTO>()
+            val dto = call.receive<CompleteRegistrationDTO>()
 
-            // 3.1: Phone must be present
-            val phone = dto.phone?.takeIf { it.isNotBlank() }
-                ?: return@post call.respond(HttpStatusCode.BadRequest, "Phone number is required")
-
-            // 3.2: Phone must be verified
-            val phoneVerified = transaction {
-                Users.slice(Users.phoneVerified)
-                    .select { Users.phone eq phone }
-                    .firstOrNull()?.get(Users.phoneVerified) ?: false
-            }
-            if (!phoneVerified) {
-                return@post call.respond(HttpStatusCode.Forbidden, "Phone not verified")
+            // Check phone is verified
+            val isVerified = transaction {
+                Users.select { Users.phone eq dto.phone }
+                    .map { it[Users.phoneVerified] }
+                    .singleOrNull() ?: false
             }
 
-            // 3.3: Email must be unique
-            val emailTaken = transaction {
-                Users.select { Users.email eq dto.email }.any()
-            }
-            if (emailTaken) {
-                return@post call.respond(HttpStatusCode.Conflict, "Email already registered")
+            if (!isVerified) {
+                return@post call.respond(HttpStatusCode.BadRequest, "Phone not verified")
             }
 
-            // 3.4: Parse and validate birthDate
+            // Validate birthDate
             val birthDate = try {
                 LocalDate.parse(dto.birthDate)
             } catch (e: Exception) {
                 return@post call.respond(HttpStatusCode.BadRequest, "Invalid birthDate format, expected YYYY-MM-DD")
             }
 
-            // 3.5: Hash password
+            // Hash password
             val passwordHash = BCrypt.withDefaults()
                 .hashToString(12, dto.password.toCharArray())
 
-            // 3.6: Insert user
-            val userId = try {
-                transaction {
-                    Users.insertAndGetId { stmt ->
-                        stmt[Users.firstName]     = dto.firstName
-                        stmt[Users.lastName]      = dto.lastName
-                        stmt[Users.birthDate]     = birthDate
-                        stmt[Users.email]         = dto.email
-                        stmt[Users.password]      = passwordHash
-                        stmt[Users.phone]         = phone
-                        stmt[Users.phoneVerified] = true
-                    }.value
+            // Update user record
+            transaction {
+                Users.update({ Users.phone eq dto.phone }) {
+                    it[Users.firstName] = dto.firstName
+                    it[Users.lastName] = dto.lastName
+                    it[Users.email] = dto.email
+                    it[Users.password] = passwordHash
+                    it[Users.birthDate] = birthDate
                 }
-            } catch (ex: ExposedSQLException) {
-                return@post call.respond(HttpStatusCode.Conflict, "Registration failed: ${ex.localizedMessage}")
             }
 
-            call.respond(
-                HttpStatusCode.Created,
-                mapOf("id" to userId, "email" to dto.email)
-            )
+            call.respond(HttpStatusCode.OK, mapOf("completed" to true))
         }
     }
 
-    // 4) Login (stub)
+    // Login route
     route("/login") {
         post {
             val dto = call.receive<LoginDTO>()
-            // 1) Найти пользователя по email
-            val userRow = transaction {
-                Users.select { Users.email eq dto.email }
-                    .firstOrNull()
-            }
-            if (userRow == null) {
-                call.respond(HttpStatusCode.Unauthorized, "Invalid email or password")
-                return@post
-            }
-            // 2) Проверить пароль
-            val storedHash = userRow[Users.password]
-            val result = BCrypt.verifyer().verify(dto.password.toCharArray(), storedHash)
+            val user = transaction {
+                Users.select { Users.email eq dto.email }.firstOrNull()
+            } ?: return@post call.respond(HttpStatusCode.Unauthorized, "Invalid email or password")
+
+            val result = BCrypt.verifyer().verify(dto.password.toCharArray(), user[Users.password])
             if (!result.verified) {
-                call.respond(HttpStatusCode.Unauthorized, "Invalid email or password")
-                return@post
+                return@post call.respond(HttpStatusCode.Unauthorized, "Invalid email or password")
             }
-            // 3) Сгенерировать JWT
+
             val jwtConfig = call.application.environment.config.config("ktor.jwt")
-            val issuer     = jwtConfig.property("issuer").getString()
-            val audience   = jwtConfig.property("audience").getString()
-            val secret     = jwtConfig.property("secret").getString()
-            val expiresIn  = jwtConfig.property("validityMs").getString().toLong()
+            val issuer = jwtConfig.property("issuer").getString()
+            val audience = jwtConfig.property("audience").getString()
+            val secret = jwtConfig.property("secret").getString()
+            val expiresIn = jwtConfig.property("validityMs").getString().toLong()
 
             val token = JWT.create()
                 .withIssuer(issuer)
                 .withAudience(audience)
-                .withClaim("id", userRow[Users.id].toString())
+                .withClaim("id", user[Users.id].toString())
                 .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
                 .sign(Algorithm.HMAC256(secret))
 

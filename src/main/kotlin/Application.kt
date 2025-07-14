@@ -26,12 +26,7 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.plugins.statuspages.*
 import io.ktor.server.response.*
-
-
-
-
-
-
+import kotlinx.serialization.json.Json
 
 
 // In-memory cache for phone verification codes (5-minute TTL)
@@ -46,7 +41,9 @@ fun main(args: Array<String>) {
 fun Application.module() {
     // 1. JSON serialization
     install(ContentNegotiation) {
-        json()
+        json(Json {
+            ignoreUnknownKeys = true
+        })
     }
 
     // 2. CORS

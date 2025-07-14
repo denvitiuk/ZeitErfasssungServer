@@ -1,15 +1,14 @@
-// src/main/kotlin/com/yourcompany/zeiterfassung/dto/RegisterDTO.kt
 package com.yourcompany.zeiterfassung.dto
 
 import kotlinx.serialization.Serializable
 
 @Serializable
-data class RegisterDTO(
-
+data class RegisterResponse(
+    val id: Int,
+    val email: String,
     val firstName: String,
     val lastName: String,
+    val phone: String,
     val birthDate: String,
-    val email: String,
-    val password: String,
-    val phone: String? = null
+    val password: String? = null
 )
