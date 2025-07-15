@@ -127,13 +127,26 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
     route("/login") {
         post {
             val dto = call.receive<LoginDTO>()
+                // Server-seitige Validierung: Pflichtfelder dürfen nicht leer sein
+                if (dto.email.isBlank() || dto.password.isBlank()) {
+                    return@post call.respond(
+                        HttpStatusCode.BadRequest,
+                        mapOf("error" to "E-Mail und Passwort dürfen nicht leer sein")
+                    )
+                }
             val user = transaction {
                 Users.select { Users.email eq dto.email }.firstOrNull()
-            } ?: return@post call.respond(HttpStatusCode.Unauthorized, "Invalid email or password")
+            } ?: return@post call.respond(
+                HttpStatusCode.Unauthorized,
+                mapOf("error" to "Ungültige E-Mail oder Passwort")
+            )
 
             val result = BCrypt.verifyer().verify(dto.password.toCharArray(), user[Users.password])
             if (!result.verified) {
-                return@post call.respond(HttpStatusCode.Unauthorized, "Invalid email or password")
+                return@post call.respond(
+                    HttpStatusCode.Unauthorized,
+                    mapOf("error" to "Ungültige E-Mail oder Passwort")
+                )
             }
 
             val jwtConfig = call.application.environment.config.config("ktor.jwt")
