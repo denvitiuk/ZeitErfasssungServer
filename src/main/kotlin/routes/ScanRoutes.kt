@@ -11,10 +11,14 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneOffset
+import java.time.ZoneId
 import com.yourcompany.zeiterfassung.dto.ScanRequest
 import com.yourcompany.zeiterfassung.dto.ScanResponse
 import com.yourcompany.zeiterfassung.models.Logs
 import com.yourcompany.zeiterfassung.models.Nonces
+
+import java.time.LocalDate
+import org.jetbrains.exposed.sql.SortOrder
 
 /**
  * Handles scanning of QR codes (in/out actions).
@@ -42,14 +46,27 @@ fun Route.scanRoutes() {
                             (Nonces.userId eq userId)
                 }.firstOrNull() ?: return@transaction null
 
-                // Пока присваиваем одно и то же действие, позже настроим in/out-логику
-                val action = "in"
+                // Определяем начало сегодняшнего дня (LocalDateTime)
+                val todayStart = LocalDate.now().atStartOfDay()
+
+                // Получаем последний лог этого пользователя за сегодня
+                val lastAction = Logs.select {
+                    (Logs.userId eq userId) and
+                    (Logs.timestamp greaterEq todayStart)
+                }
+                .orderBy(Logs.timestamp, SortOrder.DESC)
+                .limit(1)
+                .map { it[Logs.action] }
+                .firstOrNull()
+
+                // Выбираем новое действие: если был "in" — ставим "out", иначе "in"
+                val action = if (lastAction == "in") "out" else "in"
 
                 Logs.insert {
                     it[Logs.userId]        = userId
                     it[Logs.terminalNonce] = req.nonce
                     it[Logs.action]        = action
-                    it[Logs.timestamp]     = LocalDateTime.ofInstant(now, ZoneOffset.UTC)
+                    it[Logs.timestamp]     = LocalDateTime.ofInstant(now, ZoneId.systemDefault())
                     it[Logs.latitude]      = req.latitude
                     it[Logs.longitude]     = req.longitude
                     it[Logs.locationDesc]  = req.locationDescription

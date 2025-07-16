@@ -10,6 +10,7 @@ import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.transaction
 import com.yourcompany.zeiterfassung.models.Logs
 import java.time.ZoneOffset
+import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 /**
@@ -32,7 +33,8 @@ fun Route.logsRoutes() {
                             employeeId = it[Logs.userId].toString(),
                             action = it[Logs.action],
                             timestamp = it[Logs.timestamp]
-                                .atOffset(ZoneOffset.UTC)
+                                .atZone(ZoneOffset.UTC)
+                                .withZoneSameInstant(ZoneId.systemDefault())
                                 .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
                         )
                     }

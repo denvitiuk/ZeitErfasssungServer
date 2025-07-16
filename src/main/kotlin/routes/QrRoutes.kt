@@ -11,6 +11,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneOffset
+import java.time.ZoneId
 import java.util.UUID
 import java.io.ByteArrayOutputStream
 import java.util.Base64
@@ -36,7 +37,7 @@ fun Route.qrRoutes() {
             transaction {
                 Nonces.insert {
                     it[Nonces.nonce]     = newNonce
-                    it[Nonces.createdAt] = LocalDateTime.ofInstant(createdAt, ZoneOffset.UTC)
+                    it[Nonces.createdAt] = LocalDateTime.ofInstant(createdAt, ZoneId.systemDefault())
                     it[Nonces.used]      = false
                     it[Nonces.userId]    = userId
                     it[Nonces.workDate]  = LocalDate.now()
