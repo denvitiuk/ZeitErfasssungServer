@@ -13,7 +13,7 @@ object Nonces : Table("nonces") {
     val used      = bool("used").default(false)
     val userId    = integer("user_id").references(Users.id)
     val workDate  = date("work_date")
-    val action    = varchar("action", 64)
+    val action    = varchar("action", 10).nullable()
 
     override val primaryKey = PrimaryKey(nonce, name = "pk_nonces")
 }

@@ -35,13 +35,15 @@ fun Route.scanRoutes() {
 
             // 3. Транзакционно проверяем nonce, пишем лог, помечаем used и возвращаем action
             val actionPerformed: String? = transaction {
-                val row = Nonces.select {
+                // Проверяем, что nonce существует и не был использован
+                Nonces.select {
                     (Nonces.nonce eq req.nonce) and
-                    (Nonces.used eq false) and
-                    (Nonces.userId eq userId)
+                            (Nonces.used eq false) and
+                            (Nonces.userId eq userId)
                 }.firstOrNull() ?: return@transaction null
 
-                val action = row[Nonces.action]
+                // Пока присваиваем одно и то же действие, позже настроим in/out-логику
+                val action = "in"
 
                 Logs.insert {
                     it[Logs.userId]        = userId
@@ -59,6 +61,7 @@ fun Route.scanRoutes() {
 
                 action
             }
+
 
             if (actionPerformed == null) {
                 call.respond(
