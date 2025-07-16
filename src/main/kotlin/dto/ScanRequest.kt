@@ -5,5 +5,8 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class ScanRequest(
-    val nonce: String
+    val nonce: String,
+    val latitude: Double,
+    val longitude: Double,
+    val locationDescription: String? = null
 )

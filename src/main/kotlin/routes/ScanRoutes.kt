@@ -1,24 +1,79 @@
-// src/main/kotlin/com/yourcompany/zeiterfassung/routes/ScanRoutes.kt
 package com.yourcompany.zeiterfassung.routes
 
-import io.ktor.server.application.*
+import io.ktor.http.*
+import io.ktor.server.auth.*
+import io.ktor.server.auth.jwt.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import com.yourcompany.zeiterfassung.dto.*
+import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.transactions.transaction
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.ZoneOffset
+import com.yourcompany.zeiterfassung.dto.ScanRequest
+import com.yourcompany.zeiterfassung.dto.ScanResponse
+import com.yourcompany.zeiterfassung.models.Logs
+import com.yourcompany.zeiterfassung.models.Nonces
 
 /**
  * Handles scanning of QR codes (in/out actions).
  */
 fun Route.scanRoutes() {
-    post("/scan") {
-        val req = call.receive<ScanRequest>()
-        // TODO: validate nonce, record log
-        call.respond(
-            ScanResponse(
-                status = "ok",
-                timestamp = java.time.Instant.now().toString()
-            )
-        )
+    authenticate("bearerAuth") {
+        post("/scan") {
+            // 1. Получаем userId из JWT
+            val principal = call.principal<JWTPrincipal>()!!
+            val userId = principal.payload
+                .getClaim("id")
+                .asString()
+                .toInt()
+
+            // 2. Читаем тело запроса
+            val req = call.receive<ScanRequest>()
+            val now = Instant.now()
+
+            // 3. Транзакционно проверяем nonce, пишем лог, помечаем used и возвращаем action
+            val actionPerformed: String? = transaction {
+                val row = Nonces.select {
+                    (Nonces.nonce eq req.nonce) and
+                    (Nonces.used eq false) and
+                    (Nonces.userId eq userId)
+                }.firstOrNull() ?: return@transaction null
+
+                val action = row[Nonces.action]
+
+                Logs.insert {
+                    it[Logs.userId]        = userId
+                    it[Logs.terminalNonce] = req.nonce
+                    it[Logs.action]        = action
+                    it[Logs.timestamp]     = LocalDateTime.ofInstant(now, ZoneOffset.UTC)
+                    it[Logs.latitude]      = req.latitude
+                    it[Logs.longitude]     = req.longitude
+                    it[Logs.locationDesc]  = req.locationDescription
+                }
+
+                Nonces.update({ Nonces.nonce eq req.nonce }) {
+                    it[Nonces.used] = true
+                }
+
+                action
+            }
+
+            if (actionPerformed == null) {
+                call.respond(
+                    HttpStatusCode.BadRequest,
+                    mapOf("error" to "invalid_or_used_nonce")
+                )
+            } else {
+                call.respond(
+                    ScanResponse(
+                        status = "ok",
+                        timestamp = now.toString(),
+                        action = actionPerformed
+                    )
+                )
+            }
+        }
     }
 }

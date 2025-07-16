@@ -6,5 +6,6 @@ import kotlinx.serialization.Serializable
 @Serializable
 data class ScanResponse(
     val status: String,
-    val timestamp: String
+    val timestamp: String,
+    val action : String
 )
