@@ -13,6 +13,8 @@ import com.yourcompany.zeiterfassung.dto.RegisterUnverifiedDTO
 import com.yourcompany.zeiterfassung.dto.RegisterUnverifiedResponse
 import com.yourcompany.zeiterfassung.dto.CompleteRegistrationDTO
 import com.yourcompany.zeiterfassung.dto.LoginDTO
+import com.yourcompany.zeiterfassung.dto.ChangePasswordRequest
+import com.yourcompany.zeiterfassung.dto.ChangePasswordResponse
 import com.twilio.rest.verify.v2.service.Verification
 import com.twilio.rest.verify.v2.service.VerificationCheck
 
@@ -285,6 +287,42 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     }
                 }
                 call.respond(HttpStatusCode.OK, mapOf("avatar_url" to avatarUrl))
+            }
+        }
+
+        // Change password
+        route("/change-password") {
+            post {
+                val principal = call.principal<JWTPrincipal>()!!
+                val userId = principal.payload.getClaim("id").asString().toInt()
+                val req = call.receive<ChangePasswordRequest>()
+
+                // Perform password change inside a DB transaction and return a status code
+                val response = transaction {
+                    // Fetch the user
+                    val row = Users.select { Users.id eq userId }.singleOrNull()
+                        ?: return@transaction ChangePasswordResponse("user_not_found") to HttpStatusCode.NotFound
+
+                    // Verify current password
+                    val result = BCrypt.verifyer()
+                        .verify(req.currentPassword.toCharArray(), row[Users.password].toCharArray())
+                    if (!result.verified) {
+                        return@transaction ChangePasswordResponse("invalid_current_password") to HttpStatusCode.Unauthorized
+                    }
+
+                    // Hash and update new password
+                    val newHash = BCrypt.withDefaults()
+                        .hashToString(12, req.newPassword.toCharArray())
+                    Users.update({ Users.id eq userId }) {
+                        it[Users.password] = newHash
+                    }
+
+                    // On success
+                    ChangePasswordResponse("ok") to HttpStatusCode.OK
+                }
+
+                // Respond using the captured Pair
+                call.respond(response.second, response.first)
             }
         }
     }
