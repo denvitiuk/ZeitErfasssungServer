@@ -45,6 +45,10 @@ dependencies {
     implementation("io.ktor:ktor-server-openapi-jvm:$ktor_version")
     implementation("io.ktor:ktor-server-config-yaml-jvm:$ktor_version")
 
+    // Jackson (для поддержки JWT от Auth0)
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.17.1")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.17.1")
+
 
 
     // БД-драйверы
