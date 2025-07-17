@@ -44,6 +44,7 @@ import io.ktor.http.content.forEachPart
 
 import io.ktor.http.content.streamProvider
 import io.ktor.server.request.receiveMultipart
+import io.ktor.server.request.receiveText
 import org.jetbrains.exposed.sql.Column
 import java.io.File
 import java.time.LocalDateTime
@@ -293,35 +294,44 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
         // Change password
         route("/change-password") {
             post {
+                // 1) Read and log raw JSON body
+                val bodyText = call.receiveText()
+                println("🔄 [ChangePasswordRoute] Received raw body: $bodyText")
+                // Deserialize
+                val req = kotlinx.serialization.json.Json
+                    .decodeFromString<ChangePasswordRequest>(bodyText)
+
+                // 2) Authenticate and log userId
                 val principal = call.principal<JWTPrincipal>()!!
                 val userId = principal.payload.getClaim("id").asString().toInt()
-                val req = call.receive<ChangePasswordRequest>()
+                println("🔑 [ChangePasswordRoute] Authenticated userId: $userId")
 
-                // Perform password change inside a DB transaction and return a status code
+                // 3) Perform transaction with detailed logs
                 val response = transaction {
-                    // Fetch the user
                     val row = Users.select { Users.id eq userId }.singleOrNull()
-                        ?: return@transaction ChangePasswordResponse("user_not_found") to HttpStatusCode.NotFound
+                    if (row == null) {
+                        println("⚠️ [ChangePasswordRoute] user_not_found for id $userId")
+                        return@transaction ChangePasswordResponse("user_not_found") to HttpStatusCode.NotFound
+                    }
 
-                    // Verify current password
                     val result = BCrypt.verifyer()
                         .verify(req.currentPassword.toCharArray(), row[Users.password].toCharArray())
                     if (!result.verified) {
+                        println("⚠️ [ChangePasswordRoute] invalid_current_password for id $userId")
                         return@transaction ChangePasswordResponse("invalid_current_password") to HttpStatusCode.Unauthorized
                     }
 
-                    // Hash and update new password
                     val newHash = BCrypt.withDefaults()
                         .hashToString(12, req.newPassword.toCharArray())
                     Users.update({ Users.id eq userId }) {
                         it[Users.password] = newHash
                     }
-
-                    // On success
+                    println("✅ [ChangePasswordRoute] Password updated successfully for id $userId")
                     ChangePasswordResponse("ok") to HttpStatusCode.OK
                 }
 
-                // Respond using the captured Pair
+                // 4) Log and respond
+                println("🔄 [ChangePasswordRoute] Responding with status ${response.second} and body ${response.first}")
                 call.respond(response.second, response.first)
             }
         }
