@@ -24,6 +24,8 @@ import org.jetbrains.exposed.sql.update
 import org.jetbrains.exposed.sql.transactions.transaction
 
 import com.yourcompany.zeiterfassung.db.Users
+import com.yourcompany.zeiterfassung.db.Users.phone
+import com.yourcompany.zeiterfassung.db.Users.phoneVerified
 import at.favre.lib.crypto.bcrypt.BCrypt
 import java.time.LocalDate
 import com.auth0.jwt.JWT
@@ -49,6 +51,18 @@ import org.jetbrains.exposed.sql.Column
 import java.io.File
 import java.time.LocalDateTime
 import java.util.UUID
+
+@Serializable
+data class SentCodeResponse(val sent: Boolean)
+
+@Serializable
+data class VerifyCodeResponse(val verified: Boolean)
+
+@Serializable
+data class CompleteRegistrationResponse(val completed: Boolean, val token: String)
+
+@Serializable
+data class ErrorResponse(val error: String)
 
 @Serializable
 data class ProfileResponse(
@@ -91,12 +105,12 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             val dto = call.receive<SendCodeDTO>()
             val phone = dto.phone
             if (phone == "+491234567890") {
-                // Test stub: skip Twilio and pretend SMS sent
-                call.respond(HttpStatusCode.OK, mapOf("sent" to true))
+                // Test stub: skip Twilio SMS
+                call.respond(HttpStatusCode.OK, SentCodeResponse(sent = true))
                 return@post
             }
             val resp = Verification.creator(verifyServiceSid, phone, "sms").create()
-            call.respond(HttpStatusCode.OK, mapOf("sent" to true))
+            call.respond(HttpStatusCode.OK, SentCodeResponse(sent = resp.status == "pending"))
         }
     }
 
@@ -107,13 +121,13 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             val phone = dto.phone
             val code = dto.code
             if (phone == "+491234567890" && code == "000000") {
-                // Test stub: accept magic code
+                // Test stub: accept magic code without Twilio
                 transaction {
                     Users.update({ Users.phone eq phone }) {
                         it[Users.phoneVerified] = true
                     }
                 }
-                call.respond(HttpStatusCode.OK, mapOf("verified" to true))
+                call.respond(HttpStatusCode.OK, VerifyCodeResponse(verified = true))
                 return@post
             }
             val check = VerificationCheck.creator(verifyServiceSid)
@@ -127,13 +141,17 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                         it[Users.phoneVerified] = true
                     }
                 }
-                call.respond(HttpStatusCode.OK, mapOf("verified" to true))
+                call.respond(HttpStatusCode.OK, VerifyCodeResponse(verified = true))
             } else {
-                call.respond(HttpStatusCode.BadRequest, mapOf("verified" to false))
+                call.respond(HttpStatusCode.BadRequest, VerifyCodeResponse(verified = false))
             }
         }
     }
 
+    // Possible errors for complete-registration:
+    //   400 Phone not verified
+    //   400 Invalid birthDate format, expected YYYY-MM-DD
+    //   400 Email already registered
     // Phase 4: Complete registration with full profile
     route("/complete-registration") {
         post {
@@ -147,19 +165,31 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             }
 
             if (!isVerified) {
-                return@post call.respond(HttpStatusCode.BadRequest, "Phone not verified")
+                return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("Phone not verified"))
             }
 
             // Validate birthDate
             val birthDate = try {
                 LocalDate.parse(dto.birthDate)
             } catch (e: Exception) {
-                return@post call.respond(HttpStatusCode.BadRequest, "Invalid birthDate format, expected YYYY-MM-DD")
+                return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("Invalid birthDate format, expected YYYY-MM-DD"))
             }
 
             // Hash password
             val passwordHash = BCrypt.withDefaults()
                 .hashToString(12, dto.password.toCharArray())
+
+            // Ensure email is not already taken by another user
+            val emailTaken = transaction {
+                Users.select { Users.email eq dto.email }
+                    .map { it[Users.phone] }
+                    .firstOrNull()
+                    ?.let { existingPhone -> existingPhone != dto.phone }
+                    ?: false
+            }
+            if (emailTaken) {
+                return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("Email already registered"))
+            }
 
             // Update user record
             transaction {
@@ -195,7 +225,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
 
             call.respond(
                 HttpStatusCode.OK,
-                mapOf("completed" to true, "token" to token)
+                CompleteRegistrationResponse(completed = true, token = token)
             )
         }
     }
