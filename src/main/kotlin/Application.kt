@@ -22,6 +22,8 @@ import com.yourcompany.zeiterfassung.routes.authRoutes
 import com.yourcompany.zeiterfassung.routes.qrRoutes
 import com.yourcompany.zeiterfassung.routes.scanRoutes
 import com.yourcompany.zeiterfassung.routes.logsRoutes
+import com.yourcompany.zeiterfassung.routes.pauseRoutes
+import com.yourcompany.zeiterfassung.routes.proofsRoutes
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.plugins.statuspages.*
@@ -123,6 +125,8 @@ fun Application.module() {
             qrRoutes()
             scanRoutes()
             logsRoutes()
+            proofsRoutes()
+            pauseRoutes()
         }
     }
 }
