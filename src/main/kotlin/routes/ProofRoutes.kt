@@ -13,7 +13,12 @@ import com.yourcompany.zeiterfassung.models.Proofs
 import com.yourcompany.zeiterfassung.dto.ProofDto
 import com.yourcompany.zeiterfassung.dto.RespondProofRequest
 import com.yourcompany.zeiterfassung.dto.ProofResponse
-import java.time.*
+import com.yourcompany.zeiterfassung.dto.ValidationErrorResponseDto
+import com.yourcompany.zeiterfassung.dto.ProofCreateRequest
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.ZoneId
 import kotlin.math.*
 
 // 🌍 Haversine formula
@@ -61,6 +66,42 @@ fun Route.proofsRoutes() {
                 call.respond(list)
             }
 
+
+            // ✏️ POST /api/proofs — создание новой проверки
+            post {
+              try {
+                val userId = call.principal<JWTPrincipal>()!!.payload.getClaim("id").asString().toInt()
+                val req = call.receive<ProofCreateRequest>()
+                val now = Instant.now()
+
+                // Вставляем новую запись в БД
+                val newId = transaction {
+                  Proofs.insert {
+                    it[Proofs.userId] = userId
+                    it[Proofs.latitude] = req.latitude
+                    it[Proofs.longitude] = req.longitude
+                    it[Proofs.radius] = req.radius
+                    it[Proofs.slot] = req.slot.toShort()
+                    it[Proofs.sentAt] = LocalDateTime.ofInstant(now, ZoneId.systemDefault())
+                  } get Proofs.id
+                }
+
+                val created = ProofDto(
+                  id = newId,
+                  latitude = req.latitude,
+                  longitude = req.longitude,
+                  radius = req.radius,
+                  slot = req.slot,
+                  sentAt = now,
+                  responded = false
+                )
+                call.respond(created)
+              } catch (e: Throwable) {
+                call.application.log.error("Error creating proof", e)
+                call.respond(HttpStatusCode.InternalServerError, mapOf("error" to (e.localizedMessage ?: "Unknown error")))
+              }
+            }
+
             // 📩 POST /api/proofs/{id}/respond
             post("/{proofId}/respond") {
                 val userId = call.principal<JWTPrincipal>()!!.payload.getClaim("id").asString().toInt()
@@ -68,41 +109,67 @@ fun Route.proofsRoutes() {
                 val req = call.receive<RespondProofRequest>()
                 val now = Instant.now()
 
-                val result = transaction {
+                // Collect validation errors
+                val details = mutableMapOf<String, MutableList<String>>()
+                val success = transaction {
+                    // 1) Check ownership and existence
                     val row = Proofs.select {
                         (Proofs.id eq proofId) and
                                 (Proofs.userId eq userId)
-                    }.singleOrNull() ?: return@transaction false
+                    }.singleOrNull().also {
+                        if (it == null) {
+                            details.getOrPut("proofId") { mutableListOf() }
+                                .add("Proof not found or unauthorized")
+                        }
+                    } ?: return@transaction false
 
                     val lat0 = row[Proofs.latitude]
                     val lon0 = row[Proofs.longitude]
                     val radius = row[Proofs.radius]
                     val slot = row[Proofs.slot].toInt()
-                    val sentAt = row[Proofs.sentAt] ?: return@transaction false
+                    val sentAt = row[Proofs.sentAt] ?: run {
+                        details.getOrPut("sentAt") { mutableListOf() }
+                            .add("Missing sent timestamp")
+                        return@transaction false
+                    }
 
-                    val endSlotTime = when (slot) {
+                    // 2) Check time window
+                    val endSlotInstant = when (slot) {
                         1 -> sentAt.withHour(12).withMinute(0).withSecond(0)
                         else -> sentAt.withHour(17).withMinute(0).withSecond(0)
+                    }.atZone(ZoneId.systemDefault()).toInstant()
+                    if (now.isAfter(endSlotInstant)) {
+                        details.getOrPut("slot") { mutableListOf() }
+                            .add("Slot has expired")
+                        return@transaction false
                     }
-                    val endSlotInstant = endSlotTime.atZone(ZoneId.systemDefault()).toInstant()
 
-                    if (now.isAfter(endSlotInstant)) return@transaction false
-
+                    // 3) Check distance
                     val dist = distanceMeters(lat0, lon0, req.latitude, req.longitude)
-                    if (dist > radius) return@transaction false
+                    if (dist > radius) {
+                        details.getOrPut("location") { mutableListOf() }
+                            .add("Distance \$dist exceeds radius \$radius")
+                        return@transaction false
+                    }
 
+                    // Passed all checks → mark responded
                     Proofs.update({ Proofs.id eq proofId }) {
                         it[responded] = true
                         it[respondedAt] = LocalDateTime.ofInstant(now, ZoneId.systemDefault())
                     }
-
                     true
                 }
 
-                if (result) {
+                if (success) {
                     call.respond(ProofResponse(status = "ok", timestamp = now.toString()))
                 } else {
-                    call.respond(HttpStatusCode.Forbidden, mapOf("error" to "validation_failed"))
+                    call.respond(
+                        HttpStatusCode.UnprocessableEntity,
+                        ValidationErrorResponseDto(
+                            error = "validation_failed",
+                            details = details
+                        )
+                    )
                 }
             }
         }
