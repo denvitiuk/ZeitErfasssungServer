@@ -92,4 +92,12 @@ dependencies {
 
     implementation("io.ktor:ktor-server-status-pages-jvm:${ktor_version}")
 
+
+    implementation("org.quartz-scheduler:quartz:2.3.2")
+    implementation("com.eatthepath:pushy:0.14.0")        // APNs client
+    implementation("com.google.firebase:firebase-admin:8.2.0") // FCM для Android
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.7.3")
+    implementation("com.google.firebase:firebase-messaging:<latest-version>")
+
+
 }
