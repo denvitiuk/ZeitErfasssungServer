@@ -23,6 +23,7 @@ import com.yourcompany.zeiterfassung.routes.qrRoutes
 import com.yourcompany.zeiterfassung.routes.scanRoutes
 import com.yourcompany.zeiterfassung.routes.logsRoutes
 import com.yourcompany.zeiterfassung.routes.pauseRoutes
+import com.yourcompany.zeiterfassung.routes.passwordResetRoutes
 import com.yourcompany.zeiterfassung.routes.proofsRoutes
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.plugins.BadRequestException
@@ -143,6 +144,9 @@ fun Application.module() {
 
     // 7. Routing
     routing {
+        // Public password reset endpoints
+        passwordResetRoutes()
+
         authRoutes(twilioFrom, verifyServiceSid)
 
         authenticate("bearerAuth") {

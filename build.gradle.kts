@@ -87,6 +87,8 @@ dependencies {
     implementation("org.jetbrains.exposed:exposed-java-time:$exposed_version")
 
     implementation("at.favre.lib:bcrypt:0.9.0")
+    // jBCrypt for password hashing (used in password reset flow)
+    implementation("org.mindrot:jbcrypt:0.4")
     // ZXing for QR code generation
     implementation("com.google.zxing:core:3.5.0")
     implementation("com.google.zxing:javase:3.5.0")
@@ -99,6 +101,10 @@ dependencies {
     implementation("com.google.firebase:firebase-admin:8.2.0") // FCM для Android
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.7.3")
     implementation("com.google.firebase:firebase-messaging:23.0.6")
+    implementation("com.sun.mail:jakarta.mail:1.6.7")
+    implementation("at.favre.lib:bcrypt:0.9.0")
+
+
 
 
 
