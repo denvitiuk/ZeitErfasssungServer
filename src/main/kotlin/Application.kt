@@ -145,7 +145,7 @@ fun Application.module() {
     // 7. Routing
     routing {
         // Public password reset endpoints
-        passwordResetRoutes(twilioFrom)
+        passwordResetRoutes(twilioFrom,env)
 
         authRoutes(twilioFrom, verifyServiceSid)
 
