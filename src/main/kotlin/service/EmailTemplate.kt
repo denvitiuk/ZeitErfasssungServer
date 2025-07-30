@@ -42,7 +42,10 @@ object EmailTemplates {
       <p>Du hast angefordert, dein Passwort zurückzusetzen. Verwende bitte den folgenden Code:</p>
       <span class="code"><strong>$code</strong></span>
       <p>Wenn du diese Anfrage nicht gestellt hast, kannst du diese Nachricht ignorieren.</p>
-      <a href="#" class="button">Code in App eingeben</a>
+      <!-- TODO: Replace with app deep link scheme when released -->
+      <a href="zeiterfassung://reset?code=$code" class="button">Code in App eingeben</a>
+      <!-- TODO: Replace with universal/app link fallback when released -->
+      <a href="https://yourapp.com/reset?code=$code" class="button">Code in App eingeben</a>
     </div>
     <div class="footer">
       © ${LocalDate.now().year} ZeitErfassung. Alle Rechte vorbehalten.
@@ -64,5 +67,7 @@ Dieser Code ist 10 Minuten gültig.
 Wenn du diese Anfrage nicht angefordert hast, ignoriere diese E-Mail.
 
 © ${LocalDate.now().year} ZeitErfassung
+    # TODO: App Deep Link (wenn App installiert): zeiterfassung://reset?code=$code
+    # TODO: Web Fallback-Link: https://yourapp.com/reset?code=$code
 """.trimIndent()
 }
