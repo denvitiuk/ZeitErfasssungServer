@@ -3,6 +3,7 @@ package com.yourcompany.zeiterfassung.routes
 import at.favre.lib.crypto.bcrypt.BCrypt
 import com.yourcompany.zeiterfassung.dto.ForgotRequest
 import com.yourcompany.zeiterfassung.dto.ResetRequest
+import com.yourcompany.zeiterfassung.dto.VerifyRequest
 import com.yourcompany.zeiterfassung.db.Users
 import com.yourcompany.zeiterfassung.db.PasswordResetTokens
 import com.yourcompany.zeiterfassung.service.EmailService
@@ -24,21 +25,19 @@ import javax.mail.MessagingException
 
 fun Route.passwordResetRoutes(twilioFrom: String, env: io.github.cdimascio.dotenv.Dotenv) {
 
-
-
     post("/forgot-password") {
         val req = call.receive<ForgotRequest>()
         call.application.environment.log.info("📨 Received forgot-password request for ${req.to}")
 
-        // 🔒 Rate limiting (1/min and max 5/day)
-        val tooFrequent = !PasswordResetRateLimiter.allow(req.to)
-        if (tooFrequent) {
-            call.application.environment.log.warn("🚫 Rate limit exceeded for ${req.to}")
-            return@post call.respond(
-                HttpStatusCode.TooManyRequests,
-                mapOf("error" to "Too many requests. Try again later.")
-            )
-        }
+        // 🔒 Rate limiting disabled temporarily
+        // val tooFrequent = !PasswordResetRateLimiter.allow(req.to)
+        // if (tooFrequent) {
+        //     call.application.environment.log.warn("🚫 Rate limit exceeded for ${req.to}")
+        //     return@post call.respond(
+        //         HttpStatusCode.TooManyRequests,
+        //         mapOf("error" to "Too many requests. Try again later.")
+        //     )
+        // }
 
         val userRow = transaction {
             Users.select { (Users.email eq req.to) or (Users.phone eq req.to) }
@@ -148,6 +147,28 @@ fun Route.passwordResetRoutes(twilioFrom: String, env: io.github.cdimascio.doten
         }
 
         return@post call.respond(HttpStatusCode.OK, mapOf("result" to "code_sent"))
+    }
+
+    /**
+     * Verify reset code without changing password
+     * POST /verify-reset-code
+     * Body: { "to": "<email or phone>", "code": "<6-digit code>" }
+     */
+    post("/verify-reset-code") {
+        val req = call.receive<VerifyRequest>()
+        call.application.environment.log.info("🔍 Received verify-reset-code for ${req.to} with code ${req.code}")
+        val isValid = transaction {
+            PasswordResetTokens.select {
+                (PasswordResetTokens.destination eq req.to) and
+                (PasswordResetTokens.code eq req.code) and
+                (PasswordResetTokens.expiresAt greater LocalDateTime.now())
+            }.any()
+        }
+        if (isValid) {
+            call.respond(HttpStatusCode.OK, mapOf("result" to "code_valid"))
+        } else {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid or expired code"))
+        }
     }
 
     post("/reset-password") {
