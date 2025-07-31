@@ -19,6 +19,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
+import java.time.ZonedDateTime
 import kotlin.math.*
 
 // 🌍 Haversine formula
@@ -72,7 +73,15 @@ fun Route.proofsRoutes() {
               try {
                 val userId = call.principal<JWTPrincipal>()!!.payload.getClaim("id").asString().toInt()
                 val req = call.receive<ProofCreateRequest>()
-                val now = Instant.now()
+                // Use Berlin time for slot calculation
+                val berlinNow = ZonedDateTime.now(ZoneId.of("Europe/Berlin"))
+                val now = berlinNow.toInstant()
+                // Determine slot based on Berlin hour
+                val slotVal: Short = when (berlinNow.hour) {
+                    in 9 until 12 -> 1
+                    in 13 until 17 -> 2
+                    else -> 0
+                }
 
                 // Вставляем новую запись в БД
                 val newId = transaction {
@@ -81,8 +90,8 @@ fun Route.proofsRoutes() {
                     it[Proofs.latitude] = req.latitude
                     it[Proofs.longitude] = req.longitude
                     it[Proofs.radius] = req.radius
-                    it[Proofs.slot] = req.slot.toShort()
-                    it[Proofs.sentAt] = LocalDateTime.ofInstant(now, ZoneId.systemDefault())
+                    it[Proofs.slot] = slotVal
+                    it[Proofs.sentAt] = LocalDateTime.ofInstant(now, ZoneId.of("Europe/Berlin"))
                   } get Proofs.id
                 }
 

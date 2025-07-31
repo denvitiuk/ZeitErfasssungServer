@@ -14,9 +14,8 @@ import com.yourcompany.zeiterfassung.models.DeviceTokens
 import kotlinx.serialization.Serializable
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import java.time.Instant
-import java.time.LocalDateTime
-import java.time.ZoneId
-import org.jetbrains.exposed.sql.javatime.timestamp
+import io.ktor.http.HttpStatusCode
+import kotlin.and
 
 
 @Serializable
@@ -25,50 +24,57 @@ data class RegisterDeviceTokenRequest(
     val token: String
 )
 
+
 fun Route.deviceTokenRoutes() {
     authenticate("bearerAuth") {
         route("/api/device-tokens") {
-            /**
-             * POST /api/device-tokens
-             * Body: { "platform": "ios", "token": "<device-token>" }
-             * Authentication: Bearer JWT
-             * Action: Upsert device token for this user and platform
-             */
+
             post {
-                // Extract userId from JWT
                 val principal = call.principal<JWTPrincipal>()
                 val userId = principal!!.payload.getClaim("id").asString().toInt()
-
-                // Parse request body
                 val req = call.receive<RegisterDeviceTokenRequest>()
 
-                // Upsert token in database
+                if (req.platform !in listOf("ios", "android")) {
+                    call.respond(
+                        HttpStatusCode.BadRequest,
+                        mapOf("error" to "Unsupported platform: ${req.platform}")
+                    )
+                    return@post
+                }
+
+                val now = Instant.now()
+
+
+
+
                 transaction {
-                    // Delete old token for this user+platform
-                    DeviceTokens.deleteWhere {
+                    val updated = DeviceTokens.update({
                         (DeviceTokens.userId eq userId) and
                                 (DeviceTokens.platform eq req.platform)
-                    }
-                    DeviceTokens.insert {
-                        it[DeviceTokens.userId] = userId // Int
-                        it[DeviceTokens.platform] = req.platform // String
-                        it[DeviceTokens.token] = req.token // String
-                        it[DeviceTokens.createdAt] = Instant.now()
+                    }) {
+                        it[DeviceTokens.token] = req.token
+                        it[DeviceTokens.createdAt] = now
 
                     }
 
+                    if (updated == 0) {
+                        DeviceTokens.insert {
+                            it[DeviceTokens.userId] = userId
+                            it[DeviceTokens.platform] = req.platform
+                            it[DeviceTokens.token] = req.token
+                            it[DeviceTokens.createdAt] = now
+
+                        }
+                    }
                 }
 
                 call.respond(mapOf("status" to "ok"))
             }
 
-            /**
-             * GET /api/device-tokens
-             * Returns list of tokens for current user (optional)
-             */
             get {
                 val principal = call.principal<JWTPrincipal>()
                 val userId = principal!!.payload.getClaim("id").asString().toInt()
+
                 val tokens = transaction {
                     DeviceTokens.select { DeviceTokens.userId eq userId }
                         .map {
@@ -78,8 +84,10 @@ fun Route.deviceTokenRoutes() {
                             )
                         }
                 }
+
                 call.respond(tokens)
             }
         }
     }
 }
+

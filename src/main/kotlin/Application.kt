@@ -25,6 +25,7 @@ import com.yourcompany.zeiterfassung.routes.logsRoutes
 import com.yourcompany.zeiterfassung.routes.pauseRoutes
 import com.yourcompany.zeiterfassung.routes.passwordResetRoutes
 import com.yourcompany.zeiterfassung.routes.proofsRoutes
+import com.yourcompany.zeiterfassung.routes.deviceTokenRoutes
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.plugins.statuspages.*
@@ -155,6 +156,7 @@ fun Application.module() {
             logsRoutes()
             proofsRoutes()
             pauseRoutes()
+            deviceTokenRoutes()
         }
     }
 }
@@ -169,4 +171,3 @@ class ExactProofJob : Job {
         // then send APNs/FCM push containing the new proofId in userInfo.
     }
 }
-

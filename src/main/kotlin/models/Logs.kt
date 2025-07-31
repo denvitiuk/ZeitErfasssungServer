@@ -1,6 +1,7 @@
 package com.yourcompany.zeiterfassung.models
 
 import com.yourcompany.zeiterfassung.db.Users
+import com.yourcompany.zeiterfassung.models.Nonces
 
 import org.jetbrains.exposed.sql.Table
 import org.jetbrains.exposed.sql.javatime.datetime
