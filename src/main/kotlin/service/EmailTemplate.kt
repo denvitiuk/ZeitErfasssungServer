@@ -34,7 +34,7 @@ object EmailTemplates {
 <body>
   <div class="container">
     <div class="header">
-      <img src="cid:logo12.png" alt="Logo" style="height:60px;"/>
+      <img src="cid:img.png" alt="Logo" style="height:60px;"/>
       <h1>Passwort zurücksetzen</h1>
     </div>
     <div class="content">
@@ -42,9 +42,6 @@ object EmailTemplates {
       <p>Du hast angefordert, dein Passwort zurückzusetzen. Verwende bitte den folgenden Code:</p>
       <span class="code"><strong>$code</strong></span>
       <p>Wenn du diese Anfrage nicht gestellt hast, kannst du diese Nachricht ignorieren.</p>
-      <!-- TODO: Replace with app deep link scheme when released -->
-      <a href="zeiterfassung://reset?code=$code" class="button">Code in App eingeben</a>
-      <!-- TODO: Replace with universal/app link fallback when released -->
       <a href="https://yourapp.com/reset?code=$code" class="button">Code in App eingeben</a>
     </div>
     <div class="footer">
