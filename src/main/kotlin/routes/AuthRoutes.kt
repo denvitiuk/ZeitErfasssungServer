@@ -26,6 +26,7 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import com.yourcompany.zeiterfassung.db.Users
 import com.yourcompany.zeiterfassung.db.Users.phone
 import com.yourcompany.zeiterfassung.db.Users.phoneVerified
+import com.yourcompany.zeiterfassung.db.Companies
 import at.favre.lib.crypto.bcrypt.BCrypt
 import java.time.LocalDate
 import com.auth0.jwt.JWT
@@ -48,6 +49,7 @@ import io.ktor.http.content.streamProvider
 import io.ktor.server.request.receiveMultipart
 import io.ktor.server.request.receiveText
 import org.jetbrains.exposed.sql.Column
+import org.jetbrains.exposed.sql.and
 import java.io.File
 import java.time.LocalDateTime
 import java.util.UUID
@@ -191,14 +193,37 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("Email already registered"))
             }
 
+            // Validate inviteCode and fetch company
+            val companyRow = transaction {
+                Companies.select { Companies.inviteCode eq dto.inviteCode }
+                         .singleOrNull()
+            }
+            if (companyRow == null) {
+                return@post call.respond(
+                    HttpStatusCode.BadRequest,
+                    ErrorResponse("Invalid invite code")
+                )
+            }
+            val companyId = companyRow[Companies.id].value
+
+            // Determine if first admin for the company
+            val isAdmin = transaction {
+                Users.select {
+                    (Users.companyId eq companyId) and Users.isCompanyAdmin
+                }.empty()
+            }
+
             // Update user record
             transaction {
                 Users.update({ Users.phone eq dto.phone }) {
-                    it[Users.firstName] = dto.firstName
-                    it[Users.lastName] = dto.lastName
-                    it[Users.email] = dto.email
-                    it[Users.password] = passwordHash
-                    it[Users.birthDate] = birthDate
+                    it[Users.firstName]      = dto.firstName
+                    it[Users.lastName]       = dto.lastName
+                    it[Users.email]          = dto.email
+                    it[Users.password]       = passwordHash
+                    it[Users.birthDate]      = birthDate
+                    it[Users.companyId]      = companyId
+                    it[Users.isCompanyAdmin] = isAdmin
+                    it[Users.isGlobalAdmin]  = false
                 }
             }
 
@@ -220,6 +245,9 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 .withIssuer(issuer)
                 .withAudience(audience)
                 .withClaim("id", userId)
+                .withClaim("companyId", companyId)
+                .withClaim("isCompanyAdmin", isAdmin)
+                .withClaim("isGlobalAdmin", false)
                 .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
                 .sign(Algorithm.HMAC256(secret))
 
@@ -234,13 +262,13 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
     route("/login") {
         post {
             val dto = call.receive<LoginDTO>()
-                // Server-seitige Validierung: Pflichtfelder dürfen nicht leer sein
-                if (dto.email.isBlank() || dto.password.isBlank()) {
-                    return@post call.respond(
-                        HttpStatusCode.BadRequest,
-                        mapOf("error" to "E-Mail und Passwort dürfen nicht leer sein")
-                    )
-                }
+            // Server-seitige Validierung: Pflichtfelder dürfen nicht leer sein
+            if (dto.email.isBlank() || dto.password.isBlank()) {
+                return@post call.respond(
+                    HttpStatusCode.BadRequest,
+                    mapOf("error" to "E-Mail und Passwort dürfen nicht leer sein")
+                )
+            }
             val user = transaction {
                 Users.select { Users.email eq dto.email }.firstOrNull()
             } ?: return@post call.respond(
@@ -256,6 +284,11 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 )
             }
 
+            // Extract companyId, isCompanyAdmin, isGlobalAdmin from user row
+            val companyId = user[Users.companyId]
+            val isCompanyAdmin = user[Users.isCompanyAdmin]
+            val isGlobalAdmin = user[Users.isGlobalAdmin]
+
             val jwtConfig = call.application.environment.config.config("ktor.jwt")
             val issuer = jwtConfig.property("issuer").getString()
             val audience = jwtConfig.property("audience").getString()
@@ -266,6 +299,9 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 .withIssuer(issuer)
                 .withAudience(audience)
                 .withClaim("id", user[Users.id].toString())
+                .withClaim("companyId", companyId)
+                .withClaim("isCompanyAdmin", isCompanyAdmin)
+                .withClaim("isGlobalAdmin", isGlobalAdmin)
                 .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
                 .sign(Algorithm.HMAC256(secret))
 
@@ -286,6 +322,20 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     Users.select { Users.id eq userId }.single()
                 }
 
+                // Fetch company name
+                val companyName = transaction {
+                    Companies.select { Companies.id eq row[Users.companyId] }
+                        .map { it[Companies.name] }
+                        .singleOrNull()
+                }
+
+                // Determine role string
+                val role = when {
+                    row[Users.isGlobalAdmin] -> "globalAdmin"
+                    row[Users.isCompanyAdmin] -> "companyAdmin"
+                    else -> "user"
+                }
+
                 // Format registration date in German month-year
                 val createdAt = row[Users.createdAt]
                     .format(DateTimeFormatter.ofPattern("LLLL yyyy", Locale.GERMAN))
@@ -300,7 +350,9 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     phone = row[Users.phone] ?: "",
                     employee_number = employeeNumber,
                     avatar_url = row.getOrNull(Users.avatarUrl),
-                    created_at = createdAt
+                    created_at = createdAt,
+                    role = role,
+                    company = companyName
                 )
                 call.respond(HttpStatusCode.OK, profile)
             }

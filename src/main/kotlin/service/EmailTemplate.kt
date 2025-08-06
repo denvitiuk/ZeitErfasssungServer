@@ -67,4 +67,71 @@ Wenn du diese Anfrage nicht angefordert hast, ignoriere diese E-Mail.
     # TODO: App Deep Link (wenn App installiert): zeiterfassung://reset?code=$code
     # TODO: Web Fallback-Link: https://yourapp.com/reset?code=$code
 """.trimIndent()
+
+    /**
+     * Генерирует HTML-шаблон письма с кодом приглашения администратора.
+     * @param code приглашения администратора
+     * @param companyName имя компании
+     * @return HTML-контент письма
+     */
+    fun buildAdminInviteHtml(code: String, companyName: String): String = """
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Admin Einladungscode</title>
+  <style>
+    body { margin:0; padding:0; background:#f0f2f5; font-family:"Helvetica Neue",Helvetica,Arial,sans-serif; }
+    .container { width:100%; max-width:600px; margin:0 auto; background:#ffffff; border-radius:8px; overflow:hidden; }
+    .header { background:#4a90e2; color:#ffffff; text-align:center; padding:40px; }
+    .header img { height:60px; }
+    .content { padding:30px; color:#333333; line-height:1.5; }
+    .code { display:block; font-size:36px; font-weight:700; color:#4a90e2; text-align:center; margin:30px auto; }
+    .footer { padding:20px; text-align:center; font-size:12px; color:#999999; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <img src="cid:img.png" alt="Logo"/>
+      <h1>Admin Einladungscode</h1>
+    </div>
+    <div class="content">
+      <p>Hallo,</p>
+      <p>Vielen Dank, dass Sie sich für uns entschieden haben.</p>
+      <p>Wir hoffen, dass Ihnen unsere Anwendung gefällt.</p>
+      <p>Du wurdest eingeladen, Administrator für <strong>$companyName</strong> zu werden.</p>
+      <p>Verwende bitte den folgenden Einladungscode:</p>
+      <span class="code"><strong>$code</strong></span>
+      <p>Wenn du diese Einladung nicht angefordert hast, kannst du diese E-Mail ignorieren.</p>
+    </div>
+    <div class="footer">
+      © ${LocalDate.now().year} ZeitErfassung. Alle Rechte vorbehalten.
+    </div>
+  </div>
+</body>
+</html>
+""".trimIndent()
+
+    /**
+     * Генерирует простое текстовое письмо с кодом приглашения администратора.
+     * @param code приглашения администратора
+     * @param companyName имя компании
+     * @return plain-text контент письма
+     */
+    fun buildAdminInviteText(code: String, companyName: String): String = """
+Vielen Dank, dass Sie sich für uns entschieden haben.
+Wir hoffen, dass Ihnen unsere Anwendung gefällt.
+
+Admin Einladungscode
+
+Du wurdest eingeladen, Administrator für $companyName zu werden.
+Dein Einladungscode: $code
+
+Dieser Code ist 1 Stunde gültig.
+Wenn du diese Einladung nicht erhalten hast, ignoriere diese E-Mail.
+
+© ${LocalDate.now().year} ZeitErfassung
+""".trimIndent()
 }
