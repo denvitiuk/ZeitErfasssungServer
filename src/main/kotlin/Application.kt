@@ -18,7 +18,9 @@ import io.ktor.server.routing.*
 import com.auth0.jwt.JWT
 import com.auth0.jwt.algorithms.Algorithm
 import com.yourcompany.zeiterfassung.db.configureDatabases
+import com.yourcompany.zeiterfassung.routes.adminInviteRoutes
 import com.yourcompany.zeiterfassung.routes.authRoutes
+import com.yourcompany.zeiterfassung.routes.companiesRoutes
 import com.yourcompany.zeiterfassung.routes.qrRoutes
 import com.yourcompany.zeiterfassung.routes.scanRoutes
 import com.yourcompany.zeiterfassung.routes.logsRoutes
@@ -157,6 +159,8 @@ fun Application.module() {
             proofsRoutes()
             pauseRoutes()
             deviceTokenRoutes()
+            adminInviteRoutes(env)
+            companiesRoutes()
         }
     }
 }

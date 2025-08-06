@@ -287,3 +287,11 @@ $$ LANGUAGE plpgsql;
 -- 4) Create index on company_id if missing
 CREATE INDEX IF NOT EXISTS idx_users_company
     ON users(company_id);
+
+ALTER TABLE users
+    ADD COLUMN is_company_admin BOOLEAN NOT NULL DEFAULT FALSE,
+  ADD COLUMN is_global_admin  BOOLEAN NOT NULL DEFAULT FALSE;
+
+
+ALTER TABLE users
+    ALTER COLUMN company_id DROP NOT NULL;
