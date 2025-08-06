@@ -14,7 +14,7 @@ data class DeviceTokenDto(
     val token: String
 )
 
-    fun loadAllDeviceTokens(): List<DeviceTokenDto> =
+    suspend fun loadAllDeviceTokens(): List<DeviceTokenDto> =
     kotlinx.coroutines.Dispatchers.IO.let { dispatcher ->
         kotlinx.coroutines.withContext(dispatcher) {
             transaction {
