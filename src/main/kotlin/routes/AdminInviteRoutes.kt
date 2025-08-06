@@ -9,82 +9,117 @@ import com.yourcompany.zeiterfassung.service.EmailTemplates
 import io.github.cdimascio.dotenv.Dotenv
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
+import io.ktor.server.request.ContentTransformationException
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.post
+import org.jetbrains.exposed.exceptions.ExposedSQLException
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.update
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.util.UUID
 
-/**
- * DTOs expected in com.yourcompany.zeiterfassung.dto package:
- * data class SendAdminInviteDTO(val to: String, val companyId: Int)
- * data class VerifyAdminInviteDTO(val companyId: Int, val code: String)
- * data class InviteResponse(val result: String)
- */
-
 fun Route.adminInviteRoutes(env: Dotenv) {
+
     // Отправить приглашение админа
     post("/send-admin-invite") {
-        val dto = call.receive<SendAdminInviteDTO>()
+        try {
+            val dto = call.receive<SendAdminInviteDTO>()
 
-        // Проверяем, что компания существует
-        val companyRow = transaction {
-            Companies.select { Companies.id eq dto.companyId }.singleOrNull()
-        }
-        if (companyRow == null) {
-            return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "Company not found"))
-        }
-
-        // Получаем или генерируем inviteCode
-        val code = companyRow[Companies.inviteCode]?.takeIf { it.isNotBlank() }
-            ?: UUID.randomUUID().toString().also { newCode ->
+            val companyRow = try {
                 transaction {
-                    Companies.update({ Companies.id eq dto.companyId }) {
-                        it[Companies.inviteCode] = newCode
-                    }
+                    Companies.select { Companies.id eq dto.companyId }.singleOrNull()
                 }
+            } catch (e: ExposedSQLException) {
+                return@post call.respond(
+                    HttpStatusCode.InternalServerError,
+                    mapOf("error" to "Database error while fetching company: ${e.message}")
+                )
             }
 
-        // Собираем тело письма
-        val html = EmailTemplates.buildAdminInviteHtml(code, companyRow[Companies.name])
-        val text = EmailTemplates.buildAdminInviteText(code, companyRow[Companies.name])
+            if (companyRow == null) {
+                return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "Company not found"))
+            }
 
-        try {
-            EmailService.send(
-                to = dto.to,
-                subject = "Einladung als Administrator",
-                body = html,
-                env = env
-            )
-            // при желании можно отправить и текстовую версию
+            val code = companyRow[Companies.inviteCode]?.takeIf { it.isNotBlank() }
+                ?: UUID.randomUUID().toString().also { newCode ->
+                    try {
+                        transaction {
+                            Companies.update({ Companies.id eq dto.companyId }) {
+                                it[Companies.inviteCode] = newCode
+                            }
+                        }
+                    } catch (e: ExposedSQLException) {
+                        return@post call.respond(
+                            HttpStatusCode.InternalServerError,
+                            mapOf("error" to "Database error while updating invite code: ${e.message}")
+                        )
+                    }
+                }
+
+            val html = try {
+                EmailTemplates.buildAdminInviteHtml(code, companyRow[Companies.name])
+            } catch (e: Exception) {
+                return@post call.respond(
+                    HttpStatusCode.InternalServerError,
+                    mapOf("error" to "Failed to build email HTML: ${e.message}")
+                )
+            }
+
+            try {
+                EmailService.send(
+                    to = dto.to,
+                    subject = "Einladung als Administrator",
+                    body = html,
+                    env = env
+                )
+            } catch (e: Exception) {
+                return@post call.respond(
+                    HttpStatusCode.InternalServerError,
+                    mapOf("error" to "Email delivery failed: ${e.message}")
+                )
+            }
+
+            call.respond(HttpStatusCode.OK, InviteResponse(result = "invite_sent"))
+
+        } catch (e: ContentTransformationException) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid request format"))
         } catch (e: Exception) {
-            return@post call.respond(
-                HttpStatusCode.InternalServerError,
-                mapOf("error" to (e.message ?: "Email delivery failed"))
-            )
+            call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "Unexpected error: ${e.message}"))
         }
-
-        call.respond(HttpStatusCode.OK, InviteResponse(result = "invite_sent"))
     }
 
     // Проверить приглашение админа
     post("/verify-admin-invite") {
-        val dto = call.receive<VerifyAdminInviteDTO>()
+        try {
+            val dto = call.receive<VerifyAdminInviteDTO>()
 
-        val isValid = transaction {
-            Companies.select {
-                Companies.id eq dto.companyId and
-                        (Companies.inviteCode eq dto.code)
-            }.any()
-        }
-        if (isValid) {
-            call.respond(HttpStatusCode.OK, InviteResponse(result = "code_valid"))
-        } else {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid or expired invite code"))
+            val isValid = try {
+                transaction {
+                    Companies.select {
+                        Companies.id eq dto.companyId and
+                                (Companies.inviteCode eq dto.code)
+                    }.any()
+                }
+            } catch (e: ExposedSQLException) {
+                return@post call.respond(
+                    HttpStatusCode.InternalServerError,
+                    mapOf("error" to "Database error while verifying invite: ${e.message}")
+                )
+            }
+
+            if (isValid) {
+                call.respond(HttpStatusCode.OK, InviteResponse(result = "code_valid"))
+            } else {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid or expired invite code"))
+            }
+
+        } catch (e: ContentTransformationException) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid request format"))
+        } catch (e: Exception) {
+            call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "Unexpected error: ${e.message}"))
         }
     }
 }

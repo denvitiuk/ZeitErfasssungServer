@@ -1,5 +1,7 @@
 package com.yourcompany.zeiterfassung.routes
 
+import org.jetbrains.exposed.dao.id.EntityID
+
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
@@ -53,6 +55,7 @@ import org.jetbrains.exposed.sql.and
 import java.io.File
 import java.time.LocalDateTime
 import java.util.UUID
+import kotlin.collections.mapOf
 
 @Serializable
 data class SentCodeResponse(val sent: Boolean)
@@ -209,7 +212,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             // Determine if first admin for the company
             val isAdmin = transaction {
                 Users.select {
-                    (Users.companyId eq companyId) and Users.isCompanyAdmin
+                    (Users.companyId eq EntityID(companyId, Companies)) and Users.isCompanyAdmin
                 }.empty()
             }
 
@@ -285,7 +288,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             }
 
             // Extract companyId, isCompanyAdmin, isGlobalAdmin from user row
-            val companyId = user[Users.companyId]
+            val companyId = user[Users.companyId]?.value ?: 0
             val isCompanyAdmin = user[Users.isCompanyAdmin]
             val isGlobalAdmin = user[Users.isGlobalAdmin]
 
@@ -322,9 +325,11 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     Users.select { Users.id eq userId }.single()
                 }
 
-                // Fetch company name
+                // Fetch company name (unwrap EntityID to Int)
                 val companyName = transaction {
-                    Companies.select { Companies.id eq row[Users.companyId] }
+                    val companyIdValue = row[Users.companyId]?.value
+                    if (companyIdValue == null) return@transaction null
+                    Companies.select { Companies.id eq companyIdValue }
                         .map { it[Companies.name] }
                         .singleOrNull()
                 }

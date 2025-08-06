@@ -12,36 +12,24 @@ import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.plugins.cors.routing.CORS
 
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
 import io.ktor.server.auth.*
 import io.ktor.server.auth.jwt.*
 import io.ktor.server.routing.*
-import com.auth0.jwt.JWT
-import com.auth0.jwt.algorithms.Algorithm
-import com.yourcompany.zeiterfassung.db.configureDatabases
-import com.yourcompany.zeiterfassung.routes.adminInviteRoutes
-import com.yourcompany.zeiterfassung.routes.authRoutes
-import com.yourcompany.zeiterfassung.routes.companiesRoutes
-import com.yourcompany.zeiterfassung.routes.qrRoutes
-import com.yourcompany.zeiterfassung.routes.scanRoutes
-import com.yourcompany.zeiterfassung.routes.logsRoutes
-import com.yourcompany.zeiterfassung.routes.pauseRoutes
-import com.yourcompany.zeiterfassung.routes.passwordResetRoutes
-import com.yourcompany.zeiterfassung.routes.proofsRoutes
-import com.yourcompany.zeiterfassung.routes.deviceTokenRoutes
-import io.ktor.http.HttpStatusCode
-import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.plugins.statuspages.*
 import io.ktor.server.response.*
+import io.ktor.server.plugins.BadRequestException
 import kotlinx.serialization.json.Json
 
-import org.quartz.Job
-import org.quartz.JobBuilder
-import org.quartz.JobExecutionContext
-import org.quartz.TriggerBuilder
-import org.quartz.CronScheduleBuilder
+import com.auth0.jwt.JWT
+import com.auth0.jwt.algorithms.Algorithm
+
+import com.yourcompany.zeiterfassung.db.configureDatabases
+import com.yourcompany.zeiterfassung.routes.*
+
+import org.quartz.*
 import org.quartz.impl.StdSchedulerFactory
 import java.util.TimeZone
-
 
 // In-memory cache for phone verification codes (5-minute TTL)
 val verificationCodeCache: Cache<String, String> = Caffeine.newBuilder()
@@ -80,6 +68,12 @@ fun Application.module() {
             call.respond(
                 HttpStatusCode.InternalServerError,
                 mapOf("error" to (cause.message ?: "Неизвестная ошибка"))
+            )
+        }
+        status(HttpStatusCode.Unauthorized) { call, _ ->
+            call.respond(
+                HttpStatusCode.Unauthorized,
+                mapOf("error" to "Authorization failed. Please provide a valid token.")
             )
         }
     }
@@ -129,10 +123,9 @@ fun Application.module() {
     // 6. Database initialization
     configureDatabases()
 
-    // 🎯 Quartz scheduler for exact-time proof
+    // 7. Quartz scheduler for exact-time proof
     val scheduler = StdSchedulerFactory.getDefaultScheduler().apply { start() }
 
-    // Schedule exact notification at 09:43 Berlin time
     scheduler.scheduleJob(
         JobBuilder.newJob(ExactProofJob::class.java)
             .withIdentity("exactProofJob", "proofs")
@@ -145,11 +138,9 @@ fun Application.module() {
             .build()
     )
 
-    // 7. Routing
+    // 8. Routing
     routing {
-        // Public password reset endpoints
-        passwordResetRoutes(twilioFrom,env)
-
+        passwordResetRoutes(twilioFrom, env)
         authRoutes(twilioFrom, verifyServiceSid)
 
         authenticate("bearerAuth") {
