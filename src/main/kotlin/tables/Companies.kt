@@ -1,14 +1,13 @@
 package com.yourcompany.zeiterfassung.tables
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
-import java.time.Instant
 
-object Companies : Table("companies") {
-    val id = integer("id").autoIncrement()
+import org.jetbrains.exposed.sql.javatime.datetime
+import java.time.LocalDateTime
+
+import org.jetbrains.exposed.dao.id.IntIdTable
+
+object Companies : IntIdTable("companies") {
     val name = text("name").uniqueIndex()
     val inviteCode = varchar("invite_code", 16).uniqueIndex()
-    val createdAt = timestamp("created_at").clientDefault { Instant.now() }
-
-    override val primaryKey = PrimaryKey(id)
+    val createdAt = datetime("created_at").clientDefault { LocalDateTime.now() }
 }

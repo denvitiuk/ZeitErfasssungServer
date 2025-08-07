@@ -17,5 +17,5 @@ data class CompleteRegistrationDTO(
     val password: String,
     val birthDate: String,
     /** Код приглашения компании */
-    val inviteCode: String
+    val inviteCode: String? = null
 )

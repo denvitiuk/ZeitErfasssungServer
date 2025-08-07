@@ -1,6 +1,5 @@
 package com.yourcompany.zeiterfassung.routes
 
-import org.jetbrains.exposed.dao.id.EntityID
 
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
@@ -50,12 +49,14 @@ import io.ktor.http.content.forEachPart
 import io.ktor.http.content.streamProvider
 import io.ktor.server.request.receiveMultipart
 import io.ktor.server.request.receiveText
+import org.jetbrains.exposed.dao.id.EntityID
 import org.jetbrains.exposed.sql.Column
 import org.jetbrains.exposed.sql.and
 import java.io.File
 import java.time.LocalDateTime
 import java.util.UUID
 import kotlin.collections.mapOf
+import kotlin.collections.singleOrNull
 
 @Serializable
 data class SentCodeResponse(val sent: Boolean)
@@ -196,25 +197,17 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("Email already registered"))
             }
 
-            // Validate inviteCode and fetch company
-            val companyRow = transaction {
-                Companies.select { Companies.inviteCode eq dto.inviteCode }
-                         .singleOrNull()
-            }
-            if (companyRow == null) {
-                return@post call.respond(
-                    HttpStatusCode.BadRequest,
-                    ErrorResponse("Invalid invite code")
-                )
-            }
-            val companyId = companyRow[Companies.id].value
-
-            // Determine if first admin for the company
-            val isAdmin = transaction {
-                Users.select {
-                    (Users.companyId eq EntityID(companyId, Companies)) and Users.isCompanyAdmin
-                }.empty()
-            }
+            val (companyId, isAdmin) = dto.inviteCode
+                ?.takeIf { it.isNotBlank() }
+                ?.let { code ->
+                    transaction {
+                        Companies.select { Companies.inviteCode eq code }
+                            .map { it[Companies.id] }
+                            .singleOrNull()
+                    }
+                }
+                ?.let { foundId -> Pair(foundId, true) }
+                ?: Pair(null, false)
 
             // Update user record
             transaction {
@@ -248,7 +241,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 .withIssuer(issuer)
                 .withAudience(audience)
                 .withClaim("id", userId)
-                .withClaim("companyId", companyId)
+                .withClaim("companyId", companyId?.value ?: 0)
                 .withClaim("isCompanyAdmin", isAdmin)
                 .withClaim("isGlobalAdmin", false)
                 .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
@@ -288,7 +281,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             }
 
             // Extract companyId, isCompanyAdmin, isGlobalAdmin from user row
-            val companyId = user[Users.companyId]?.value ?: 0
+            val companyId = user[Users.companyId] ?: 0
             val isCompanyAdmin = user[Users.isCompanyAdmin]
             val isGlobalAdmin = user[Users.isGlobalAdmin]
 
@@ -302,7 +295,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 .withIssuer(issuer)
                 .withAudience(audience)
                 .withClaim("id", user[Users.id].toString())
-                .withClaim("companyId", companyId)
+                .withClaim("companyId", if (companyId != null) (companyId as Int) else 0)
                 .withClaim("isCompanyAdmin", isCompanyAdmin)
                 .withClaim("isGlobalAdmin", isGlobalAdmin)
                 .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
@@ -325,13 +318,13 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     Users.select { Users.id eq userId }.single()
                 }
 
-                // Fetch company name (unwrap EntityID to Int)
+                // Fetch company name (unwrap nullable companyId and query by Int)
                 val companyName = transaction {
-                    val companyIdValue = row[Users.companyId]?.value
-                    if (companyIdValue == null) return@transaction null
-                    Companies.select { Companies.id eq companyIdValue }
-                        .map { it[Companies.name] }
-                        .singleOrNull()
+                    row[Users.companyId]?.let { companyId ->
+                        Companies.select { Companies.id eq companyId }
+                            .map { it[Companies.name] }
+                            .singleOrNull()
+                    }
                 }
 
                 // Determine role string

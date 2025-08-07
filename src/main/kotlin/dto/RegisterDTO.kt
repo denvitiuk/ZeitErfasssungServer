@@ -13,5 +13,5 @@ data class RegisterDTO(
     val password: String,
     val phone: String? = null,
     /** Код приглашения компании */
-    val inviteCode: String
+    val inviteCode: String? = null
 )

@@ -1,7 +1,6 @@
 package com.yourcompany.zeiterfassung.routes
 
 import io.ktor.server.routing.*
-import io.ktor.server.application.*
 import io.ktor.server.response.*
 import io.ktor.server.request.*
 import io.ktor.http.*
@@ -26,20 +25,20 @@ fun Route.companiesRoutes() {
                         Companies.select { Companies.name like "%${nameFilter}%" }
                             .map {
                                 Company(
-                                    it[Companies.id],
+                                    it[Companies.id].value,
                                     it[Companies.name],
                                     it[Companies.inviteCode],
-                                    it[Companies.createdAt]
+                                    it[Companies.createdAt].toString()
                                 )
                             }
                     } else {
                         Companies.selectAll()
                             .map {
                                 Company(
-                                    it[Companies.id],
+                                    it[Companies.id].value,
                                     it[Companies.name],
                                     it[Companies.inviteCode],
-                                    it[Companies.createdAt]
+                                    it[Companies.createdAt].toString()
                                 )
                             }
                     }
@@ -66,10 +65,10 @@ fun Route.companiesRoutes() {
                     Companies.select { Companies.id eq id }
                         .map {
                             Company(
-                                it[Companies.id],
+                                it[Companies.id].value,
                                 it[Companies.name],
                                 it[Companies.inviteCode],
-                                it[Companies.createdAt]
+                                it[Companies.createdAt].toString()
                             )
                         }
                         .singleOrNull() ?: throw IllegalStateException("Company not found after insert")
