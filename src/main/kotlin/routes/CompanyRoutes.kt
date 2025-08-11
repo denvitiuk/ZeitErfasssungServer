@@ -17,6 +17,10 @@ import com.yourcompany.zeiterfassung.models.Company
 import com.yourcompany.zeiterfassung.models.CompanyRequest
 import com.yourcompany.zeiterfassung.tables.Companies
 
+import com.yourcompany.zeiterfassung.db.Users
+import org.jetbrains.exposed.dao.id.EntityID
+import org.jetbrains.exposed.sql.SortOrder
+
 @Serializable
 private data class VerifyCompanyCodeRequest(val code: String)
 
@@ -26,6 +30,22 @@ private data class InviteCodeResponse(val code: String)
 private data class InviteCodeSetRequest(val code: String)
 @Serializable
 private data class ApiError(val error: String, val detail: String? = null)
+
+@Serializable
+private data class CompanyMetricsDTO(
+    val employees: Int,
+    val active_sessions: Int,
+    val pause_requests: Int,
+    val total_hours_today: Double
+)
+
+@Serializable
+private data class CompanyUserDTO(
+    val id: Int,
+    val name: String,
+    val birth_date: String? = null,
+    val approved: Boolean
+)
 
 private fun String.isValidInvite(): Boolean =
     this.length in 8..16 && this.all { it.isLetterOrDigit() }
@@ -163,6 +183,62 @@ fun Route.companiesRoutes() {
         authenticate("bearerAuth") {
             // ---- SELF scope: companyId taken from JWT ----
             route("/self") {
+                // GET /companies/self/metrics — company-scoped metrics (admin only)
+                get("/metrics") {
+                    val principal = call.principal<JWTPrincipal>()
+                        ?: return@get call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Missing token"))
+
+                    val companyId = principal.payload.getClaim("companyId").asInt() ?: 0
+                    if (companyId <= 0) {
+                        return@get call.respond(HttpStatusCode.BadRequest, ApiError("no_company", "Token has no companyId"))
+                    }
+                    if (!isAdminForCompany(principal, companyId)) {
+                        return@get call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Admin rights required for this company"))
+                    }
+
+                    // Minimal viable metrics; expand later when logs/pause tables are wired up
+                    val employeesCount = transaction {
+                        Users.select { Users.companyId eq EntityID(companyId, Companies) }.count()
+                    }.toInt()
+
+                    val metrics = CompanyMetricsDTO(
+                        employees = employeesCount,
+                        active_sessions = 0,      // TODO: compute from logs (last action == 'in')
+                        pause_requests = 0,       // TODO: from pause_sessions where is_active=true
+                        total_hours_today = 0.0   // TODO: sum of today sessions across users
+                    )
+                    call.respond(HttpStatusCode.OK, metrics)
+                }
+
+                // GET /companies/self/users — list employees of this company (admin only)
+                get("/users") {
+                    val principal = call.principal<JWTPrincipal>()
+                        ?: return@get call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Missing token"))
+
+                    val companyId = principal.payload.getClaim("companyId").asInt() ?: 0
+                    if (companyId <= 0) {
+                        return@get call.respond(HttpStatusCode.BadRequest, ApiError("no_company", "Token has no companyId"))
+                    }
+                    if (!isAdminForCompany(principal, companyId)) {
+                        return@get call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Admin rights required for this company"))
+                    }
+
+                    val list = transaction {
+                        Users
+                            .slice(Users.id, Users.firstName, Users.lastName, Users.birthDate, Users.phoneVerified)
+                            .select { Users.companyId eq EntityID(companyId, Companies) }
+                            .orderBy(Users.lastName to SortOrder.ASC)
+                            .map {
+                                CompanyUserDTO(
+                                    id = it[Users.id].value,
+                                    name = "${it[Users.firstName]} ${it[Users.lastName]}",
+                                    birth_date = it[Users.birthDate].toString(),
+                                    approved = it[Users.phoneVerified]
+                                )
+                            }
+                    }
+                    call.respond(HttpStatusCode.OK, list)
+                }
                 // GET /companies/self/invite-code — return current code
                 get("/invite-code") {
                     val principal = call.principal<JWTPrincipal>()
