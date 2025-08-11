@@ -1,13 +1,16 @@
 package com.yourcompany.zeiterfassung.db
 
 import org.jetbrains.exposed.dao.id.IntIdTable
+import org.jetbrains.exposed.sql.Column
 import org.jetbrains.exposed.sql.javatime.date
 import org.jetbrains.exposed.sql.javatime.datetime
-
 import java.time.LocalDateTime
+import java.util.UUID
 import com.yourcompany.zeiterfassung.db.Companies
+import org.jetbrains.exposed.sql.UUIDColumnType
 
 object Users : IntIdTable("users") {
+    val employeeNumber: Column<UUID> = Users.registerColumn<UUID>("employee_number", UUIDColumnType())
     val firstName     = varchar("first_name", 100)
     val lastName      = varchar("last_name", 100)
     val birthDate     = date("birth_date")

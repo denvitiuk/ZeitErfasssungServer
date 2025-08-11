@@ -82,7 +82,18 @@ data class ProfileResponse(
     val avatar_url: String? = null,
     val company: String? = null,
     val created_at: String
+)
 
+@Serializable
+data class LinkCompanyRequest(val code: String)
+
+@Serializable
+data class LinkCompanyResponse(
+    val token: String,
+    val companyId: Int,
+    val companyName: String,
+    val isCompanyAdmin: Boolean,
+    val alreadyLinked: Boolean = false
 )
 
 fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
@@ -206,7 +217,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                             .singleOrNull()
                     }
                 }
-                ?.let { foundId -> Pair(foundId, true) }
+                ?.let { foundId -> Pair(foundId, false) } // company invite_code should not grant admin
                 ?: Pair(null, false)
 
             // Update user record
@@ -233,7 +244,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             // Fetch user ID by phone
             val userId = transaction {
                 Users.select { Users.phone eq dto.phone }
-                    .map { it[Users.id].toString() }
+                    .map { it[Users.id].value.toString() }
                     .single()
             }
 
@@ -281,7 +292,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             }
 
             // Extract companyId, isCompanyAdmin, isGlobalAdmin from user row
-            val companyId = user[Users.companyId] ?: 0
+            val companyId = user[Users.companyId]?.value ?: 0
             val isCompanyAdmin = user[Users.isCompanyAdmin]
             val isGlobalAdmin = user[Users.isGlobalAdmin]
 
@@ -294,8 +305,8 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             val token = JWT.create()
                 .withIssuer(issuer)
                 .withAudience(audience)
-                .withClaim("id", user[Users.id].toString())
-                .withClaim("companyId", if (companyId != null) (companyId as Int) else 0)
+                .withClaim("id", user[Users.id].value.toString())
+                .withClaim("companyId", companyId)
                 .withClaim("isCompanyAdmin", isCompanyAdmin)
                 .withClaim("isGlobalAdmin", isGlobalAdmin)
                 .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
@@ -339,8 +350,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     .format(DateTimeFormatter.ofPattern("LLLL yyyy", Locale.GERMAN))
 
                 // Build and send response
-                val rawId = row[Users.id].value.toString()
-                val employeeNumber = if (rawId.length > 12) rawId.takeLast(12) else rawId
+                val employeeNumber = row[Users.employeeNumber].toString()
                 val profile = ProfileResponse(
                     first_name = row[Users.firstName],
                     last_name = row[Users.lastName],
@@ -431,6 +441,128 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 // 4) Log and respond
                 println("🔄 [ChangePasswordRoute] Responding with status ${response.second} and body ${response.first}")
                 call.respond(response.second, response.first)
+            }
+        }
+
+        // Link current user to a company by invite code and return updated JWT
+        route("/link-company") {
+            post {
+                val principal = call.principal<JWTPrincipal>()!!
+                val userId = principal.payload.getClaim("id").asString().toInt()
+
+                val req = call.receive<LinkCompanyRequest>()
+                val code = req.code.trim()
+                if (code.isEmpty()) {
+                    return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("code_required"))
+                }
+
+                // 1) Find company by companies.invite_code
+                val companyId: EntityID<Int> = transaction {
+                    Companies
+                        .select { Companies.inviteCode eq code }
+                        .map { it[Companies.id] }
+                        .singleOrNull()
+                } ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("invalid_code"))
+
+                // Load company name and check current linkage
+                val companyName: String = transaction {
+                    Companies
+                        .select { Companies.id eq companyId }
+                        .map { it[Companies.name] }
+                        .single()
+                }
+                val currentCompanyId: EntityID<Int>? = transaction {
+                    Users
+                        .select { Users.id eq userId }
+                        .map { it[Users.companyId] }
+                        .single()
+                }
+                // If already linked to this company, short-circuit and just issue a fresh token
+                if (currentCompanyId != null && currentCompanyId == companyId) {
+                    val jwtConfig = call.application.environment.config.config("ktor.jwt")
+                    val issuer = jwtConfig.property("issuer").getString()
+                    val audience = jwtConfig.property("audience").getString()
+                    val secret = jwtConfig.property("secret").getString()
+                    val expiresIn = jwtConfig.property("validityMs").getString().toLong()
+
+                    val row = transaction { Users.select { Users.id eq userId }.single() }
+                    val tokenSame = JWT.create()
+                        .withIssuer(issuer)
+                        .withAudience(audience)
+                        .withClaim("id", row[Users.id].value.toString())
+                        .withClaim("companyId", row[Users.companyId]?.value ?: 0)
+                        .withClaim("isCompanyAdmin", row[Users.isCompanyAdmin])
+                        .withClaim("isGlobalAdmin", row[Users.isGlobalAdmin])
+                        .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
+                        .sign(Algorithm.HMAC256(secret))
+
+                    call.application.environment.log.info("link-company: user=$userId already linked to company=${companyId.value}, returning fresh token")
+                    return@post call.respond(
+                        HttpStatusCode.OK,
+                        LinkCompanyResponse(
+                            token = tokenSame,
+                            companyId = companyId.value,
+                            companyName = companyName,
+                            isCompanyAdmin = row[Users.isCompanyAdmin],
+                            alreadyLinked = true
+                        )
+                    )
+                }
+                // If linked to a different company, forbid switching here (safety)
+                if (currentCompanyId != null && currentCompanyId != companyId) {
+                    return@post call.respond(
+                        HttpStatusCode.Forbidden,
+                        ErrorResponse("already_linked_to_another_company")
+                    )
+                }
+
+                // 2) Attach user to company, make first user admin
+                transaction {
+                    // attach
+                    Users.update({ Users.id eq userId }) {
+                        it[Users.companyId] = companyId
+                    }
+                    // first in company becomes admin
+                    val hasAdmin = Users
+                        .select { (Users.companyId eq companyId) and (Users.isCompanyAdmin eq true) }
+                        .any()
+                    if (!hasAdmin) {
+                        Users.update({ Users.id eq userId }) {
+                            it[Users.isCompanyAdmin] = true
+                        }
+                    }
+                    call.application.environment.log.info("link-company: user=$userId -> company=${companyId.value}, first_admin=${!hasAdmin}")
+                }
+
+                // 3) Issue updated JWT with fresh claims
+                val jwtConfig = call.application.environment.config.config("ktor.jwt")
+                val issuer = jwtConfig.property("issuer").getString()
+                val audience = jwtConfig.property("audience").getString()
+                val secret = jwtConfig.property("secret").getString()
+                val expiresIn = jwtConfig.property("validityMs").getString().toLong()
+
+                val row = transaction { Users.select { Users.id eq userId }.single() }
+                val newToken = JWT.create()
+                    .withIssuer(issuer)
+                    .withAudience(audience)
+                    .withClaim("id", row[Users.id].value.toString())
+                    .withClaim("companyId", row[Users.companyId]?.value ?: 0)
+                    .withClaim("isCompanyAdmin", row[Users.isCompanyAdmin])
+                    .withClaim("isGlobalAdmin", row[Users.isGlobalAdmin])
+                    .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
+                    .sign(Algorithm.HMAC256(secret))
+
+                val isAdminNow = row[Users.isCompanyAdmin]
+                call.respond(
+                    HttpStatusCode.OK,
+                    LinkCompanyResponse(
+                        token = newToken,
+                        companyId = companyId.value,
+                        companyName = companyName,
+                        isCompanyAdmin = isAdminNow,
+                        alreadyLinked = false
+                    )
+                )
             }
         }
     }
