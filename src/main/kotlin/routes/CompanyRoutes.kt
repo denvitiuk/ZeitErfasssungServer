@@ -47,6 +47,11 @@ private data class CompanyUserDTO(
     val approved: Boolean
 )
 
+@Serializable
+private data class HoursSeriesDTO(
+    val series: List<Double>
+)
+
 private fun String.isValidInvite(): Boolean =
     this.length in 8..16 && this.all { it.isLetterOrDigit() }
 
@@ -238,6 +243,27 @@ fun Route.companiesRoutes() {
                             }
                     }
                     call.respond(HttpStatusCode.OK, list)
+                }
+                // GET /companies/self/hours?period=daily|weekly — sample time series for charts (admin only)
+                get("/hours") {
+                    val principal = call.principal<JWTPrincipal>()
+                        ?: return@get call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Missing token"))
+
+                    val companyId = principal.payload.getClaim("companyId").asInt() ?: 0
+                    if (companyId <= 0) {
+                        return@get call.respond(HttpStatusCode.BadRequest, ApiError("no_company", "Token has no companyId"))
+                    }
+                    if (!isAdminForCompany(principal, companyId)) {
+                        return@get call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Admin rights required for this company"))
+                    }
+
+                    val period = call.request.queryParameters["period"]?.lowercase() ?: "daily"
+                    val series = if (period == "weekly")
+                        listOf(400.0, 450.0, 420.0, 500.0, 550.0, 530.0, 600.0)
+                    else
+                        listOf(60.0, 50.0, 30.0, 70.0, 80.0, 65.0, 100.0)
+
+                    call.respond(HttpStatusCode.OK, HoursSeriesDTO(series))
                 }
                 // GET /companies/self/invite-code — return current code
                 get("/invite-code") {
