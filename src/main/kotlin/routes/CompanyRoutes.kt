@@ -30,7 +30,7 @@ private data class InviteCodeResponse(val code: String)
 @Serializable
 private data class InviteCodeSetRequest(val code: String)
 @Serializable
-private data class ApiError(val error: String, val detail: String? = null)
+data class ApiError(val error: String, val detail: String? = null)
 
 @Serializable
 private data class CompanyMetricsDTO(

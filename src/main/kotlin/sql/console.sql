@@ -258,7 +258,6 @@ FROM proofs
 
 
 
--- Migration fix: backfill null company_id and enforce NOT NULL
 DO $$
 DECLARE
 comp_id INTEGER;
@@ -278,9 +277,9 @@ UPDATE users
 SET company_id = comp_id
 WHERE company_id IS NULL;
 
--- 3) Now enforce the NOT NULL constraint
+-- 3) Now allow company_id to be nullable
 ALTER TABLE users
-    ALTER COLUMN company_id SET NOT NULL;
+    ALTER COLUMN company_id DROP NOT NULL;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -290,8 +289,123 @@ CREATE INDEX IF NOT EXISTS idx_users_company
 
 ALTER TABLE users
     ADD COLUMN is_company_admin BOOLEAN NOT NULL DEFAULT FALSE,
-  ADD COLUMN is_global_admin  BOOLEAN NOT NULL DEFAULT FALSE;
+    ADD COLUMN is_global_admin  BOOLEAN NOT NULL DEFAULT FALSE;
 
 
 ALTER TABLE users
     ALTER COLUMN company_id DROP NOT NULL;
+
+-- === Hardening: unique roles & identities ===
+-- Ensure at most one admin per company
+CREATE UNIQUE INDEX IF NOT EXISTS uq_company_admin
+    ON users(company_id)
+    WHERE is_company_admin = TRUE;
+
+-- Ensure employee_number is globally unique
+CREATE UNIQUE INDEX IF NOT EXISTS uq_users_employee_number
+    ON users(employee_number);
+
+-- Case-insensitive uniqueness for emails (if CITEXT is not used)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email_lower
+    ON users (lower(email));
+
+
+CREATE TABLE IF NOT EXISTS projects (
+                                        id          SERIAL PRIMARY KEY,
+                                        company_id  INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    title       VARCHAR(120) NOT NULL,
+    description TEXT,
+    location    TEXT,
+    lat         DOUBLE PRECISION,
+    lng         DOUBLE PRECISION,
+    created_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+
+    CONSTRAINT projects_title_unique_per_company UNIQUE (company_id, title),
+    CONSTRAINT projects_lat_check CHECK (lat IS NULL OR (lat >= -90 AND lat <= 90)),
+    CONSTRAINT projects_lng_check CHECK (lng IS NULL OR (lng >= -180 AND lng <= 180))
+    );
+
+CREATE INDEX IF NOT EXISTS idx_projects_company_id ON projects(company_id);
+
+-- Keep updated_at in sync
+CREATE OR REPLACE FUNCTION projects_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger WHERE tgname = 'trg_projects_updated_at'
+  ) THEN
+CREATE TRIGGER trg_projects_updated_at
+    BEFORE UPDATE ON projects
+    FOR EACH ROW EXECUTE FUNCTION projects_set_updated_at();
+END IF;
+END;
+$$;
+
+-- 2) Project members (many-to-many users↔projects), with simple role
+CREATE TABLE IF NOT EXISTS project_members (
+                                               project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    user_id     INTEGER NOT NULL REFERENCES users(id)    ON DELETE CASCADE,
+    role        SMALLINT NOT NULL DEFAULT 0,   -- 0=member, 1=manager (на будущее)
+    joined_at   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    PRIMARY KEY (project_id, user_id)
+    );
+
+CREATE INDEX IF NOT EXISTS idx_project_members_user_id ON project_members(user_id);
+
+-- (Опционально, но очень полезно) Гарантия: пользователь и проект одной компании
+CREATE OR REPLACE FUNCTION ensure_same_company_project_members()
+RETURNS TRIGGER AS $$
+DECLARE
+proj_company  INTEGER;
+  user_company  INTEGER;
+BEGIN
+SELECT company_id INTO proj_company FROM projects WHERE id = NEW.project_id;
+SELECT company_id INTO user_company FROM users    WHERE id = NEW.user_id;
+IF proj_company IS NULL OR user_company IS NULL OR proj_company <> user_company THEN
+    RAISE EXCEPTION 'User and project must belong to the same company';
+END IF;
+RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger WHERE tgname = 'trg_project_members_same_company'
+  ) THEN
+CREATE TRIGGER trg_project_members_same_company
+    BEFORE INSERT OR UPDATE ON project_members
+                         FOR EACH ROW EXECUTE FUNCTION ensure_same_company_project_members();
+END IF;
+END;
+$$;
+
+-- 3) Link logs with projects for reporting (nullable)
+ALTER TABLE logs
+    ADD COLUMN IF NOT EXISTS project_id INTEGER;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.table_constraints
+    WHERE table_name = 'logs' AND constraint_name = 'fk_logs_project'
+  ) THEN
+ALTER TABLE logs
+    ADD CONSTRAINT fk_logs_project
+        FOREIGN KEY (project_id)
+            REFERENCES projects(id)
+            ON DELETE SET NULL;
+END IF;
+END;
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_logs_project_id ON logs(project_id);

@@ -152,6 +152,7 @@ fun Application.module() {
             deviceTokenRoutes()
             adminInviteRoutes(env)
             companiesRoutes()
+            projectsRoutes()
         }
     }
 }
