@@ -153,6 +153,7 @@ fun Application.module() {
             adminInviteRoutes(env)
             companiesRoutes()
             projectsRoutes()
+            timesheetRoutes()
         }
     }
 }
