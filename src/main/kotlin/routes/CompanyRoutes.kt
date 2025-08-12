@@ -18,6 +18,7 @@ import com.yourcompany.zeiterfassung.models.CompanyRequest
 import com.yourcompany.zeiterfassung.tables.Companies
 
 import com.yourcompany.zeiterfassung.db.Users
+import io.ktor.server.application.log
 import org.jetbrains.exposed.dao.id.EntityID
 import org.jetbrains.exposed.sql.SortOrder
 
@@ -369,38 +370,39 @@ fun Route.companiesRoutes() {
                         )
                     }
 
-                    try {
-                        val updated = transaction {
-                            Companies.update({
-                                Companies.id eq org.jetbrains.exposed.dao.id.EntityID(
-                                    companyId,
-                                    Companies
-                                )
-                            }) {
-                                it[inviteCode] = desired
-                            }
-                        }
-                        if (updated == 0) {
-                            return@put call.respond(HttpStatusCode.NotFound, ApiError("not_found", "Company not found"))
-                        }
-                        call.respond(HttpStatusCode.OK, InviteCodeResponse(desired))
-                    } catch (e: org.jetbrains.exposed.exceptions.ExposedSQLException) {
-                        if (e.sqlState == "23505") {
-                            return@put call.respond(
-                                HttpStatusCode.Conflict,
-                                ApiError("code_taken", "Invite code already in use")
+                try {
+                    val updated = transaction {
+                        Companies.update({
+                            Companies.id eq org.jetbrains.exposed.dao.id.EntityID(
+                                companyId,
+                                Companies
                             )
+                        }) {
+                            it[inviteCode] = desired
                         }
+                    }
+                    if (updated == 0) {
+                        return@put call.respond(HttpStatusCode.NotFound, ApiError("not_found", "Company not found"))
+                    }
+                    call.respond(HttpStatusCode.OK, InviteCodeResponse(desired))
+                } catch (e: org.jetbrains.exposed.exceptions.ExposedSQLException) {
+                    if (e.sqlState == "23505") {
                         return@put call.respond(
-                            HttpStatusCode.InternalServerError,
-                            ApiError("update_failed", e.message)
-                        )
-                    } catch (e: Exception) {
-                        return@put call.respond(
-                            HttpStatusCode.InternalServerError,
-                            ApiError("update_failed", e.message)
+                            HttpStatusCode.Conflict,
+                            ApiError("code_taken", "Invite code already in use")
                         )
                     }
+                    return@put call.respond(
+                        HttpStatusCode.InternalServerError,
+                        ApiError("update_failed", e.message)
+                    )
+                } catch (e: Exception) {
+                    call.application.log.error("Error updating invite code for self company $companyId", e)
+                    return@put call.respond(
+                        HttpStatusCode.InternalServerError,
+                        ApiError("update_failed", e.message)
+                    )
+                }
                 }
             }
 
@@ -530,6 +532,7 @@ fun Route.companiesRoutes() {
                     }
                     return@put call.respond(HttpStatusCode.InternalServerError, ApiError("update_failed", e.message))
                 } catch (e: Exception) {
+                    call.application.log.error("Error updating invite code for company $companyId", e)
                     return@put call.respond(HttpStatusCode.InternalServerError, ApiError("update_failed", e.message))
                 }
             }
