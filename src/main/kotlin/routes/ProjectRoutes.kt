@@ -72,6 +72,27 @@ private fun ResultRow.toProjectListItemDTO(membersCount: Int? = null): ProjectLi
 private fun userName(first: String?, last: String?): String =
     listOfNotNull(first?.takeIf { it.isNotBlank() }, last?.takeIf { it.isNotBlank() }).joinToString(" ").trim()
 
+private fun membersForProject(projectEntityId: EntityID<Int>): List<ProjectMemberDTO> = transaction {
+    (ProjectMembers innerJoin Users)
+        .slice(
+            ProjectMembers.userId,
+            ProjectMembers.role,
+            ProjectMembers.joinedAt,
+            Users.firstName,
+            Users.lastName
+        )
+        .select { ProjectMembers.projectId eq projectEntityId }
+        .orderBy(Users.lastName to SortOrder.ASC, Users.firstName to SortOrder.ASC)
+        .map {
+            ProjectMemberDTO(
+                userId   = it[ProjectMembers.userId].value,
+                name     = userName(it[Users.firstName], it[Users.lastName]),
+                role     = it[ProjectMembers.role].toInt(),
+                joinedAt = it[ProjectMembers.joinedAt].toString()
+            )
+        }
+}
+
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
@@ -100,13 +121,23 @@ fun Route.projectsRoutes() {
                         .orderBy(Projects.createdAt, SortOrder.DESC)
                         .toList()
 
-                    val countsByProject = ProjectMembers
-                        .slice(ProjectMembers.projectId, ProjectMembers.userId.count())
-                        .select { ProjectMembers.projectId inList base.map { it[Projects.id] } }
-                        .groupBy(ProjectMembers.projectId)
-                        .associate { row -> row[ProjectMembers.projectId].value to row[ProjectMembers.userId.count()].toInt() }
+                    val baseIds = base.map { it[Projects.id] }
+                    val countsByProject: Map<Int, Int> = if (baseIds.isEmpty()) {
+                        emptyMap()
+                    } else {
+                        ProjectMembers
+                            .slice(ProjectMembers.projectId, ProjectMembers.userId.count())
+                            .select { ProjectMembers.projectId inList baseIds }
+                            .groupBy(ProjectMembers.projectId)
+                            .associate { row ->
+                                row[ProjectMembers.projectId].value to row[ProjectMembers.userId.count()].toInt()
+                            }
+                    }
 
-                    base.map { it.toProjectListItemDTO(membersCount = countsByProject[it[Projects.id].value]) }
+                    base.map { row ->
+                        val count = countsByProject[row[Projects.id].value] ?: 0
+                        row.toProjectListItemDTO(membersCount = count)
+                    }
                 }
 
                 call.respond(HttpStatusCode.OK, items)
@@ -282,20 +313,7 @@ fun Route.projectsRoutes() {
                 val row = requireSameCompanyOr404(projectId, companyId)
                     ?: return@get call.respond(HttpStatusCode.NotFound, ApiErrorProject("not_found", "Project not found"))
 
-                val members = transaction {
-                    (ProjectMembers innerJoin Users)
-                        .slice(ProjectMembers.userId, ProjectMembers.role, ProjectMembers.joinedAt, Users.firstName, Users.lastName)
-                        .select { ProjectMembers.projectId eq row[Projects.id] }
-                        .orderBy(Users.lastName to SortOrder.ASC, Users.firstName to SortOrder.ASC)
-                        .map {
-                            ProjectMemberDTO(
-                                userId = it[ProjectMembers.userId].value,
-                                name   = userName(it[Users.firstName], it[Users.lastName]),
-                                role   = it[ProjectMembers.role].toInt(),
-                                joinedAt = it[ProjectMembers.joinedAt].toString()
-                            )
-                        }
-                }
+                val members = membersForProject(row[Projects.id])
                 call.respond(HttpStatusCode.OK, members)
             }
 
@@ -328,7 +346,8 @@ fun Route.projectsRoutes() {
                             body.role?.let { r -> it[role] = r.toShort() }
                         }
                     }
-                    call.respond(HttpStatusCode.OK, OkResponse(true))
+                    val members = membersForProject(row[Projects.id])
+                    call.respond(HttpStatusCode.OK, members)
                 } catch (e: Exception) {
                     call.application.log.error("Add member failed", e)
                     call.respond(HttpStatusCode.InternalServerError, ApiErrorProject("add_member_failed", e.message))
@@ -360,7 +379,8 @@ fun Route.projectsRoutes() {
                     }
                 }
                 if (deleted == 0) return@delete call.respond(HttpStatusCode.NotFound, ApiErrorProject("not_found", "Member not found"))
-                call.respond(HttpStatusCode.OK, OkResponse(true))
+                val members = membersForProject(row[Projects.id])
+                call.respond(HttpStatusCode.OK, members)
             }
 
             // POST /projects/{id}/members/bulk-set  — replace membership
@@ -404,10 +424,8 @@ fun Route.projectsRoutes() {
                             }
                         }
                     }
-                    val membersCount = transaction {
-                        ProjectMembers.select { ProjectMembers.projectId eq row[Projects.id] }.count().toInt()
-                    }
-                    call.respond(HttpStatusCode.OK, row.toProjectDTO(membersCount))
+                    val members = membersForProject(row[Projects.id])
+                    call.respond(HttpStatusCode.OK, members)
                 } catch (e: Exception) {
                     call.application.log.error("Bulk set members failed", e)
                     call.respond(HttpStatusCode.InternalServerError, ApiErrorProject("bulk_set_failed", e.message))
