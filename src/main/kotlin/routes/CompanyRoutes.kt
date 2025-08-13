@@ -17,6 +17,9 @@ import com.yourcompany.zeiterfassung.models.Company
 import com.yourcompany.zeiterfassung.models.CompanyRequest
 import com.yourcompany.zeiterfassung.tables.Companies
 
+import com.yourcompany.zeiterfassung.models.PauseSessions
+import java.time.*
+
 import com.yourcompany.zeiterfassung.db.Users
 import io.ktor.server.application.log
 import org.jetbrains.exposed.dao.id.EntityID
@@ -51,6 +54,17 @@ private data class CompanyUserDTO(
 @Serializable
 private data class HoursSeriesDTO(
     val series: List<Double>
+)
+
+@Serializable
+private data class CompanyPauseDTO(
+    val id: Int,
+    val userId: Int,
+    val name: String,
+    val startedAt: String,
+    val endedAt: String? = null,
+    val isActive: Boolean,
+    val minutes: Int
 )
 
 private fun String.isValidInvite(): Boolean =
@@ -265,6 +279,82 @@ fun Route.companiesRoutes() {
                         listOf(60.0, 50.0, 30.0, 70.0, 80.0, 65.0, 100.0)
 
                     call.respond(HttpStatusCode.OK, HoursSeriesDTO(series))
+                }
+                // GET /companies/self/pause-sessions — returns all inactive pause sessions for the company
+                get("/pause-sessions") {
+                    val principal = call.principal<JWTPrincipal>()
+                        ?: return@get call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Missing token"))
+
+                    val companyId = principal.payload.getClaim("companyId").asInt() ?: 0
+                    if (companyId <= 0) {
+                        return@get call.respond(HttpStatusCode.BadRequest, ApiError("no_company", "Token has no companyId"))
+                    }
+                    if (!isAdminForCompany(principal, companyId)) {
+                        return@get call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Admin rights required for this company"))
+                    }
+
+                    val tz = try {
+                        ZoneId.of(call.request.queryParameters["tz"] ?: "Europe/Berlin")
+                    } catch (_: Exception) { ZoneId.of("Europe/Berlin") }
+
+                    data class Row(
+                        val id: Int,
+                        val uid: Int,
+                        val first: String,
+                        val last: String,
+                        val started: LocalDateTime,
+                        val ended: LocalDateTime?,
+                        val active: Boolean
+                    )
+
+                    val rows: List<Row> = transaction {
+                        val q = (PauseSessions innerJoin Users)
+                            .slice(
+                                PauseSessions.id,
+                                PauseSessions.userId,
+                                Users.firstName,
+                                Users.lastName,
+                                PauseSessions.startedAt,
+                                PauseSessions.endedAt,
+                                PauseSessions.isActive
+                            )
+                            .select {
+                                (Users.companyId eq EntityID(companyId, Companies)) and
+                                (PauseSessions.isActive eq false)
+                            }
+                            .orderBy(PauseSessions.startedAt to SortOrder.DESC)
+
+                        q.map { r ->
+                            Row(
+                                id = r[PauseSessions.id].value,
+                                uid = r[PauseSessions.userId],
+                                first = r[Users.firstName],
+                                last = r[Users.lastName],
+                                started = r[PauseSessions.startedAt],
+                                ended = r[PauseSessions.endedAt],
+                                active = r[PauseSessions.isActive]
+                            )
+                        }
+                    }
+
+                    val now = ZonedDateTime.now(tz)
+                    val payload = rows.map { r ->
+                        val startZ = r.started.atZone(tz)
+                        val endZ   = r.ended?.atZone(tz)
+                        val endForCalc = endZ ?: now
+                        val mins = Duration.between(startZ, endForCalc).toMinutes().toInt().coerceAtLeast(0)
+                        CompanyPauseDTO(
+                            id = r.id,
+                            userId = r.uid,
+                            name = "${r.first} ${r.last}".trim(),
+                            startedAt = startZ.toOffsetDateTime().toString(),
+                            endedAt = endZ?.toOffsetDateTime()?.toString(),
+                            isActive = r.active,
+                            minutes = mins
+                        )
+                    }
+
+                    call.respond(HttpStatusCode.OK, payload)
                 }
                 // GET /companies/self/invite-code — return current code
                 get("/invite-code") {
