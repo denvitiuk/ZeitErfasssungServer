@@ -154,6 +154,9 @@ fun Application.module() {
             companiesRoutes()
             projectsRoutes()
             timesheetRoutes()
+            companyMonthsRoutes()
+            companyTimesheetRoutes()
+
         }
     }
 }

@@ -1,5 +1,6 @@
 package com.yourcompany.zeiterfassung.models
 
+import com.yourcompany.zeiterfassung.db.Projects
 import com.yourcompany.zeiterfassung.db.Users
 import com.yourcompany.zeiterfassung.models.Nonces
 
@@ -24,6 +25,8 @@ object Logs : Table("logs") {
     val latitude      = double("latitude").nullable()
     val longitude     = double("longitude").nullable()
     val locationDesc  = text("location_description").nullable()
+
+    val projectId = reference("project_id", Projects.id, onDelete = ReferenceOption.SET_NULL).nullable()
 
     override val primaryKey = PrimaryKey(id, name = "pk_logs")
 }
