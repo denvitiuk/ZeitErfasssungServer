@@ -67,6 +67,52 @@ private data class CompanyPauseDTO(
     val minutes: Int
 )
 
+@Serializable
+private data class CompanyCurrentSessionDTO(
+    val userId: Int,
+    val name: String,
+    val startedAt: String,
+    val projectId: Int? = null,
+    val minutes: Int
+)
+
+// === Metrics helpers =========================================================
+// Count open work sessions (last action == 'in'). If projectId is null/<=0 —
+// count across all projects (including NULL project_id).
+private fun countActiveSessions(companyId: Int, projectId: Int?): Int = transaction {
+    val projectCond = if (projectId != null && projectId > 0) {
+        " AND l.project_id = $projectId "
+    } else {
+        ""
+    }
+    var count = 0
+    val sql = """
+        SELECT COUNT(*) AS c FROM (
+            SELECT DISTINCT ON (l.user_id) l.user_id, l.action
+            FROM logs l
+            JOIN users u ON u.id = l.user_id
+            WHERE u.company_id = $companyId
+              $projectCond
+            ORDER BY l.user_id, l."timestamp" DESC
+        ) t
+        WHERE lower(t.action) = 'in'
+    """.trimIndent()
+    exec(sql) { rs -> if (rs.next()) count = rs.getInt("c") }
+    count
+}
+
+// Count active (not finished) pause sessions for the company.
+private fun countActivePauseRequests(companyId: Int): Int = transaction {
+    (PauseSessions innerJoin Users)
+        .slice(PauseSessions.id)
+        .select {
+            (Users.companyId eq EntityID(companyId, Companies)) and
+            (PauseSessions.isActive eq true)
+        }
+        .count()
+        .toInt()
+}
+
 private fun String.isValidInvite(): Boolean =
     this.length in 8..16 && this.all { it.isLetterOrDigit() }
 
@@ -216,16 +262,21 @@ fun Route.companiesRoutes() {
                         return@get call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Admin rights required for this company"))
                     }
 
-                    // Minimal viable metrics; expand later when logs/pause tables are wired up
+                    // optional project filter: ?projectId=8 ; 0 or missing = all
+                    val projectId = call.request.queryParameters["projectId"]?.toIntOrNull()
+
                     val employeesCount = transaction {
                         Users.select { Users.companyId eq EntityID(companyId, Companies) }.count()
                     }.toInt()
 
+                    val activeSessions = countActiveSessions(companyId, projectId)
+                    val activePauses   = countActivePauseRequests(companyId)
+
                     val metrics = CompanyMetricsDTO(
                         employees = employeesCount,
-                        active_sessions = 0,      // TODO: compute from logs (last action == 'in')
-                        pause_requests = 0,       // TODO: from pause_sessions where is_active=true
-                        total_hours_today = 0.0   // TODO: sum of today sessions across users
+                        active_sessions = activeSessions,
+                        pause_requests = activePauses,
+                        total_hours_today = 0.0 // TODO: implement simple same-day sum later
                     )
                     call.respond(HttpStatusCode.OK, metrics)
                 }
@@ -280,6 +331,92 @@ fun Route.companiesRoutes() {
 
                     call.respond(HttpStatusCode.OK, HoursSeriesDTO(series))
                 }
+                // GET /companies/self/current-sessions — returns all open work sessions (last action == 'in') for the company
+                get("/current-sessions") {
+                    val principal = call.principal<JWTPrincipal>()
+                        ?: return@get call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Missing token"))
+
+                    val companyId = principal.payload.getClaim("companyId").asInt() ?: 0
+                    if (companyId <= 0) {
+                        return@get call.respond(HttpStatusCode.BadRequest, ApiError("no_company", "Token has no companyId"))
+                    }
+                    if (!isAdminForCompany(principal, companyId)) {
+                        return@get call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Admin rights required for this company"))
+                    }
+
+                    val tz = try {
+                        ZoneId.of(call.request.queryParameters["tz"] ?: "Europe/Berlin")
+                    } catch (_: Exception) { ZoneId.of("Europe/Berlin") }
+
+                    // optional project filter: ?projectId=8 ; 0 or missing = all
+                    val projectIdParam = call.request.queryParameters["projectId"]?.toIntOrNull()
+                    val projectCond = if (projectIdParam != null && projectIdParam > 0) {
+                        " AND l.project_id = $projectIdParam "
+                    } else {
+                        ""
+                    }
+
+                    data class Row(
+                        val userId: Int,
+                        val first: String,
+                        val last: String,
+                        val started: LocalDateTime,
+                        val projectId: Int?
+                    )
+
+                    val rows: List<Row> = transaction {
+                        val out = mutableListOf<Row>()
+                        val sql = """
+                            SELECT DISTINCT ON (l.user_id)
+                                   l.user_id,
+                                   l.action,
+                                   l.timestamp,
+                                   l.project_id,
+                                   u.first_name,
+                                   u.last_name
+                            FROM logs l
+                            JOIN users u ON u.id = l.user_id
+                            WHERE u.company_id = $companyId
+                              $projectCond
+                            ORDER BY l.user_id, l.timestamp DESC
+                        """.trimIndent()
+                        exec(sql) { rs ->
+                            while (rs.next()) {
+                                val action = rs.getString("action")?.lowercase()
+                                if (action == "in") {
+                                    val uid = rs.getInt("user_id")
+                                    val ts  = rs.getTimestamp("timestamp").toLocalDateTime()
+                                    val pidObj = rs.getObject("project_id")
+                                    val pid = when (pidObj) {
+                                        null -> null
+                                        is Number -> pidObj.toInt()
+                                        else -> null
+                                    }
+                                    val fn = rs.getString("first_name") ?: ""
+                                    val ln = rs.getString("last_name") ?: ""
+                                    out += Row(uid, fn, ln, ts, pid)
+                                }
+                            }
+                        }
+                        out
+                    }
+
+                    val now = ZonedDateTime.now(tz)
+                    val payload = rows.map { r ->
+                        val startZ = r.started.atZone(tz)
+                        val mins = Duration.between(startZ, now).toMinutes().toInt().coerceAtLeast(0)
+                        CompanyCurrentSessionDTO(
+                            userId = r.userId,
+                            name = "${r.first} ${r.last}".trim(),
+                            startedAt = startZ.toOffsetDateTime().toString(),
+                            projectId = r.projectId,
+                            minutes = mins
+                        )
+                    }
+
+                    call.respond(HttpStatusCode.OK, payload)
+                }
+
                 // GET /companies/self/pause-sessions — returns all inactive pause sessions for the company
                 get("/pause-sessions") {
                     val principal = call.principal<JWTPrincipal>()

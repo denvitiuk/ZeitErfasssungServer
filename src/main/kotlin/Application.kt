@@ -10,6 +10,8 @@ import io.ktor.server.application.*
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.plugins.cors.routing.CORS
+import io.ktor.server.http.content.*
+import java.io.File
 
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
@@ -143,6 +145,9 @@ fun Application.module() {
         passwordResetRoutes(twilioFrom, env)
         authRoutes(twilioFrom, verifyServiceSid)
 
+        // Public static file serving for uploaded images (before/after)
+        staticFiles("/files", File("uploads"))
+
         authenticate("bearerAuth") {
             qrRoutes()
             scanRoutes()
@@ -153,6 +158,7 @@ fun Application.module() {
             adminInviteRoutes(env)
             companiesRoutes()
             projectsRoutes()
+            workPhotoRoutes()
             timesheetRoutes()
             companyMonthsRoutes()
             companyTimesheetRoutes()

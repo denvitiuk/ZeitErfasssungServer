@@ -1,5 +1,3 @@
-
-
 -- Enable pgcrypto extension for UUID generation
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
@@ -75,7 +73,7 @@ ALTER TABLE users
 
 
 
-ALTER ROLE yuliyanatasheva WITH PASSWORD 'SOLGANn47@25'
+
 
 ALTER TABLE users
     ADD COLUMN phone_verified BOOLEAN NOT NULL DEFAULT FALSE;
@@ -309,7 +307,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_users_employee_number
 CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email_lower
     ON users (lower(email));
 
+-- === Projects & Membership (v1) =============================================
 
+-- 1) Projects table per company
 CREATE TABLE IF NOT EXISTS projects (
                                         id          SERIAL PRIMARY KEY,
                                         company_id  INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -409,3 +409,88 @@ END;
 $$;
 
 CREATE INDEX IF NOT EXISTS idx_logs_project_id ON logs(project_id);
+-- === End Projects & Membership ==============================================
+
+
+
+UPDATE logs
+SET project_id = 8
+WHERE project_id IS NULL;
+
+
+
+-- === Work Photos ============================================================
+-- Фото ДО/ПОСЛЕ, загруженные сотрудниками для проектов компании
+
+CREATE TABLE IF NOT EXISTS work_photos (
+                                           id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    company_id   INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    project_id   INTEGER NOT NULL REFERENCES projects(id)  ON DELETE CASCADE,
+    user_id      INTEGER NOT NULL REFERENCES users(id)     ON DELETE CASCADE,
+
+    -- Маркеры и метаданные
+    type         VARCHAR(10) NOT NULL CHECK (type IN ('BEFORE','AFTER')),  -- ДО/ПОСЛЕ
+    caption      TEXT,
+    status       SMALLINT NOT NULL DEFAULT 0 CHECK (status IN (0,1,2)),    -- 0=pending, 1=approved, 2=rejected
+
+-- Где лежит файл (ключ в S3/MinIO или путь на диске) и, при необходимости, отдаваемый URL
+    storage_key  TEXT NOT NULL,           -- напр. "projects/42/8dbf...c6.jpg"
+    url          TEXT,                    -- публичный/подписанный URL (может генериться на лету — поле опционально)
+
+-- Технические поля
+    width        INTEGER,
+    height       INTEGER,
+    size_bytes   BIGINT,
+    checksum_md5 BYTEA,                   -- опционально: md5/sha256 содержимого
+
+    taken_at     TIMESTAMPTZ,             -- когда сделано фото (клиент может прислать)
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),  -- когда запись создана на сервере
+
+    approved_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    approved_at  TIMESTAMPTZ,
+    rejected_reason TEXT
+    );
+
+-- Индексы под частые выборки
+CREATE INDEX IF NOT EXISTS idx_work_photos_company   ON work_photos(company_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_work_photos_project   ON work_photos(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_work_photos_user      ON work_photos(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_work_photos_type      ON work_photos(project_id, type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_work_photos_status    ON work_photos(status);
+
+-- Триггер: подтягиваем company_id из проекта и проверяем, что user и project из одной компании
+CREATE OR REPLACE FUNCTION work_photos_set_company_and_validate()
+    RETURNS TRIGGER AS $$
+DECLARE
+proj_company  INTEGER;
+    user_company  INTEGER;
+BEGIN
+SELECT company_id INTO proj_company FROM projects WHERE id = NEW.project_id;
+IF proj_company IS NULL THEN
+        RAISE EXCEPTION 'Project % not found or has no company', NEW.project_id;
+END IF;
+
+SELECT company_id INTO user_company FROM users WHERE id = NEW.user_id;
+IF user_company IS NULL OR user_company <> proj_company THEN
+        RAISE EXCEPTION 'User % and project % must belong to the same company', NEW.user_id, NEW.project_id;
+END IF;
+
+    -- Если кто-то не передал company_id — выставим автоматически.
+    NEW.company_id := proj_company;
+RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_trigger WHERE tgname = 'trg_work_photos_company_validate'
+        ) THEN
+CREATE TRIGGER trg_work_photos_company_validate
+    BEFORE INSERT OR UPDATE ON work_photos
+                         FOR EACH ROW EXECUTE FUNCTION work_photos_set_company_and_validate();
+END IF;
+END;
+$$;
+-- === End Work Photos ========================================================
