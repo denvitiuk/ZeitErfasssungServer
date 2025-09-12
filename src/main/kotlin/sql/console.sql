@@ -494,3 +494,185 @@ END IF;
 END;
 $$;
 -- === End Work Photos ========================================================
+
+
+SELECT datname FROM pg_database WHERE datistemplate = false;
+
+
+
+-- 0) На всякий: расширение для UUID/crypto
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- 1) Компания: лимит мест + режим учёта мест
+ALTER TABLE companies
+    ADD COLUMN IF NOT EXISTS max_seats INTEGER NOT NULL DEFAULT 5,
+    ADD COLUMN IF NOT EXISTS seat_mode  TEXT    NOT NULL DEFAULT 'auto'; -- 'auto' или 'manual'
+
+-- 2) Пользователь: активность (чтоб считать только активных)
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Индекс под частые выборки активных сотрудников компании
+CREATE INDEX IF NOT EXISTS idx_users_company_active
+    ON users(company_id)
+    WHERE is_active;
+
+-- 3) Подписка компании (текущее состояние)
+--    Если хочешь хранить историю позже — сделаем отдельную таблицу событий.
+CREATE TABLE IF NOT EXISTS subscriptions (
+                                             id                       SERIAL PRIMARY KEY,
+                                             company_id               INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    stripe_customer_id       TEXT,
+    stripe_subscription_id   TEXT,
+    price_id                 TEXT,
+    status                   TEXT,                -- raw из Stripe: active, trialing, past_due, canceled, incomplete, unpaid...
+    current_period_end       TIMESTAMPTZ,         -- конец оплаченного периода
+    unpaid_since             TIMESTAMPTZ,         -- когда впервые стали "не оплачены" для grace-политики
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_subscriptions_company UNIQUE (company_id)
+    );
+
+-- Обновляем updated_at автоматически
+CREATE OR REPLACE FUNCTION subscriptions_set_updated_at()
+    RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_subscriptions_updated_at') THEN
+CREATE TRIGGER trg_subscriptions_updated_at
+    BEFORE UPDATE ON subscriptions
+    FOR EACH ROW EXECUTE FUNCTION subscriptions_set_updated_at();
+END IF;
+END;
+$$;
+
+-- Ускорим поиски по статусу/компании
+CREATE INDEX IF NOT EXISTS idx_subscriptions_company_status
+    ON subscriptions(company_id, status);
+
+-- 4) Вьюха: сводка по местам в компании (использовано/лимит)
+CREATE OR REPLACE VIEW v_company_seats AS
+SELECT
+    c.id           AS company_id,
+    c.name         AS company_name,
+    c.max_seats    AS seats_limit,
+    COUNT(u.*) FILTER (WHERE u.is_active) AS seats_used
+FROM companies c
+         LEFT JOIN users u ON u.company_id = c.id
+GROUP BY c.id, c.name, c.max_seats;
+
+-- 5) Вьюха: биллинг + расчет paid/unpaid (с 72ч grace)
+-- paid_effective = TRUE, если статус оплаченный ИЛИ мы в "grace" окне.
+CREATE OR REPLACE VIEW v_company_billing AS
+WITH sub AS (
+    SELECT
+        s.company_id,
+        s.status,
+        s.price_id,
+        s.current_period_end,
+        s.unpaid_since,
+        CASE
+            WHEN s.status IN ('active','trialing')
+                AND s.current_period_end IS NOT NULL
+                AND now() <= s.current_period_end
+                THEN TRUE
+            ELSE FALSE
+            END AS is_paid_now,
+        CASE
+            WHEN (s.status IS NULL OR s.status NOT IN ('active','trialing'))
+                AND s.unpaid_since IS NOT NULL
+                THEN s.unpaid_since + INTERVAL '72 hours'
+            ELSE NULL
+            END AS grace_until
+    FROM subscriptions s
+)
+SELECT
+    c.id   AS company_id,
+    c.name AS company_name,
+    sub.status,
+    sub.price_id,
+    sub.current_period_end,
+    sub.unpaid_since,
+    sub.grace_until,
+    -- эффективный доступ: оплачен сейчас или ещё действует grace
+    (COALESCE(sub.is_paid_now, FALSE)
+        OR (sub.grace_until IS NOT NULL AND now() <= sub.grace_until)) AS paid_effective,
+    -- человекочитаемая причина, если доступ закрыт
+    CASE
+        WHEN (COALESCE(sub.is_paid_now, FALSE)
+            OR (sub.grace_until IS NOT NULL AND now() <= sub.grace_until))
+            THEN NULL
+        ELSE COALESCE(sub.status, 'no_subscription')
+        END AS unpaid_reason
+FROM companies c
+         LEFT JOIN sub ON sub.company_id = c.id;
+
+-- 6) Сводная вьюха: права + места
+CREATE OR REPLACE VIEW v_company_entitlements AS
+SELECT
+    b.company_id,
+    b.company_name,
+    b.paid_effective AS paid,
+    b.unpaid_reason  AS reason,
+    b.grace_until,
+    b.price_id,
+    s.seats_used,
+    s.seats_limit
+FROM v_company_billing b
+         JOIN v_company_seats   s ON s.company_id = b.company_id;
+
+-- 7) (Опционально) Жёсткое ограничение мест на уровне БД
+--    Блокирует включение/перевод пользователя в active, если лимит исчерпан.
+--    Если пока не нужно — этот блок можно не выполнять.
+CREATE OR REPLACE FUNCTION enforce_seat_limit()
+    RETURNS TRIGGER AS $$
+DECLARE
+limit_i  INTEGER;
+    used_i   INTEGER;
+    comp_i   INTEGER;
+BEGIN
+    comp_i := COALESCE(NEW.company_id, OLD.company_id);
+    IF comp_i IS NULL THEN
+        RETURN NEW;
+END IF;
+
+    -- интересует только включение/перевод в active
+    IF TG_OP IN ('INSERT','UPDATE') AND NEW.is_active = TRUE THEN
+SELECT max_seats INTO limit_i FROM companies WHERE id = comp_i;
+SELECT COUNT(*) INTO used_i FROM users WHERE company_id = comp_i AND is_active = TRUE;
+
+-- Если это INSERT, used_i уже учитывает NEW; если UPDATE с FALSE->TRUE, то тоже.
+-- Разрешим, если хватает мест.
+IF used_i > limit_i THEN
+            RAISE EXCEPTION 'Seat limit exceeded for company %: used %, limit %', comp_i, used_i, limit_i
+                USING ERRCODE = 'check_violation';
+END IF;
+END IF;
+
+RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_enforce_seat_limit_insert') THEN
+CREATE TRIGGER trg_enforce_seat_limit_insert
+    BEFORE INSERT ON users
+    FOR EACH ROW EXECUTE FUNCTION enforce_seat_limit();
+END IF;
+
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_enforce_seat_limit_update') THEN
+CREATE TRIGGER trg_enforce_seat_limit_update
+    BEFORE UPDATE OF company_id, is_active ON users
+    FOR EACH ROW EXECUTE FUNCTION enforce_seat_limit();
+END IF;
+END;
+$$;
+
+SELECT * FROM v_company_entitlements ORDER BY company_id;

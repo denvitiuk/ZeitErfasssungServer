@@ -1,5 +1,5 @@
 // Hardcoded version variables
-val kotlin_version = "2.1.10"
+val kotlin_version = "2.1.21"
 val ktor_version = "3.2.1"
 val logback_version = "1.5.16"
 val postgres_version = "42.6.0"
@@ -7,10 +7,11 @@ val h2_version = "2.1.214"
 val exposed_version = "0.41.1"
 val hikari_version   = "5.0.1"
 val flyway_version   = "9.22.0"
+val stripe_version  = "29.6.0"
 
 plugins {
-    kotlin("jvm") version "2.1.10"
-    id("org.jetbrains.kotlin.plugin.serialization") version "2.1.10"
+    kotlin("jvm") version "2.1.21"
+    id("org.jetbrains.kotlin.plugin.serialization") version "2.1.21"
     id("io.ktor.plugin") version "3.2.1"
     application
 }
@@ -42,13 +43,16 @@ dependencies {
     implementation("io.ktor:ktor-serialization-kotlinx-json-jvm:$ktor_version")
     implementation("io.ktor:ktor-server-auth-jvm:$ktor_version")
     implementation("io.ktor:ktor-server-auth-jwt-jvm:$ktor_version")
+    implementation("com.auth0:java-jwt:4.5.0")
+    implementation("com.auth0:jwks-rsa:0.22.1")
     implementation("io.ktor:ktor-server-cors-jvm:$ktor_version")
     implementation("io.ktor:ktor-server-openapi-jvm:$ktor_version")
     implementation("io.ktor:ktor-server-config-yaml-jvm:$ktor_version")
 
-    // Jackson (для поддержки JWT от Auth0)
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.17.1")
-    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.17.1")
+    // Jackson (для Auth0 JWT и JSON-инфраструктуры)
+    implementation(platform("com.fasterxml.jackson:jackson-bom:2.17.2"))
+    implementation("com.fasterxml.jackson.core:jackson-databind")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
 
 
 
@@ -86,6 +90,8 @@ dependencies {
     implementation("org.jetbrains.exposed:exposed-jdbc:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-java-time:$exposed_version")
 
+    implementation("com.stripe:stripe-java:$stripe_version")
+
     implementation("at.favre.lib:bcrypt:0.9.0")
     // jBCrypt for password hashing (used in password reset flow)
     implementation("org.mindrot:jbcrypt:0.4")
@@ -99,10 +105,8 @@ dependencies {
     implementation("org.quartz-scheduler:quartz:2.3.2")
     implementation("com.eatthepath:pushy:0.14.0")        // APNs client
     implementation("com.google.firebase:firebase-admin:8.2.0") // FCM для Android
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.7.3")
-    implementation("com.google.firebase:firebase-messaging:23.0.6")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.10.2")
     implementation("com.sun.mail:jakarta.mail:1.6.7")
-    implementation("at.favre.lib:bcrypt:0.9.0")
 
 
 

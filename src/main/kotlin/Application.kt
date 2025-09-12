@@ -63,19 +63,19 @@ fun Application.module() {
         exception<BadRequestException> { call, cause ->
             call.respond(
                 HttpStatusCode.BadRequest,
-                mapOf("error" to (cause.message ?: "Некорректный запрос"))
+                mapOf("error" to (cause.message ?: "Unkorrekter Antrag"))
             )
         }
         exception<Throwable> { call, cause ->
             call.respond(
                 HttpStatusCode.InternalServerError,
-                mapOf("error" to (cause.message ?: "Неизвестная ошибка"))
+                mapOf("error" to (cause.message ?: "Unbekannter Fehler"))
             )
         }
         status(HttpStatusCode.Unauthorized) { call, _ ->
             call.respond(
                 HttpStatusCode.Unauthorized,
-                mapOf("error" to "Authorization failed. Please provide a valid token.")
+                mapOf("error" to "Bitte geben Sie das richtige Passwort oder die richtige E-Mail-Adresse ein.")
             )
         }
     }
@@ -162,6 +162,8 @@ fun Application.module() {
             timesheetRoutes()
             companyMonthsRoutes()
             companyTimesheetRoutes()
+            registerEntitlementsRoutes()
+
 
         }
     }
