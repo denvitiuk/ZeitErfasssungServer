@@ -16,6 +16,10 @@ plugins {
     application
 }
 
+tasks.register("stage") {
+    dependsOn("installDist")
+}
+
 java {
     toolchain {
         languageVersion.set(JavaLanguageVersion.of(21))
