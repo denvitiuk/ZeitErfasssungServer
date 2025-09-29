@@ -142,6 +142,7 @@ fun Application.module() {
 
     // 8. Routing
     routing {
+
         passwordResetRoutes(twilioFrom, env)
         authRoutes(twilioFrom, verifyServiceSid)
 

@@ -13,8 +13,8 @@ import io.ktor.server.auth.*
 import io.ktor.server.auth.jwt.*
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.transaction
-
-import rc.*
+import org.jetbrains.exposed.sql.*
+import com.yourcompany.zeiterfassung.routes.EntitlementsDto
 import io.ktor.client.HttpClient
 import java.time.Instant
 

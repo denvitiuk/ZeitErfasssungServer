@@ -7,7 +7,7 @@ val h2_version = "2.1.214"
 val exposed_version = "0.41.1"
 val hikari_version   = "5.0.1"
 val flyway_version   = "9.22.0"
-val stripe_version  = "29.6.0"
+val stripe_version  = "29.5.0"
 
 plugins {
     kotlin("jvm") version "2.1.21"
@@ -103,7 +103,7 @@ dependencies {
 
 
     implementation("org.quartz-scheduler:quartz:2.3.2")
-    implementation("com.eatthepath:pushy:0.14.0")        // APNs client
+    implementation("com.eatthepath:pushy:0.14.2")        // APNs client
     implementation("com.google.firebase:firebase-admin:8.2.0") // FCM для Android
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.10.2")
     implementation("com.sun.mail:jakarta.mail:1.6.7")
