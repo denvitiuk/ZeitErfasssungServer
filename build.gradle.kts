@@ -36,6 +36,13 @@ version = "0.0.1"
 application {
     // Ktor EngineMain
     mainClass.set("io.ktor.server.netty.EngineMain")
+    applicationName = "zeiterfassung-server"
+}
+
+distributions {
+    main {
+        distributionBaseName.set("zeiterfassung-server")
+    }
 }
 
 repositories {
