@@ -16,6 +16,12 @@ plugins {
     application
 }
 
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }
+}
+
 tasks.test {
     environment("JWT_REALM", "zeiterfassung")
 }
