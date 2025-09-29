@@ -172,7 +172,7 @@ fun Application.module() {
 
 /**
  * Quartz Job that inserts a new Proof record and sends a push notification
- * to the device at the exact scheduled time.
+ * to the device at nthe exact scheduled time.
  */
 class ExactProofJob : Job {
     override fun execute(context: JobExecutionContext) {
