@@ -14,3 +14,26 @@ build/
 
 # Uploads и прочие временные файлы
 uploads/
+
+
+.env
+config/**
+*.p8
+
+
+# IntelliJ компиляции
+out/
+
+# Разные варианты env
+.env*
+!.env.example
+!.env.sample
+.envrc
+
+# macOS системное
+.AppleDouble
+.Spotlight-V100
+.Trashes
+
+# Если хочешь оставить заметку в config/
+!config/README.md
