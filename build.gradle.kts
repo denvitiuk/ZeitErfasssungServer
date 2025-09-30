@@ -11,15 +11,6 @@ val stripe_version  = "29.5.0"
 
 
 
-configurations.all {
-    resolutionStrategy.eachDependency {
-        if (requested.group == "com.gradleup.shadow") {
-            useTarget("com.github.johnrengelman:shadow:8.1.1")
-        }
-    }
-}
-
-
 plugins {
     kotlin("jvm") version "2.1.21"
     id("org.jetbrains.kotlin.plugin.serialization") version "2.1.21"
@@ -52,18 +43,6 @@ application {
     // Ktor EngineMain
     mainClass.set("io.ktor.server.netty.EngineMain")
     applicationName = "zeiterfassung-server"
-}
-
-// ShadowJar configuration (без import, через FQCN)
-tasks.withType<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar> {
-    // Добавляем Main‑Class в манифест, чтобы `java -jar` работал
-    manifest {
-        attributes["Main-Class"] = "io.ktor.server.netty.EngineMain"
-    }
-    // Сливаем service‑файлы (Netty/SLF4J и пр.)
-    mergeServiceFiles()
-    archiveBaseName.set("zeiterfassung-server")
-    archiveClassifier.set("all")
 }
 
 distributions {
