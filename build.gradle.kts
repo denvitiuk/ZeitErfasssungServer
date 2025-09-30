@@ -32,7 +32,7 @@ plugins {
 
 // Heroku/Koyeb: buildpack ищет stage; собираем fat‑jar, это надёжнее installDist
 tasks.register("stage") {
-    dependsOn("clean", "shadowJar")
+    dependsOn("clean", "installDist")
 }
 
 java {
