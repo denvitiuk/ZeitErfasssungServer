@@ -9,15 +9,30 @@ val hikari_version   = "5.0.1"
 val flyway_version   = "9.22.0"
 val stripe_version  = "29.5.0"
 
+
+
+configurations.all {
+    resolutionStrategy.eachDependency {
+        if (requested.group == "com.gradleup.shadow") {
+            useTarget("com.github.johnrengelman:shadow:8.1.1")
+        }
+    }
+}
+
+
 plugins {
     kotlin("jvm") version "2.1.21"
     id("org.jetbrains.kotlin.plugin.serialization") version "2.1.21"
     id("io.ktor.plugin") version "3.2.1"
+
     application
 }
 
+
+
+// Heroku/Koyeb: buildpack ищет stage; собираем fat‑jar, это надёжнее installDist
 tasks.register("stage") {
-    dependsOn("installDist")
+    dependsOn("clean", "shadowJar")
 }
 
 java {
@@ -37,6 +52,18 @@ application {
     // Ktor EngineMain
     mainClass.set("io.ktor.server.netty.EngineMain")
     applicationName = "zeiterfassung-server"
+}
+
+// ShadowJar configuration (без import, через FQCN)
+tasks.withType<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar> {
+    // Добавляем Main‑Class в манифест, чтобы `java -jar` работал
+    manifest {
+        attributes["Main-Class"] = "io.ktor.server.netty.EngineMain"
+    }
+    // Сливаем service‑файлы (Netty/SLF4J и пр.)
+    mergeServiceFiles()
+    archiveBaseName.set("zeiterfassung-server")
+    archiveClassifier.set("all")
 }
 
 distributions {
@@ -71,8 +98,6 @@ dependencies {
     implementation("com.fasterxml.jackson.core:jackson-databind")
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
 
-
-
     // БД-драйверы
     implementation("org.postgresql:postgresql:$postgres_version")
     implementation("com.h2database:h2:$h2_version")
@@ -91,7 +116,7 @@ dependencies {
     // In-memory cache for codes
     implementation("com.github.ben-manes.caffeine:caffeine:3.1.8")
 
-// Twilio
+    // Twilio
     implementation("com.twilio.sdk:twilio:8.33.0")
     implementation("io.github.cdimascio:dotenv-kotlin:6.4.1")
 
@@ -118,15 +143,9 @@ dependencies {
 
     implementation("io.ktor:ktor-server-status-pages-jvm:${ktor_version}")
 
-
     implementation("org.quartz-scheduler:quartz:2.3.2")
     implementation("com.eatthepath:pushy:0.14.2")        // APNs client
     implementation("com.google.firebase:firebase-admin:8.2.0") // FCM для Android
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.10.2")
     implementation("com.sun.mail:jakarta.mail:1.6.7")
-
-
-
-
-
 }
