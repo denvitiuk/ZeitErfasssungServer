@@ -7,8 +7,9 @@ WORKDIR /src
 # Кэшируем зависимости: сначала wrapper + gradle метаданные
 COPY gradle gradle
 COPY gradlew gradlew.bat settings.gradle.kts build.gradle.kts ./
-# (опционально) проверка, что gradle доступен
-RUN ./gradlew --no-daemon -v
+RUN chmod +x gradlew
+# Тёплый кэш зависимостей для ускорения последующих билдов
+RUN ./gradlew --no-daemon dependencies
 
 # Теперь копируем исходники
 COPY src ./src
