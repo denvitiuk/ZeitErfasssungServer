@@ -28,6 +28,8 @@ import com.auth0.jwt.algorithms.Algorithm
 
 import com.yourcompany.zeiterfassung.db.configureDatabases
 import com.yourcompany.zeiterfassung.routes.*
+import com.yourcompany.zeiterfassung.service.AccountDeletionService
+
 
 import org.quartz.*
 import org.quartz.impl.StdSchedulerFactory
@@ -100,18 +102,20 @@ fun Application.module() {
     // 5. JWT authentication
     install(Authentication) {
         jwt("bearerAuth") {
-            realm = config.propertyOrNull("ktor.jwt.realm")?.getString()
-                ?: env["JWT_REALM"] ?: error("ktor.jwt.realm is not configured")
-
-            val jwtConfig = this@module.environment.config.config("ktor.jwt")
-            val secret = jwtConfig.property("secret").getString()
-            val issuer = jwtConfig.property("issuer").getString()
-            val audience = jwtConfig.property("audience").getString()
+            val cfg = this@module.environment.config
+            val jwtSecret = cfg.propertyOrNull("ktor.jwt.secret")?.getString()
+                ?: env["JWT_SECRET"] ?: "dev-secret"
+            val jwtIssuer = cfg.propertyOrNull("ktor.jwt.issuer")?.getString()
+                ?: env["JWT_ISSUER"] ?: "dev-issuer"
+            val jwtAudience = cfg.propertyOrNull("ktor.jwt.audience")?.getString()
+                ?: env["JWT_AUDIENCE"] ?: "dev-audience"
+            realm = cfg.propertyOrNull("ktor.jwt.realm")?.getString()
+                ?: env["JWT_REALM"] ?: "zeiterfassung"
 
             verifier(
-                JWT.require(Algorithm.HMAC256(secret))
-                    .withIssuer(issuer)
-                    .withAudience(audience)
+                JWT.require(Algorithm.HMAC256(jwtSecret))
+                    .withIssuer(jwtIssuer)
+                    .withAudience(jwtAudience)
                     .build()
             )
             validate { credential ->
@@ -140,9 +144,13 @@ fun Application.module() {
             .build()
     )
 
+    // Account deletion service (for in‑app account removal)
+    val appBaseUrl = environment.config.propertyOrNull("app.baseUrl")?.getString()
+        ?: env["APP_BASE_URL"] ?: "https://ratty-marian-denvitiuk-7c71a36f.koyeb.app"
+    val deletionService = AccountDeletionService(appBaseUrl)
+
     // 8. Routing
     routing {
-
         passwordResetRoutes(twilioFrom, env)
         authRoutes(twilioFrom, verifyServiceSid)
 
@@ -164,6 +172,7 @@ fun Application.module() {
             companyMonthsRoutes()
             companyTimesheetRoutes()
             registerEntitlementsRoutes()
+            accountDeletionRoutes(deletionService)
 
 
         }
@@ -172,7 +181,7 @@ fun Application.module() {
 
 /**
  * Quartz Job that inserts a new Proof record and sends a push notification
- * to the device at nthe exact scheduled time.
+ * to the device at the exact scheduled time.
  */
 class ExactProofJob : Job {
     override fun execute(context: JobExecutionContext) {

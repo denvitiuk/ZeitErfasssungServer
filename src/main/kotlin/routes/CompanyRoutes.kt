@@ -465,8 +465,8 @@ fun Route.companiesRoutes() {
                             Row(
                                 id = r[PauseSessions.id].value,
                                 uid = r[PauseSessions.userId],
-                                first = r[Users.firstName],
-                                last = r[Users.lastName],
+                                first = r[Users.firstName] ?: "",
+                                last  = r[Users.lastName]  ?: "",
                                 started = r[PauseSessions.startedAt],
                                 ended = r[PauseSessions.endedAt],
                                 active = r[PauseSessions.isActive]

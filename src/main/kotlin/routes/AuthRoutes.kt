@@ -283,7 +283,11 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 mapOf("error" to "Ungültige E-Mail oder Passwort")
             )
 
-            val result = BCrypt.verifyer().verify(dto.password.toCharArray(), user[Users.password])
+            val hashed = user[Users.password] ?: return@post call.respond(
+                HttpStatusCode.Unauthorized,
+                mapOf("error" to "Ungültige E-Mail oder Passwort")
+            )
+            val result = BCrypt.verifyer().verify(dto.password.toCharArray(), hashed)
             if (!result.verified) {
                 return@post call.respond(
                     HttpStatusCode.Unauthorized,
@@ -352,9 +356,9 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 // Build and send response
                 val employeeNumber = row[Users.employeeNumber].toString()
                 val profile = ProfileResponse(
-                    first_name = row[Users.firstName],
-                    last_name = row[Users.lastName],
-                    email = row[Users.email],
+                    first_name = row[Users.firstName] ?: "",
+                    last_name  = row[Users.lastName]  ?: "",
+                    email      = row[Users.email]     ?: "",
                     phone = row[Users.phone] ?: "",
                     employee_number = employeeNumber,
                     avatar_url = row.getOrNull(Users.avatarUrl),
@@ -422,8 +426,9 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                         return@transaction ChangePasswordResponse("user_not_found") to HttpStatusCode.NotFound
                     }
 
+                    val hashed = row[Users.password] ?: return@transaction ChangePasswordResponse("user_not_found") to HttpStatusCode.NotFound
                     val result = BCrypt.verifyer()
-                        .verify(req.currentPassword.toCharArray(), row[Users.password].toCharArray())
+                        .verify(req.currentPassword.toCharArray(), hashed.toCharArray())
                     if (!result.verified) {
                         println("⚠️ [ChangePasswordRoute] invalid_current_password for id $userId")
                         return@transaction ChangePasswordResponse("invalid_current_password") to HttpStatusCode.Unauthorized

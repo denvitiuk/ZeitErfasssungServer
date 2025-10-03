@@ -251,8 +251,8 @@ fun Route.companyTimesheetRoutes() {
                     .orderBy(Users.id to SortOrder.ASC)
                     .map { row ->
                         val id = row[Users.id].value
-                        val fn = row[Users.firstName]
-                        val ln = row[Users.lastName]
+                        val fn = row[Users.firstName] ?: ""
+                        val ln = row[Users.lastName]  ?: ""
                         val full = listOf(fn, ln).filter { it.isNotBlank() }.joinToString(" ")
                         id to (if (full.isNotEmpty()) full else "Mitarbeiter $id")
                     }
