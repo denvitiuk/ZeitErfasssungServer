@@ -157,6 +157,8 @@ fun Application.module() {
         // Public static file serving for uploaded images (before/after)
         staticFiles("/files", File("uploads"))
 
+        supportAutoReplyRoutes(env)
+
         authenticate("bearerAuth") {
             qrRoutes()
             scanRoutes()
@@ -173,7 +175,7 @@ fun Application.module() {
             companyTimesheetRoutes()
             registerEntitlementsRoutes()
             accountDeletionRoutes(deletionService)
-            supportAutoReplyRoutes(env)
+
 
 
         }

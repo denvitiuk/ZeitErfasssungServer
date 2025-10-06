@@ -26,13 +26,17 @@ data class SupportEmailDTO(
 fun Route.supportAutoReplyRoutes(env: Dotenv) {
 
     post("/api/support/auto-reply") {
-        // простая аутентификация вебхука
+        // простая аутентификация вебхука + базовый лог
+        println("[INBOUND] hit /api/support/auto-reply")
         val token = call.request.header("X-Inbound-Token")
-        if (token != env["INBOUND_TOKEN"]) {
+        val tokenOk = (token == env["INBOUND_TOKEN"])
+        println("[INBOUND] token ok? $tokenOk")
+        if (!tokenOk) {
             return@post call.respond(HttpStatusCode.Forbidden)
         }
 
         val dto = call.receive<SupportEmailDTO>()
+        println("[INBOUND] from=${dto.from} subject=${dto.subject}")
         val requesterEmail = dto.from.trim()
 
         // 1) Определяем базовое имя компании
@@ -40,6 +44,7 @@ fun Route.supportAutoReplyRoutes(env: Dotenv) {
 
         // 2) Делаем имя уникальным: "Name", "Name 1", "Name 2", ...
         val finalName = ensureUniqueCompanyName(baseName)
+        println("[INBOUND] baseName=$baseName finalName=$finalName")
 
         // 3) Создаём / находим компанию
         val companyId = transaction {
@@ -51,6 +56,7 @@ fun Route.supportAutoReplyRoutes(env: Dotenv) {
                     it[createdAt] = LocalDateTime.now()
                 }.value
         }
+        println("[INBOUND] companyId=$companyId")
 
         // 4) Генерим и пишем inviteCode (колонка уже есть)
         val code = CodeUtil.randomCode(8, 4)
@@ -59,6 +65,7 @@ fun Route.supportAutoReplyRoutes(env: Dotenv) {
                 it[inviteCode] = code
             }
         }
+        println("[INBOUND] inviteCode=$code")
 
         // 5) Отправляем ровно твой HTML-шаблон (можешь заменить текст сабжа)
         val html = EmailTemplates.buildAdminInviteHtml(code, finalName)
@@ -70,6 +77,7 @@ fun Route.supportAutoReplyRoutes(env: Dotenv) {
             env = env
         )
         // если хочешь text/plain — расширь EmailService по примеру, что я показал ранее
+        println("[INBOUND] email sent to=$requesterEmail")
 
         call.respond(HttpStatusCode.OK, mapOf("status" to "ok", "companyName" to finalName, "code" to code))
     }
