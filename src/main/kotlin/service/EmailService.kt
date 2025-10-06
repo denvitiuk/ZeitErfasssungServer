@@ -13,6 +13,8 @@ import javax.activation.DataHandler
 import javax.activation.FileDataSource
 import javax.mail.internet.MimeBodyPart
 import javax.mail.internet.MimeMultipart
+import java.io.File
+import javax.mail.util.ByteArrayDataSource
 
 object EmailService {
     fun send(to: String, subject: String, body: String, env: Dotenv) {
@@ -44,17 +46,38 @@ object EmailService {
         val htmlPart = MimeBodyPart().apply {
             setContent(body, "text/html; charset=utf-8")
         }
-        val imagePart = MimeBodyPart().apply {
-            val fds = FileDataSource("/Users/yuliyanatasheva/IdeaProjects/zeiterfassung-server/src/main/kotlin/service/img.png")
-            dataHandler = DataHandler(fds)
-            fileName = "img.png"
-            setHeader("Content-ID", "<img.png>")
-            disposition = MimeBodyPart.INLINE
-        }
+
         val multipart = MimeMultipart("related").apply {
             addBodyPart(htmlPart)
-            addBodyPart(imagePart)
         }
+
+        // Try absolute file path first; if not found, fallback to classpath resource
+        val absPath = "/Users/yuliyanatasheva/IdeaProjects/zeiterfassung-server/src/main/resources/img.png"
+        val imgFile = File(absPath)
+        if (imgFile.exists() && imgFile.isFile) {
+            val imagePart = MimeBodyPart().apply {
+                val fds = FileDataSource(imgFile)
+                dataHandler = DataHandler(fds)
+                fileName = "img.png"
+                setHeader("Content-ID", "<img.png>")
+                disposition = MimeBodyPart.INLINE
+            }
+            multipart.addBodyPart(imagePart)
+        } else {
+            val imageStream = Thread.currentThread().contextClassLoader.getResourceAsStream("img.png")
+            if (imageStream != null) {
+                val bytes = imageStream.readAllBytes()
+                val ds = ByteArrayDataSource(bytes, "image/png")
+                val imagePart = MimeBodyPart().apply {
+                    dataHandler = DataHandler(ds)
+                    fileName = "img.png"
+                    setHeader("Content-ID", "<img.png>")
+                    disposition = MimeBodyPart.INLINE
+                }
+                multipart.addBodyPart(imagePart)
+            }
+        }
+
         message.setContent(multipart)
 
         Transport.send(message)
