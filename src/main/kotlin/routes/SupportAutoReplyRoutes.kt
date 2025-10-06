@@ -15,7 +15,9 @@ import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.time.LocalDateTime
 import java.util.Locale
+import kotlinx.serialization.Serializable
 
+@Serializable
 data class SupportEmailDTO(
     val from: String,
     val subject: String? = null,
