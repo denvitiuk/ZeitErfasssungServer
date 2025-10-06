@@ -173,6 +173,7 @@ fun Application.module() {
             companyTimesheetRoutes()
             registerEntitlementsRoutes()
             accountDeletionRoutes(deletionService)
+            supportAutoReplyRoutes(env)
 
 
         }
