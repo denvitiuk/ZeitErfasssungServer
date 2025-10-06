@@ -98,21 +98,35 @@ data class LinkCompanyResponse(
 
 fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
 
-    // Phase 1: Register unverified user
+    // Phase 1: Register unverified user (idempotent, upsert pending draft)
     route("/register-unverified") {
         post {
             val dto = call.receive<RegisterUnverifiedDTO>()
             val phone = dto.phone.takeIf { it.isNotBlank() }
                 ?: return@post call.respond(HttpStatusCode.BadRequest, "Phone is required")
 
-            transaction {
-                Users.insert {
-                    it[Users.phone] = phone
-                    it[Users.phoneVerified] = false
-                }
+            // If a pending draft for this phone already exists, return OK (idempotent)
+            val existingDraft = transaction {
+                Users.select {
+                    (Users.phone eq phone) and
+                    (Users.phoneVerified eq false) and
+                    (Users.status eq "pending")
+                }.limit(1).singleOrNull()
             }
 
-            call.respond(HttpStatusCode.Created, RegisterUnverifiedResponse(phone))
+            if (existingDraft == null) {
+                transaction {
+                    Users.insert {
+                        it[Users.phone] = phone
+                        it[Users.phoneVerified] = false
+                        it[Users.status] = "pending"
+                        it[Users.isActive] = false
+                    }
+                }
+                call.respond(HttpStatusCode.Created, RegisterUnverifiedResponse(phone))
+            } else {
+                call.respond(HttpStatusCode.OK, RegisterUnverifiedResponse(phone))
+            }
         }
     }
 
@@ -131,22 +145,27 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
         }
     }
 
-    // Phase 3: Verify code and mark phoneVerified = true
+    // Phase 3: Verify code and mark phoneVerified = true (only for single pending draft)
     route("/verify-code") {
         post {
             val dto = call.receive<VerifyCodeDTO>()
             val phone = dto.phone
             val code = dto.code
+
+            // Magic test path
             if (phone == "+491234567890" && code == "000000") {
-                // Test stub: accept magic code without Twilio
                 transaction {
-                    Users.update({ Users.phone eq phone }) {
+                    Users.update({
+                        (Users.phone eq phone) and
+                        (Users.status eq "pending") and
+                        (Users.phoneVerified eq false)
+                    }) {
                         it[Users.phoneVerified] = true
                     }
                 }
-                call.respond(HttpStatusCode.OK, VerifyCodeResponse(verified = true))
-                return@post
+                return@post call.respond(HttpStatusCode.OK, VerifyCodeResponse(verified = true))
             }
+
             val check = VerificationCheck.creator(verifyServiceSid)
                 .setTo(phone)
                 .setCode(code)
@@ -154,7 +173,11 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
 
             if (check.status == "approved") {
                 transaction {
-                    Users.update({ Users.phone eq phone }) {
+                    Users.update({
+                        (Users.phone eq phone) and
+                        (Users.status eq "pending") and
+                        (Users.phoneVerified eq false)
+                    }) {
                         it[Users.phoneVerified] = true
                     }
                 }
@@ -165,49 +188,45 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
         }
     }
 
-    // Possible errors for complete-registration:
-    //   400 Phone not verified
-    //   400 Invalid birthDate format, expected YYYY-MM-DD
-    //   400 Email already registered
-    // Phase 4: Complete registration with full profile
+    // Phase 4: Complete registration with full profile (complete exactly one pending draft)
     route("/complete-registration") {
         post {
             val dto = call.receive<CompleteRegistrationDTO>()
 
-            // Check phone is verified
-            val isVerified = transaction {
-                Users.select { Users.phone eq dto.phone }
-                    .map { it[Users.phoneVerified] }
-                    .singleOrNull() ?: false
-            }
+            // 1) Find the single pending draft for this phone
+            val draftRow = transaction {
+                Users.select {
+                    (Users.phone eq dto.phone) and
+                    (Users.status eq "pending")
+                }.limit(1).singleOrNull()
+            } ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("No pending draft for this phone"))
 
-            if (!isVerified) {
+            // 2) Require verified phone on the draft
+            if (!draftRow[Users.phoneVerified]) {
                 return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("Phone not verified"))
             }
 
-            // Validate birthDate
+            // 3) Validate birthDate
             val birthDate = try {
                 LocalDate.parse(dto.birthDate)
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("Invalid birthDate format, expected YYYY-MM-DD"))
             }
 
-            // Hash password
-            val passwordHash = BCrypt.withDefaults()
-                .hashToString(12, dto.password.toCharArray())
+            // 4) Hash password
+            val passwordHash = BCrypt.withDefaults().hashToString(12, dto.password.toCharArray())
 
-            // Ensure email is not already taken by another user
-            val emailTaken = transaction {
+            // 5) Ensure email is not already taken by another user (different id)
+            val draftUserId = draftRow[Users.id].value
+            val emailTakenByAnother = transaction {
                 Users.select { Users.email eq dto.email }
-                    .map { it[Users.phone] }
-                    .firstOrNull()
-                    ?.let { existingPhone -> existingPhone != dto.phone }
-                    ?: false
+                    .any { it[Users.id].value != draftUserId }
             }
-            if (emailTaken) {
+            if (emailTakenByAnother) {
                 return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("Email already registered"))
             }
 
+            // 6) Optional company linkage by invite code (no admin grant here)
             val (companyId, isAdmin) = dto.inviteCode
                 ?.takeIf { it.isNotBlank() }
                 ?.let { code ->
@@ -216,13 +235,11 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                             .map { it[Companies.id] }
                             .singleOrNull()
                     }
-                }
-                ?.let { foundId -> Pair(foundId, false) } // company invite_code should not grant admin
-                ?: Pair(null, false)
+                }?.let { it to false } ?: (null to false)
 
-            // Update user record
+            // 7) Update exactly this draft and flip to active
             transaction {
-                Users.update({ Users.phone eq dto.phone }) {
+                Users.update({ Users.id eq draftUserId }) {
                     it[Users.firstName]      = dto.firstName
                     it[Users.lastName]       = dto.lastName
                     it[Users.email]          = dto.email
@@ -231,27 +248,22 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     it[Users.companyId]      = companyId
                     it[Users.isCompanyAdmin] = isAdmin
                     it[Users.isGlobalAdmin]  = false
+                    it[Users.status]         = "active"
+                    it[Users.isActive]       = true
                 }
             }
 
-            // Generate JWT for newly registered user
+            // 8) JWT
             val jwtConfig = call.application.environment.config.config("ktor.jwt")
             val issuer = jwtConfig.property("issuer").getString()
             val audience = jwtConfig.property("audience").getString()
             val secret = jwtConfig.property("secret").getString()
             val expiresIn = jwtConfig.property("validityMs").getString().toLong()
 
-            // Fetch user ID by phone
-            val userId = transaction {
-                Users.select { Users.phone eq dto.phone }
-                    .map { it[Users.id].value.toString() }
-                    .single()
-            }
-
             val token = JWT.create()
                 .withIssuer(issuer)
                 .withAudience(audience)
-                .withClaim("id", userId)
+                .withClaim("id", draftUserId.toString())
                 .withClaim("companyId", companyId?.value ?: 0)
                 .withClaim("isCompanyAdmin", isAdmin)
                 .withClaim("isGlobalAdmin", false)
@@ -485,9 +497,9 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 // If already linked to this company, short-circuit and just issue a fresh token
                 if (currentCompanyId != null && currentCompanyId == companyId) {
                     val jwtConfig = call.application.environment.config.config("ktor.jwt")
-                    val issuer = jwtConfig.property("issuer").getString()
-                    val audience = jwtConfig.property("audience").getString()
-                    val secret = jwtConfig.property("secret").getString()
+                    val issuer    = jwtConfig.property("issuer").getString()
+                    val audience  = jwtConfig.property("audience").getString()
+                    val secret    = jwtConfig.property("secret").getString()
                     val expiresIn = jwtConfig.property("validityMs").getString().toLong()
 
                     val row = transaction { Users.select { Users.id eq userId }.single() }
