@@ -32,6 +32,9 @@ private data class VerifyCompanyCodeRequest(val code: String)
 private data class InviteCodeResponse(val code: String)
 @Serializable
 private data class InviteCodeSetRequest(val code: String)
+
+@Serializable
+private data class CompanyNameUpdateRequest(val name: String)
 @Serializable
 data class ApiError(val error: String, val detail: String? = null)
 
@@ -118,6 +121,17 @@ private fun String.isValidInvite(): Boolean =
 
 private fun normalizeCode(raw: String): String = raw.trim().uppercase()
 
+private fun normalizeCompanyName(raw: String): String = raw.trim().replace(Regex("\\s+"), " ")
+
+private fun isValidCompanyName(name: String): Boolean {
+    if (name.length !in 2..80) return false
+    // Allow Unicode letters/digits/space and a small set of punctuation used in company names
+    val allowedPunct = setOf('-', '&', '.', '\'', '(', ')', '_', '/', ',', ':')
+    return name.all { ch ->
+        ch.isLetterOrDigit() || ch.isWhitespace() || allowedPunct.contains(ch)
+    }
+}
+
 private fun isMemberOfCompany(principal: JWTPrincipal, companyId: Int): Boolean {
     val tokenCompanyId = principal.payload.getClaim("companyId").asInt() ?: 0
     return tokenCompanyId == companyId
@@ -130,14 +144,36 @@ private fun isAdminForCompany(principal: JWTPrincipal, companyId: Int): Boolean 
     return isGlobalAdmin || (isCompanyAdmin && tokenCompanyId == companyId)
 }
 
+// Simple in-memory rate limiter for invite-code verification (per remote host)
+private object InviteCodeRateLimiter {
+    private val lock = Any()
+    // store timestamps (ms) of attempts per key within a sliding window
+    private val buckets = mutableMapOf<String, MutableList<Long>>()
+    private const val WINDOW_MS = 60_000L
+    private const val MAX_ATTEMPTS = 5
+
+    fun allow(key: String, now: Long = System.currentTimeMillis()): Boolean {
+        synchronized(lock) {
+            val list = buckets.getOrPut(key) { mutableListOf() }
+            // purge old
+            val cutoff = now - WINDOW_MS
+            list.removeAll { it < cutoff }
+            if (list.size >= MAX_ATTEMPTS) return false
+            list.add(now)
+            return true
+        }
+    }
+}
+
 fun Route.companiesRoutes() {
     route("/companies") {
 
         // GET /companies?name=...
         get {
             try {
-                val inviteFilter = call.request.queryParameters["invite_code"]
+                val inviteFilterRaw = call.request.queryParameters["invite_code"]
                 val nameFilter = call.request.queryParameters["name"]
+                val inviteFilter = inviteFilterRaw?.let { normalizeCode(it) }
                 val companies = transaction {
                     val base = Companies.slice(Companies.id, Companies.name, Companies.inviteCode, Companies.createdAt)
                     val query = when {
@@ -156,25 +192,32 @@ fun Route.companiesRoutes() {
                 }
                 call.respond(HttpStatusCode.OK, companies)
             } catch (e: Exception) {
-                call.respond(
-                    HttpStatusCode.InternalServerError,
-                    mapOf("error" to "Failed to fetch companies: ${e.message}")
-                )
+                call.application.log.error("Failed to fetch companies", e)
+                call.respond(HttpStatusCode.InternalServerError, ApiError("internal_error"))
             }
         }
 
         // POST /companies/verify-code — validate a company code and return company details
         post("/verify-code") {
             try {
+                val clientKey =
+                    // Respect common proxy headers first
+                    call.request.headers["X-Forwarded-For"]?.split(',')?.firstOrNull()?.trim()
+                        ?: call.request.headers["X-Real-IP"]
+                        // Fallback to Host header (domain:port)
+                        ?: call.request.headers[HttpHeaders.Host]
+                        // Last resort
+                        ?: "unknown"
+                if (!InviteCodeRateLimiter.allow(clientKey)) {
+                    return@post call.respond(HttpStatusCode.TooManyRequests, ApiError("rate_limited", "Too many attempts. Try again in a minute"))
+                }
+
                 val req = call.receive<VerifyCompanyCodeRequest>()
-                val code = req.code.trim()
+                val code = normalizeCode(req.code)
                 if (code.isEmpty()) {
                     return@post call.respond(
                         HttpStatusCode.BadRequest,
-                        mapOf(
-                            "error" to "code_required",
-                            "detail" to "Provide non-empty company code"
-                        )
+                        ApiError("code_required", "Provide non-empty company code")
                     )
                 }
 
@@ -185,10 +228,7 @@ fun Route.companiesRoutes() {
                         .singleOrNull()
                 } ?: return@post call.respond(
                     HttpStatusCode.BadRequest,
-                    mapOf(
-                        "error" to "invalid_code",
-                        "detail" to "No company found for the provided code"
-                    )
+                    ApiError("invalid_code", "No company found for the provided code")
                 )
 
                 val company = Company(
@@ -201,18 +241,13 @@ fun Route.companiesRoutes() {
             } catch (e: ContentTransformationException) {
                 call.respond(
                     HttpStatusCode.BadRequest,
-                    mapOf(
-                        "error" to "invalid_request",
-                        "detail" to "Body must be JSON: {\"code\": \"...\"}"
-                    )
+                    ApiError("invalid_request", "Body must be JSON: {\"code\": \"...\"}")
                 )
             } catch (e: Exception) {
+                call.application.log.error("verify-code failed", e)
                 call.respond(
                     HttpStatusCode.InternalServerError,
-                    mapOf(
-                        "error" to "verify_failed",
-                        "detail" to (e.message ?: "Unknown error")
-                    )
+                    ApiError("internal_error")
                 )
             }
         }
@@ -220,11 +255,11 @@ fun Route.companiesRoutes() {
         // GET /companies/by-code/{code} — lookup by invite code via path param
         get("/by-code/{code}") {
             val raw = call.parameters["code"] ?: return@get call.respond(
-                HttpStatusCode.BadRequest, mapOf("error" to "code_required")
+                HttpStatusCode.BadRequest, ApiError("code_required")
             )
-            val code = raw.trim()
+            val code = normalizeCode(raw)
             if (code.isEmpty()) {
-                return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "code_required"))
+                return@get call.respond(HttpStatusCode.BadRequest, ApiError("code_required"))
             }
 
             val row = transaction {
@@ -234,7 +269,7 @@ fun Route.companiesRoutes() {
                     .singleOrNull()
             } ?: return@get call.respond(
                 HttpStatusCode.BadRequest,
-                mapOf("error" to "invalid_code", "detail" to "No company found for the provided code")
+                ApiError("invalid_code", "No company found for the provided code")
             )
 
             val company = Company(
@@ -493,6 +528,96 @@ fun Route.companiesRoutes() {
 
                     call.respond(HttpStatusCode.OK, payload)
                 }
+                // PUT /companies/self/name — update company name (admin only)
+                put("/name") {
+                    val principal = call.principal<JWTPrincipal>()
+                        ?: return@put call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Missing token"))
+
+                    val companyId = principal.payload.getClaim("companyId").asInt() ?: 0
+                    if (companyId <= 0) {
+                        return@put call.respond(HttpStatusCode.BadRequest, ApiError("no_company", "Token has no companyId"))
+                    }
+                    if (!isAdminForCompany(principal, companyId)) {
+                        return@put call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Admin rights required for this company"))
+                    }
+
+                    val body = try {
+                        call.receive<CompanyNameUpdateRequest>()
+                    } catch (e: Exception) {
+                        return@put call.respond(HttpStatusCode.BadRequest, ApiError("invalid_request", "Body must be {\"name\":\"...\"}"))
+                    }
+
+                    val desiredRaw = body.name
+                    val desired = normalizeCompanyName(desiredRaw)
+                    if (!isValidCompanyName(desired)) {
+                        return@put call.respond(HttpStatusCode.BadRequest, ApiError("invalid_name", "Name must be 2–80 chars; letters/digits/spaces and - & . ' ( ) _ / , : allowed"))
+                    }
+
+                    // Read current name and bail out early if unchanged (idempotent behavior)
+                    val currentName: String = transaction {
+                        Companies
+                            .slice(Companies.name)
+                            .select { Companies.id eq org.jetbrains.exposed.dao.id.EntityID(companyId, Companies) }
+                            .map { it[Companies.name] }
+                            .singleOrNull()
+                    } ?: return@put call.respond(HttpStatusCode.NotFound, ApiError("not_found", "Company not found"))
+
+                    if (currentName == desired) {
+                        // No-op update, still return current company payload
+                        val company = transaction {
+                            Companies
+                                .slice(Companies.id, Companies.name, Companies.inviteCode, Companies.createdAt)
+                                .select { Companies.id eq org.jetbrains.exposed.dao.id.EntityID(companyId, Companies) }
+                                .map {
+                                    Company(
+                                        it[Companies.id].value,
+                                        it[Companies.name],
+                                        it[Companies.inviteCode],
+                                        it[Companies.createdAt].toString()
+                                    )
+                                }
+                                .single()
+                        }
+                        return@put call.respond(HttpStatusCode.OK, company)
+                    }
+
+                    try {
+                        val updated = transaction {
+                            Companies.update({ Companies.id eq org.jetbrains.exposed.dao.id.EntityID(companyId, Companies) }) {
+                                it[name] = desired
+                            }
+                        }
+                        if (updated == 0) {
+                            return@put call.respond(HttpStatusCode.NotFound, ApiError("not_found", "Company not found"))
+                        }
+
+                        val company = transaction {
+                            Companies
+                                .slice(Companies.id, Companies.name, Companies.inviteCode, Companies.createdAt)
+                                .select { Companies.id eq org.jetbrains.exposed.dao.id.EntityID(companyId, Companies) }
+                                .map {
+                                    Company(
+                                        it[Companies.id].value,
+                                        it[Companies.name],
+                                        it[Companies.inviteCode],
+                                        it[Companies.createdAt].toString()
+                                    )
+                                }
+                                .single()
+                        }
+                        call.respond(HttpStatusCode.OK, company)
+                    } catch (e: org.jetbrains.exposed.exceptions.ExposedSQLException) {
+                        // 23505: unique violation (only if a unique index exists on name)
+                        if (e.sqlState == "23505") {
+                            return@put call.respond(HttpStatusCode.Conflict, ApiError("name_taken", "Company name already in use"))
+                        }
+                        return@put call.respond(HttpStatusCode.InternalServerError, ApiError("update_failed", e.message))
+                    } catch (e: Exception) {
+                        call.application.log.error("Error updating company name for self company $companyId", e)
+                        return@put call.respond(HttpStatusCode.InternalServerError, ApiError("update_failed", e.message))
+                    }
+                }
+
                 // GET /companies/self/invite-code — return current code
                 get("/invite-code") {
                     val principal = call.principal<JWTPrincipal>()
@@ -770,11 +895,11 @@ fun Route.companiesRoutes() {
             try {
                 val idParam = call.parameters["id"] ?: return@get call.respond(
                     HttpStatusCode.BadRequest,
-                    mapOf("error" to "id_required")
+                    ApiError("id_required")
                 )
                 val id = idParam.toIntOrNull() ?: return@get call.respond(
                     HttpStatusCode.BadRequest,
-                    mapOf("error" to "id_must_be_int")
+                    ApiError("id_must_be_int")
                 )
                 val company = transaction {
                     Companies
@@ -789,69 +914,69 @@ fun Route.companiesRoutes() {
                             )
                         }
                         .singleOrNull()
-                } ?: return@get call.respond(HttpStatusCode.NotFound, mapOf("error" to "company_not_found"))
+                } ?: return@get call.respond(HttpStatusCode.NotFound, ApiError("company_not_found"))
 
                 call.respond(HttpStatusCode.OK, company)
             } catch (e: Exception) {
+                call.application.log.error("Failed to fetch company by id", e)
                 call.respond(
                     HttpStatusCode.InternalServerError,
-                    mapOf("error" to "Failed to fetch company: ${e.message}")
+                    ApiError("internal_error")
                 )
             }
         }
 
-        // POST /companies
-        post {
-            try {
-                val req = call.receive<CompanyRequest>()
-
-                val newCompany = transaction {
-                    val id = Companies.insert {
-                        it[Companies.name] = req.name
-                    } get Companies.id
-
-                    Companies.select { Companies.id eq id }
-                        .map {
-                            Company(
-                                it[Companies.id].value,
-                                it[Companies.name],
-                                it[Companies.inviteCode],
-                                it[Companies.createdAt].toString()
-                            )
-                        }
-                        .singleOrNull() ?: throw IllegalStateException("Company not found after insert")
+        // POST /companies (authenticated, global admin only)
+        authenticate("bearerAuth") {
+            post {
+                val principal = call.principal<JWTPrincipal>()
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Missing token"))
+                val isGlobalAdmin = principal.payload.getClaim("isGlobalAdmin").asBoolean() ?: false
+                if (!isGlobalAdmin) {
+                    return@post call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Global admin rights required"))
                 }
 
-                call.respond(HttpStatusCode.Created, newCompany)
+                try {
+                    val req = call.receive<CompanyRequest>()
+                    val normalizedName = normalizeCompanyName(req.name)
+                    if (!isValidCompanyName(normalizedName)) {
+                        return@post call.respond(HttpStatusCode.BadRequest, ApiError("invalid_name", "Name must be 2–80 chars; letters/digits/spaces and - & . ' ( ) _ / , : allowed"))
+                    }
 
-            } catch (e: ContentTransformationException) {
-                call.respond(
-                    HttpStatusCode.BadRequest,
-                    mapOf("error" to "Invalid request format: ${e.message}")
-                )
-            } catch (e: ExposedSQLException) {
-                // 23505 = unique_violation in Postgres
-                val pgCode = e.sqlState
-                if (pgCode == "23505") {
-                    return@post call.respond(
-                        HttpStatusCode.Conflict,
-                        mapOf("error" to "company_name_already_exists")
-                    )
+                    val newCompany = transaction {
+                        val id = Companies.insert {
+                            it[Companies.name] = normalizedName
+                        } get Companies.id
+
+                        Companies.select { Companies.id eq id }
+                            .map {
+                                Company(
+                                    it[Companies.id].value,
+                                    it[Companies.name],
+                                    it[Companies.inviteCode],
+                                    it[Companies.createdAt].toString()
+                                )
+                            }
+                            .singleOrNull() ?: throw IllegalStateException("Company not found after insert")
+                    }
+
+                    call.respond(HttpStatusCode.Created, newCompany)
+
+                } catch (e: ContentTransformationException) {
+                    call.respond(HttpStatusCode.BadRequest, ApiError("invalid_request", "Invalid request format"))
+                } catch (e: ExposedSQLException) {
+                    if (e.sqlState == "23505") {
+                        return@post call.respond(HttpStatusCode.Conflict, ApiError("company_name_already_exists"))
+                    }
+                    call.application.log.error("Database error on company create", e)
+                    call.respond(HttpStatusCode.BadRequest, ApiError("db_error"))
+                } catch (e: IllegalStateException) {
+                    call.application.log.error("Unexpected state on company create", e)
+                    call.respond(HttpStatusCode.InternalServerError, ApiError("internal_error"))
+                } catch (e: Exception) {
+                    call.application.log.error("Unexpected error on company create", e)
+                    call.respond(HttpStatusCode.InternalServerError, ApiError("internal_error"))
                 }
-                call.respond(
-                    HttpStatusCode.BadRequest,
-                    mapOf("error" to "Database error: ${e.message}")
-                )
-            } catch (e: IllegalStateException) {
-                call.respond(
-                    HttpStatusCode.InternalServerError,
-                    mapOf("error" to "Unexpected state: ${e.message}")
-                )
-            } catch (e: Exception) {
-                call.respond(
-                    HttpStatusCode.InternalServerError,
-                    mapOf("error" to "Unexpected error: ${e.message}")
-                )
             }
         }
     }

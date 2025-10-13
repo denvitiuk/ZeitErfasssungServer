@@ -18,6 +18,8 @@ import com.yourcompany.zeiterfassung.dto.ChangePasswordRequest
 import com.yourcompany.zeiterfassung.dto.ChangePasswordResponse
 import com.twilio.rest.verify.v2.service.Verification
 import com.twilio.rest.verify.v2.service.VerificationCheck
+import com.twilio.exception.ApiException
+import java.util.concurrent.ConcurrentHashMap
 
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
@@ -58,6 +60,12 @@ import java.util.UUID
 import kotlin.collections.mapOf
 import kotlin.collections.singleOrNull
 
+import io.ktor.server.application.ApplicationCall
+import io.ktor.server.application.call
+import com.google.i18n.phonenumbers.PhoneNumberUtil
+import com.google.i18n.phonenumbers.NumberParseException
+import com.google.i18n.phonenumbers.PhoneNumberUtil.PhoneNumberFormat
+
 @Serializable
 data class SentCodeResponse(val sent: Boolean)
 
@@ -96,14 +104,65 @@ data class LinkCompanyResponse(
     val alreadyLinked: Boolean = false
 )
 
+// --- Helpers: phone normalization (E.164-ish for DE) and SMS throttle ---
+private fun ApplicationCall.preferredRegion(default: String = "DE"): String {
+    val h = request.headers
+    val raw = h["X-Client-Region"]
+        ?: h["X-Region"]
+        ?: h["CF-IPCountry"]
+        ?: h["Fly-Client-Country"]
+        ?: h["X-App-Region"]
+        ?: h["Accept-Language"]?.let { al ->
+            // Examples: "de-DE,de;q=0.9", "en-US", "pl"
+            val primary = al.split(',').firstOrNull()?.trim()
+            val tag = primary?.split('-')
+            when {
+                tag != null && tag.size >= 2 -> tag[1]
+                tag != null && tag.size == 1 && tag[0].length == 2 -> tag[0]
+                else -> null
+            }
+        }
+    val iso2 = raw?.trim()?.uppercase()
+    return if (iso2 != null && iso2.matches(Regex("^[A-Z]{2}$"))) iso2 else default
+}
+
+private fun normalizePhoneE164(raw: String, defaultRegion: String = "DE"): String? {
+    var input = raw.trim()
+    if (input.isEmpty()) return null
+    // Convert 00xx… to +xx… to help the parser
+    if (input.startsWith("00")) input = "+" + input.drop(2)
+
+    val util = PhoneNumberUtil.getInstance()
+    return try {
+        val number = util.parse(input, defaultRegion)
+        if (!util.isValidNumber(number)) return null
+        util.format(number, PhoneNumberFormat.E164)
+    } catch (e: NumberParseException) {
+        null
+    }
+}
+
+private const val SMS_THROTTLE_MS: Long = 60_000
+private val smsThrottle = ConcurrentHashMap<String, Long>()
+private fun shouldThrottle(phone: String): Boolean {
+    val now = System.currentTimeMillis()
+    val last = smsThrottle[phone]
+    return if (last != null && (now - last) < SMS_THROTTLE_MS) {
+        true
+    } else {
+        smsThrottle[phone] = now
+        false
+    }
+}
+// --- End helpers ---
 fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
 
     // Phase 1: Register unverified user (idempotent, upsert pending draft)
     route("/register-unverified") {
         post {
             val dto = call.receive<RegisterUnverifiedDTO>()
-            val phone = dto.phone.takeIf { it.isNotBlank() }
-                ?: return@post call.respond(HttpStatusCode.BadRequest, "Phone is required")
+            val phone = normalizePhoneE164(dto.phone, call.preferredRegion())
+                ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("phone_required"))
 
             // If a pending draft for this phone already exists, return OK (idempotent)
             val existingDraft = transaction {
@@ -134,14 +193,46 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
     route("/send-code") {
         post {
             val dto = call.receive<SendCodeDTO>()
-            val phone = dto.phone
-            if (phone == "+491234567890") {
-                // Test stub: skip Twilio SMS
-                call.respond(HttpStatusCode.OK, SentCodeResponse(sent = true))
-                return@post
+            val phone = normalizePhoneE164(dto.phone, call.preferredRegion())
+                ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("invalid_phone"))
+
+            // Require an existing pending draft; avoid creating ghosts
+            val draft = transaction {
+                Users.select {
+                    (Users.phone eq phone) and
+                    (Users.status eq "pending")
+                }.limit(1).singleOrNull()
+            } ?: return@post call.respond(HttpStatusCode.Conflict, ErrorResponse("no_pending_registration"))
+
+            // If already verified, don't send again: pretend success for idempotency
+            if (draft[Users.phoneVerified]) {
+                return@post call.respond(HttpStatusCode.OK, SentCodeResponse(sent = true))
             }
-            val resp = Verification.creator(verifyServiceSid, phone, "sms").create()
-            call.respond(HttpStatusCode.OK, SentCodeResponse(sent = resp.status == "pending"))
+
+            // Demo/test number: no real SMS
+            if (phone == "+491234567890") {
+                return@post call.respond(HttpStatusCode.OK, SentCodeResponse(sent = true))
+            }
+
+            // Simple throttle to avoid duplicate SMS floods from repeated taps
+            if (shouldThrottle(phone)) {
+                return@post call.respond(HttpStatusCode.TooManyRequests, ErrorResponse("too_many_requests"))
+            }
+
+            try {
+                val resp = Verification.creator(verifyServiceSid, phone, "sms").create()
+                call.respond(HttpStatusCode.OK, SentCodeResponse(sent = (resp.status == "pending")))
+            } catch (e: ApiException) {
+                // Map Twilio errors to clean client-facing statuses
+                val status = when (e.statusCode) {
+                    400, 404 -> HttpStatusCode.BadRequest
+                    429 -> HttpStatusCode.TooManyRequests
+                    else -> HttpStatusCode.BadGateway
+                }
+                call.respond(status, ErrorResponse("verification_start_failed"))
+            } catch (t: Throwable) {
+                call.respond(HttpStatusCode.BadGateway, ErrorResponse("verification_start_failed"))
+            }
         }
     }
 
@@ -149,8 +240,29 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
     route("/verify-code") {
         post {
             val dto = call.receive<VerifyCodeDTO>()
-            val phone = dto.phone
+            val phone = normalizePhoneE164(dto.phone, call.preferredRegion())
+                ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("invalid_phone"))
             val code = dto.code
+
+            // If we already have a verified pending draft for this phone, return verified=true (idempotent)
+            val pendingDraft = transaction {
+                Users.select {
+                    (Users.phone eq phone) and
+                    (Users.status eq "pending")
+                }.limit(1).singleOrNull()
+            }
+
+            if (pendingDraft == null) {
+                // If phone is already verified or user progressed, treat as idempotent success
+                val alreadyVerified = transaction {
+                    Users.select { (Users.phone eq phone) and (Users.phoneVerified eq true) }
+                        .limit(1).singleOrNull()
+                }
+                if (alreadyVerified != null) {
+                    return@post call.respond(HttpStatusCode.OK, VerifyCodeResponse(verified = true))
+                }
+                return@post call.respond(HttpStatusCode.Conflict, ErrorResponse("no_pending_registration"))
+            }
 
             // Magic test path
             if (phone == "+491234567890" && code == "000000") {
@@ -166,24 +278,35 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 return@post call.respond(HttpStatusCode.OK, VerifyCodeResponse(verified = true))
             }
 
-            val check = VerificationCheck.creator(verifyServiceSid)
-                .setTo(phone)
-                .setCode(code)
-                .create()
+            try {
+                val check = VerificationCheck.creator(verifyServiceSid)
+                    .setTo(phone)
+                    .setCode(code)
+                    .create()
 
-            if (check.status == "approved") {
-                transaction {
-                    Users.update({
-                        (Users.phone eq phone) and
-                        (Users.status eq "pending") and
-                        (Users.phoneVerified eq false)
-                    }) {
-                        it[Users.phoneVerified] = true
+                if (check.status == "approved") {
+                    transaction {
+                        Users.update({
+                            (Users.phone eq phone) and
+                            (Users.status eq "pending") and
+                            (Users.phoneVerified eq false)
+                        }) {
+                            it[Users.phoneVerified] = true
+                        }
                     }
+                    call.respond(HttpStatusCode.OK, VerifyCodeResponse(verified = true))
+                } else {
+                    call.respond(HttpStatusCode.BadRequest, VerifyCodeResponse(verified = false))
                 }
-                call.respond(HttpStatusCode.OK, VerifyCodeResponse(verified = true))
-            } else {
-                call.respond(HttpStatusCode.BadRequest, VerifyCodeResponse(verified = false))
+            } catch (e: ApiException) {
+                val status = when (e.statusCode) {
+                    400, 404 -> HttpStatusCode.BadRequest
+                    429 -> HttpStatusCode.TooManyRequests
+                    else -> HttpStatusCode.BadGateway
+                }
+                call.respond(status, ErrorResponse("verification_failed"))
+            } catch (t: Throwable) {
+                call.respond(HttpStatusCode.BadGateway, ErrorResponse("verification_failed"))
             }
         }
     }
@@ -192,11 +315,12 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
     route("/complete-registration") {
         post {
             val dto = call.receive<CompleteRegistrationDTO>()
-
+            val normalizedPhone = normalizePhoneE164(dto.phone, call.preferredRegion())
+                ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("invalid_phone"))
             // 1) Find the single pending draft for this phone
             val draftRow = transaction {
                 Users.select {
-                    (Users.phone eq dto.phone) and
+                    (Users.phone eq normalizedPhone) and
                     (Users.status eq "pending")
                 }.limit(1).singleOrNull()
             } ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("No pending draft for this phone"))
