@@ -15,6 +15,7 @@ import java.io.File
 
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.HttpMethod
 import io.ktor.server.auth.*
 import io.ktor.server.auth.jwt.*
 import io.ktor.server.routing.*
@@ -30,10 +31,33 @@ import com.yourcompany.zeiterfassung.db.configureDatabases
 import com.yourcompany.zeiterfassung.routes.*
 import com.yourcompany.zeiterfassung.service.AccountDeletionService
 
+// --- Document Flow imports ---
+import com.yourcompany.zeiterfassung.routes.registerDocumentFlowRoutes
+import com.yourcompany.zeiterfassung.routes.DocumentTemplateStorage
+import com.yourcompany.zeiterfassung.routes.DocumentRequestService
+import com.yourcompany.zeiterfassung.routes.DocumentUploadService
+import com.yourcompany.zeiterfassung.routes.TemplateDTO
+import com.yourcompany.zeiterfassung.routes.TemplateQuery
+import com.yourcompany.zeiterfassung.routes.RequestDTO
+import com.yourcompany.zeiterfassung.routes.SetStatusPayload
+import com.yourcompany.zeiterfassung.routes.CreateRequestPayload
+import com.yourcompany.zeiterfassung.routes.LeaveBalanceDTO
+import com.yourcompany.zeiterfassung.routes.PresignRequest
+import com.yourcompany.zeiterfassung.routes.PresignResponse
+
+import com.yourcompany.zeiterfassung.service.TemplateService
+import com.yourcompany.zeiterfassung.service.pg.TemplateStoragePg
+import com.yourcompany.zeiterfassung.service.pg.DocumentRequestServicePg
+import com.yourcompany.zeiterfassung.service.pg.DocumentUploadServicePg
+import com.yourcompany.zeiterfassung.service.RequestService
+import javax.sql.DataSource
+import com.zaxxer.hikari.HikariConfig
+import com.zaxxer.hikari.HikariDataSource
 
 import org.quartz.*
 import org.quartz.impl.StdSchedulerFactory
 import java.util.TimeZone
+import io.ktor.server.application.ApplicationStopped
 
 // In-memory cache for phone verification codes (5-minute TTL)
 val verificationCodeCache: Cache<String, String> = Caffeine.newBuilder()
@@ -55,6 +79,7 @@ fun Application.module() {
     // 2. CORS
     install(CORS) {
         anyHost()
+        allowMethod(HttpMethod.Put)
         allowCredentials = true
         allowHeader(HttpHeaders.ContentType)
         allowHeader(HttpHeaders.Authorization)
@@ -129,8 +154,69 @@ fun Application.module() {
     // 6. Database initialization
     configureDatabases()
 
-    // 7. Quartz scheduler for exact-time proof
+    // --- Document Flow stubs (temporary wiring) ---
+    val templateStorageStub = object : DocumentTemplateStorage {
+        override suspend fun listTemplates(companyId: Long?, query: TemplateQuery): List<TemplateDTO> = emptyList()
+        override suspend fun getTemplate(id: Long): TemplateDTO? = null
+        override suspend fun upsertTemplate(meta: TemplateDTO): TemplateDTO = meta
+    }
+
+    val requestServiceStub = object : DocumentRequestService {
+        override suspend fun create(userId: Long, companyId: Long, payload: CreateRequestPayload): RequestDTO {
+            throw UnsupportedOperationException("Document requests: not wired yet")
+        }
+        override suspend fun listOwn(userId: Long): List<RequestDTO> = emptyList()
+        override suspend fun listForCompany(companyId: Long, status: com.yourcompany.zeiterfassung.routes.RequestStatus?): List<RequestDTO> = emptyList()
+        override suspend fun setStatus(adminId: Long, companyId: Long, requestId: Long, payload: SetStatusPayload): RequestDTO {
+            throw UnsupportedOperationException("setStatus: not wired yet")
+        }
+        override suspend fun leaveBalance(userId: Long): LeaveBalanceDTO = LeaveBalanceDTO(0.0, 0.0, 0.0, 0.0)
+    }
+
+    val uploadServiceStub = object : DocumentUploadService {
+        override suspend fun presign(userId: Long, companyId: Long?, req: PresignRequest): PresignResponse {
+            throw UnsupportedOperationException("presign uploads: not wired yet (STORAGE_PROVIDER=pg)")
+        }
+    }
+    // --- End stubs ---
+
+    // Storage provider flag (pg by default; later can be switched to s3 without frontend changes)
+    val storageProvider = (env["STORAGE_PROVIDER"] ?: "pg").lowercase()
+    environment.log.info("Storage provider: $storageProvider")
+
+    val triple: Triple<DocumentTemplateStorage, DocumentRequestService, DocumentUploadService> =
+        if (storageProvider == "pg") {
+            val ds = try {
+                buildHikariFromEnv(env)
+            } catch (t: Throwable) {
+                environment.log.error("Failed to init Hikari DataSource for Document Flow, falling back to stubs", t)
+                null
+            }
+            if (ds != null) {
+                val tpl = TemplateService(TemplateStoragePg(ds))
+                val req = RequestService(DocumentRequestServicePg(ds))
+                val upl = DocumentUploadServicePg()
+                Triple(tpl, req, upl)
+            } else {
+                Triple(templateStorageStub, requestServiceStub, uploadServiceStub)
+            }
+        } else {
+            // future: s3 wiring
+            Triple(templateStorageStub, requestServiceStub, uploadServiceStub)
+        }
+
+    val (templateStorageImpl, requestServiceImpl, uploadServiceImpl) = triple
+
+    // 7. Quartz scheduler for exact-time proof (configurable time via EXACT_PROOF_TIME=HH:mm)
     val scheduler = StdSchedulerFactory.getDefaultScheduler().apply { start() }
+
+    val timeStr = env["EXACT_PROOF_TIME"] ?: "09:43"
+    val (proofHour, proofMinute) = timeStr.split(":").let {
+        val h = it.getOrNull(0)?.toIntOrNull() ?: 9
+        val m = it.getOrNull(1)?.toIntOrNull() ?: 43
+        h to m
+    }
+    val berlinTz = TimeZone.getTimeZone("Europe/Berlin")
 
     scheduler.scheduleJob(
         JobBuilder.newJob(ExactProofJob::class.java)
@@ -138,11 +224,16 @@ fun Application.module() {
             .build(),
         TriggerBuilder.newTrigger()
             .withSchedule(
-                CronScheduleBuilder.dailyAtHourAndMinute(9, 43)
-                    .inTimeZone(TimeZone.getTimeZone("Europe/Berlin"))
+                CronScheduleBuilder.dailyAtHourAndMinute(proofHour, proofMinute)
+                    .inTimeZone(berlinTz)
             )
             .build()
     )
+
+    // Graceful shutdown for Quartz
+    environment.monitor.subscribe(ApplicationStopped) {
+        scheduler.shutdown(true)
+    }
 
     // Account deletion service (for in‑app account removal)
     val appBaseUrl = environment.config.propertyOrNull("app.baseUrl")?.getString()
@@ -175,6 +266,12 @@ fun Application.module() {
             companyTimesheetRoutes()
             registerEntitlementsRoutes()
             accountDeletionRoutes(deletionService)
+            // Document Flow
+            registerDocumentFlowRoutes(
+                templateStorage = templateStorageImpl,
+                requestService = requestServiceImpl,
+                uploadService = uploadServiceImpl
+            )
 
 
 
@@ -191,4 +288,22 @@ class ExactProofJob : Job {
         // TODO: Insert a new record into Proofs table with responded = false,
         // then send APNs/FCM push containing the new proofId in userInfo.
     }
+}
+
+private fun buildHikariFromEnv(env: io.github.cdimascio.dotenv.Dotenv): DataSource {
+    val jdbcUrl = env["JDBC_DATABASE_URL"]
+        ?: env["JDBC_DATABASE_URL_NEON"]
+        ?: error("JDBC_DATABASE_URL or JDBC_DATABASE_URL_NEON must be set")
+    val user = env["DB_USER"] ?: env["DB_USER_NEON"] ?: error("DB_USER/DB_USER_NEON must be set")
+    val pass = env["DB_PASSWORD"] ?: env["DB_PASSWORD_NEON"] ?: error("DB_PASSWORD/DB_PASSWORD_NEON must be set")
+    val maxPool = (env["DB_MAX_POOL"] ?: env["DB_MAX_POOL_NEON"] ?: "10").toInt()
+
+    val cfg = HikariConfig().apply {
+        this.jdbcUrl = jdbcUrl
+        this.username = user
+        this.password = pass
+        this.maximumPoolSize = maxPool
+        this.isAutoCommit = true
+    }
+    return HikariDataSource(cfg)
 }

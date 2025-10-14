@@ -128,4 +128,5 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.10.2")
     implementation("com.sun.mail:jakarta.mail:1.6.7")
     implementation("com.googlecode.libphonenumber:libphonenumber:8.13.43")
+    implementation("software.amazon.awssdk:s3:2.25.64")
 }
