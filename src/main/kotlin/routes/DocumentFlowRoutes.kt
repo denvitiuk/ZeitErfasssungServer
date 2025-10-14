@@ -7,9 +7,11 @@ import io.ktor.server.auth.jwt.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import kotlinx.serialization.Serializable
 
 // --- Public DTOs & Enums ---
 
+@Serializable
 enum class RequestType {
     KRANKMELDUNG, // больничный
     URLAUB,       // отпуск
@@ -18,12 +20,14 @@ enum class RequestType {
     SONSTIGES     // прочее
 }
 
+@Serializable
 enum class RequestStatus {
     EINGEREICHT,  // отправлено
     ANGENOMMEN,   // одобрено
     ABGELEHNT     // отклонено
 }
 
+@Serializable
 data class TemplateDTO(
     val id: Long,
     val title: String,
@@ -36,6 +40,7 @@ data class TemplateDTO(
     val updatedAt: Long
 )
 
+@Serializable
 data class AttachmentRef(
     val objectKey: String,      // ключ в хранилище (S3/GCS) — не URL
     val fileName: String,
@@ -43,6 +48,7 @@ data class AttachmentRef(
     val size: Long
 )
 
+@Serializable
 data class CreateRequestPayload(
     val type: RequestType,
     val dateFrom: String,       // ISO yyyy-MM-dd
@@ -53,6 +59,7 @@ data class CreateRequestPayload(
     val attachments: List<AttachmentRef> = emptyList()
 )
 
+@Serializable
 data class RequestDTO(
     val id: Long,
     val userId: Long,
@@ -70,6 +77,7 @@ data class RequestDTO(
     val declineReason: String? = null
 )
 
+@Serializable
 data class LeaveBalanceDTO(
     val totalDaysPerYear: Double,
     val usedDays: Double,
@@ -77,13 +85,16 @@ data class LeaveBalanceDTO(
     val remainingDays: Double
 )
 
+@Serializable
 data class SetStatusPayload(
     val status: RequestStatus,  // ANGENOMMEN или ABGELEHNT
     val reason: String? = null
 )
 
+@Serializable
 enum class UploadPurpose { REQUEST_ATTACHMENT, TEMPLATE }
 
+@Serializable
 data class PresignRequest(
     val fileName: String,
     val contentType: String,
@@ -91,6 +102,7 @@ data class PresignRequest(
     val purpose: UploadPurpose
 )
 
+@Serializable
 data class PresignResponse(
     val uploadUrl: String,
     val objectKey: String,
@@ -99,6 +111,7 @@ data class PresignResponse(
     val headers: Map<String, String> = emptyMap()
 )
 
+@Serializable
 data class TemplateQuery(
     val locale: String? = null,
     val type: RequestType? = null,
@@ -107,6 +120,7 @@ data class TemplateQuery(
 
 // --- Error body (единый формат ошибок) ---
 
+@Serializable
 data class ErrorBody(val error: String)
 
 // --- Claims helper ---
