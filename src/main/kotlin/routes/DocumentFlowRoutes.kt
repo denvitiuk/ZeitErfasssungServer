@@ -86,6 +86,13 @@ data class LeaveBalanceDTO(
 )
 
 @Serializable
+data class AdjustLeavePayload(
+    val deltaDays: Int,
+    val reason: String? = null,
+    val year: Int? = null
+)
+
+@Serializable
 data class SetStatusPayload(
     val status: RequestStatus,  // ANGENOMMEN или ABGELEHNT
     val reason: String? = null
@@ -116,6 +123,13 @@ data class TemplateQuery(
     val locale: String? = null,
     val type: RequestType? = null,
     val includeCompanySpecific: Boolean = true
+)
+
+// Binary blob returned from storage (e.g., Postgres large object / bytea)
+data class DownloadedObject(
+    val bytes: ByteArray,
+    val contentType: String = "application/pdf",
+    val fileName: String? = null
 )
 
 // --- Error body (единый формат ошибок) ---
@@ -170,6 +184,7 @@ interface DocumentTemplateStorage {
     suspend fun listTemplates(companyId: Long?, query: TemplateQuery): List<TemplateDTO>
     suspend fun getTemplate(id: Long): TemplateDTO?
     suspend fun upsertTemplate(meta: TemplateDTO): TemplateDTO
+    // Download binary by Postgres id (for storageKey like "pg:{id}")
 }
 
 interface DocumentRequestService {
@@ -178,10 +193,20 @@ interface DocumentRequestService {
     suspend fun listForCompany(companyId: Long, status: RequestStatus?): List<RequestDTO>
     suspend fun setStatus(adminId: Long, companyId: Long, requestId: Long, payload: SetStatusPayload): RequestDTO
     suspend fun leaveBalance(userId: Long): LeaveBalanceDTO
+    suspend fun adminLeaveBalance(targetUserId: Long, year: Int): LeaveBalanceDTO
+    suspend fun adjustLeaveEntitlement(
+        adminId: Long,
+        companyId: Long,
+        targetUserId: Long,
+        year: Int,
+        deltaDays: Int,
+        reason: String?
+    ): LeaveBalanceDTO
 }
 
 interface DocumentUploadService {
     suspend fun presign(userId: Long, companyId: Long?, req: PresignRequest): PresignResponse
+    suspend fun downloadPgObject(id: Long): DownloadedObject?
 }
 
 // --- Route registration ---
@@ -194,6 +219,7 @@ interface DocumentUploadService {
  * - /admin/requests/{id}/status
  * - /leave/balance
  * - /uploads/presign
+ * - /files/pg/{id}
  */
 fun Route.registerDocumentFlowRoutes(
     templateStorage: DocumentTemplateStorage,
@@ -294,6 +320,40 @@ fun Route.registerDocumentFlowRoutes(
             }
         }
 
+        route("/admin/users") {
+            // GET /admin/users/{id}/leave/balance?year=YYYY
+            get("/{id}/leave/balance") {
+                val claims = call.requireCompanyAdminOrRespond() ?: return@get
+                val targetId = call.parameters["id"]?.toLongOrNull()
+                    ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_id")
+                val year = call.request.queryParameters["year"]?.toIntOrNull()
+                    ?: java.time.LocalDate.now().year
+                val bal = requestService.adminLeaveBalance(targetId, year)
+                call.respond(bal)
+            }
+
+            // POST /admin/users/{id}/leave/adjust
+            post("/{id}/leave/adjust") {
+                val claims = call.requireCompanyAdminOrRespond() ?: return@post
+                val targetId = call.parameters["id"]?.toLongOrNull()
+                    ?: return@post call.respondError(HttpStatusCode.BadRequest, "invalid_id")
+                val payload = call.receive<AdjustLeavePayload>()
+                if (payload.deltaDays == 0) {
+                    return@post call.respondError(HttpStatusCode.UnprocessableEntity, "delta_zero_not_allowed")
+                }
+                val year = payload.year ?: java.time.LocalDate.now().year
+                val newBal = requestService.adjustLeaveEntitlement(
+                    adminId = claims.userId,
+                    companyId = claims.companyId!!,
+                    targetUserId = targetId,
+                    year = year,
+                    deltaDays = payload.deltaDays,
+                    reason = payload.reason
+                )
+                call.respond(HttpStatusCode.OK, newBal)
+            }
+        }
+
         // Leave balance for current user
         get("/leave/balance") {
             val claims = call.requireAuthOrRespond() ?: return@get
@@ -323,6 +383,30 @@ fun Route.registerDocumentFlowRoutes(
                 req = req
             )
             call.respond(HttpStatusCode.Created, presigned)
+        }
+
+        // File download for Postgres-backed template blobs, e.g. storageKey = "pg:{id}"
+        get("/files/pg/{id}") {
+            if (call.requireAuthOrRespond() == null) return@get
+            val id = call.parameters["id"]?.toLongOrNull()
+                ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_id")
+
+            val obj = uploadService.downloadPgObject(id)
+                ?: return@get call.respondError(HttpStatusCode.NotFound, "not_found")
+
+            val ct = runCatching { ContentType.parse(obj.contentType) }
+                .getOrElse { ContentType.Application.OctetStream }
+
+            obj.fileName?.let { fname ->
+                call.response.headers.append(
+                    HttpHeaders.ContentDisposition,
+                    ContentDisposition.Attachment
+                        .withParameter(ContentDisposition.Parameters.FileName, fname)
+                        .toString()
+                )
+            }
+
+            call.respondBytes(obj.bytes, contentType = ct)
         }
     }
 }

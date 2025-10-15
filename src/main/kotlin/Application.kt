@@ -44,6 +44,8 @@ import com.yourcompany.zeiterfassung.routes.CreateRequestPayload
 import com.yourcompany.zeiterfassung.routes.LeaveBalanceDTO
 import com.yourcompany.zeiterfassung.routes.PresignRequest
 import com.yourcompany.zeiterfassung.routes.PresignResponse
+import com.yourcompany.zeiterfassung.routes.RequestStatus
+import com.yourcompany.zeiterfassung.routes.DownloadedObject
 
 import com.yourcompany.zeiterfassung.service.TemplateService
 import com.yourcompany.zeiterfassung.service.pg.TemplateStoragePg
@@ -162,20 +164,63 @@ fun Application.module() {
     }
 
     val requestServiceStub = object : DocumentRequestService {
-        override suspend fun create(userId: Long, companyId: Long, payload: CreateRequestPayload): RequestDTO {
-            throw UnsupportedOperationException("Document requests: not wired yet")
+        override suspend fun create(
+            userId: Long,
+            companyId: Long,
+            payload: CreateRequestPayload
+        ): RequestDTO {
+            throw UnsupportedOperationException("create: not wired yet (stub)")
         }
-        override suspend fun listOwn(userId: Long): List<RequestDTO> = emptyList()
-        override suspend fun listForCompany(companyId: Long, status: com.yourcompany.zeiterfassung.routes.RequestStatus?): List<RequestDTO> = emptyList()
-        override suspend fun setStatus(adminId: Long, companyId: Long, requestId: Long, payload: SetStatusPayload): RequestDTO {
-            throw UnsupportedOperationException("setStatus: not wired yet")
+
+        override suspend fun listOwn(userId: Long): List<RequestDTO> {
+            return emptyList()
         }
-        override suspend fun leaveBalance(userId: Long): LeaveBalanceDTO = LeaveBalanceDTO(0.0, 0.0, 0.0, 0.0)
+
+        override suspend fun listForCompany(
+            companyId: Long,
+            status: RequestStatus?
+        ): List<RequestDTO> {
+            return emptyList()
+        }
+
+        override suspend fun setStatus(
+            adminId: Long,
+            companyId: Long,
+            requestId: Long,
+            payload: SetStatusPayload
+        ): RequestDTO {
+            throw UnsupportedOperationException("setStatus: not wired yet (stub)")
+        }
+
+        override suspend fun leaveBalance(userId: Long): LeaveBalanceDTO {
+            // Return zeros in stub so UI can render without crashing
+            return LeaveBalanceDTO(0.0, 0.0, 0.0, 0.0)
+        }
+
+
+        override suspend fun adminLeaveBalance(targetUserId: Long, year: Int): LeaveBalanceDTO {
+            return LeaveBalanceDTO(0.0, 0.0, 0.0, 0.0)
+        }
+
+        override suspend fun adjustLeaveEntitlement(
+            adminId: Long,
+            companyId: Long,
+            targetUserId: Long,
+            year: Int,
+            deltaDays: Int,
+            reason: String?
+        ): LeaveBalanceDTO {
+            throw UnsupportedOperationException("adjustLeaveEntitlement: not wired yet (stub)")
+        }
     }
 
     val uploadServiceStub = object : DocumentUploadService {
         override suspend fun presign(userId: Long, companyId: Long?, req: PresignRequest): PresignResponse {
             throw UnsupportedOperationException("presign uploads: not wired yet (STORAGE_PROVIDER=pg)")
+        }
+        override suspend fun downloadPgObject(id: Long): DownloadedObject? {
+            // Stub implementation for compilation when STORAGE_PROVIDER=pg but DS is not wired
+            return null
         }
     }
     // --- End stubs ---
