@@ -1,5 +1,7 @@
 package com.yourcompany.zeiterfassung.service.pg
 
+import com.yourcompany.zeiterfassung.routes.DownloadedObject
+
 import com.yourcompany.zeiterfassung.routes.DocumentUploadService
 import com.yourcompany.zeiterfassung.routes.PresignRequest
 import com.yourcompany.zeiterfassung.routes.PresignResponse
@@ -32,6 +34,13 @@ class DocumentUploadServicePg(
             method = "POST",
             headers = emptyMap()
         )
+    }
+
+    override suspend fun downloadPgObject(id: Long): DownloadedObject? {
+        // PG mode: binary download is handled by /uploads/{id} route (streamed directly from DB/storage).
+        // This service does not access blobs; return null so the caller can respond 404/Not Implemented.
+        // TODO: Wire a repository here if you decide to fetch bytes via service.
+        return null
     }
 
     companion object {

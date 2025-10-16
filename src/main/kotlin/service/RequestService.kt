@@ -67,6 +67,36 @@ class RequestService(
             remainingDays = lb.remainingDays
         )
     }
+
+    override suspend fun adminLeaveBalance(targetUserId: Long, year: Int): RoutesLeaveBalance {
+        val lb: PortsLeaveBalance = delegate.leaveBalance(targetUserId.toInt(), year)
+        return RoutesLeaveBalance(
+            totalDaysPerYear = lb.totalDaysPerYear,
+            usedDays = lb.usedDays,
+            pendingDays = lb.pendingDays,
+            remainingDays = lb.remainingDays
+        )
+    }
+
+    override suspend fun adjustLeaveEntitlement(
+        adminId: Long,
+        companyId: Long,
+        targetUserId: Long,
+        year: Int,
+        deltaDays: Int,
+        reason: String?
+    ): RoutesLeaveBalance {
+        // TEMP compatibility: ports.DocumentRequestService has no adjust API yet.
+        // TODO: add `adjustLeaveEntitlement(...)` to ports + implementation and wire it here.
+        // For now, return current balance as a no-op so routes compile.
+        val lb: PortsLeaveBalance = delegate.leaveBalance(targetUserId.toInt(), year)
+        return RoutesLeaveBalance(
+            totalDaysPerYear = lb.totalDaysPerYear,
+            usedDays = lb.usedDays,
+            pendingDays = lb.pendingDays,
+            remainingDays = lb.remainingDays
+        )
+    }
 }
 
 // ---------------- Mappers ----------------
