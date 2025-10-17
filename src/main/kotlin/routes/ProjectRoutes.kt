@@ -27,6 +27,15 @@ import org.jetbrains.exposed.sql.transactions.transaction
 @Serializable
 data class ApiErrorProject(val error: String, val detail: String? = null)
 
+@Serializable
+data class StandortDTO(
+    val projectId: Int,
+    val lat: Double,
+    val lng: Double,
+    val radius: Int = 300,
+    val location: String? = null
+)
+
 private fun principalCompanyId(principal: JWTPrincipal): Int =
     principal.payload.getClaim("companyId").asInt() ?: 0
 
@@ -185,6 +194,33 @@ fun Route.projectsRoutes() {
                     call.application.log.error("Create project failed", e)
                     call.respond(HttpStatusCode.InternalServerError, ApiErrorProject("create_failed", e.message))
                 }
+            }
+            // GET /projects/{id}/standort — coordinates for active geofence
+            get("/{id}/standort") {
+                val principal = call.principal<JWTPrincipal>()
+                    ?: return@get call.respond(HttpStatusCode.Unauthorized, ApiErrorProject("unauthorized", "Missing token"))
+                val idParam = call.parameters["id"] ?: return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing id"))
+                val projectId = idParam.toIntOrNull() ?: return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
+
+                val companyId = principalCompanyId(principal)
+                if (companyId <= 0)
+                    return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("no_company", "Token has no companyId"))
+
+                val row = requireSameCompanyOr404(projectId, companyId)
+                    ?: return@get call.respond(HttpStatusCode.NotFound, ApiErrorProject("not_found", "Project not found"))
+
+                val lat = row[Projects.lat] ?: return@get call.respond(HttpStatusCode.NotFound)
+                val lng = row[Projects.lng] ?: return@get call.respond(HttpStatusCode.NotFound)
+                val location = row[Projects.location]
+
+                val dto = StandortDTO(
+                    projectId = projectId,
+                    lat = lat,
+                    lng = lng,
+                    // If Projects has no radius column, we use default = 300 in DTO
+                    location = location
+                )
+                call.respond(HttpStatusCode.OK, dto)
             }
 
             // GET /projects/{id} — details with optional ?include=members

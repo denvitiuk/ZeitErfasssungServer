@@ -19,12 +19,15 @@ object Projects : IntIdTable(name = "projects") {
     val location    = text("location").nullable()
     val lat         = double("lat").nullable()
     val lng         = double("lng").nullable()
+    val archived    = bool("archived").default(false)
+    val archivedAt  = timestamp("archived_at").nullable()
     val createdAt   = timestamp("created_at").defaultExpression(CurrentTimestamp())
     val updatedAt   = timestamp("updated_at").defaultExpression(CurrentTimestamp())
 
     init {
-        // UNIQUE (company_id, title) создаётся миграцией; эти индексы помогут планировщику
-        index(isUnique = true, companyId, title)
+        // Убрали unique-индекс из кода: теперь частичный уникальный индекс
+        // (company_id, lower(title)) WHERE archived=false создаётся миграцией в БД.
+        // Оставляем только лёгкий индекс по company_id для листингов.
         index(isUnique = false, companyId)
     }
 }
