@@ -529,6 +529,253 @@ fun Route.proofsRoutes() {
 
                 call.respond(HttpStatusCode.OK, result)
             }
+            // 🧪 POST /api/proofs/create-test — shorthand for adhoc test (defaults to debug mode)
+            post("/create-test") {
+                val principal = call.principal<JWTPrincipal>()
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
+                val userId = principal.payload.getClaim("id").asString().toInt()
+                val projectId = parseProjectId(call)
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "project_required"))
+
+                val zone = resolveZone(call)
+
+                // Load project + check membership
+                val projectRow = transaction {
+                    Projects
+                        .slice(Projects.id, Projects.lat, Projects.lng)
+                        .select { Projects.id eq projectId }
+                        .singleOrNull()
+                } ?: return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "project_not_found"))
+
+                if (!isMember(userId, projectId)) {
+                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "forbidden_not_member"))
+                }
+
+                val projLat = projectRow[Projects.lat]
+                val projLng = projectRow[Projects.lng]
+                if (projLat == null || projLng == null) {
+                    return@post call.respond(HttpStatusCode.Conflict, mapOf("error" to "project_location_missing"))
+                }
+
+                val nowZdt = ZonedDateTime.now(zone)
+                val fireAtZdt = nowZdt.plusSeconds(15)
+
+                fun chooseSlotByTime(h: Int): Short = when (h) {
+                    in 9..11 -> 1
+                    in 13..16 -> 2
+                    else -> 1
+                }.toShort()
+
+                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
+                val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
+                val newId = transaction {
+                    Proofs.insert {
+                        it[Proofs.userId] = userId
+                        it[Proofs.projectId] = projectId
+                        it[Proofs.latitude] = projLat
+                        it[Proofs.longitude] = projLng
+                        it[Proofs.radius] = 150
+                        it[Proofs.date] = nowZdt.toLocalDate()
+                        it[Proofs.slot] = chosenSlot
+                        it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                        it[Proofs.responded] = false
+                    } get Proofs.id
+                }
+
+                call.respond(HttpStatusCode.OK, mapOf(
+                    "id" to newId,
+                    "slot" to chosenSlot.toInt(),
+                    "sentAt" to fireAtZdt.toInstant().toString(),
+                    "mode" to "adhoc"
+                ))
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────
+        // Aliases without /api prefix for backward/SDK compatibility
+        // ─────────────────────────────────────────────────────────────────
+        route("/proofs") {
+            // POST /proofs/test — same logic as /api/proofs/test
+            post("/test") {
+                val principal = call.principal<JWTPrincipal>()
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
+                val userId = principal.payload.getClaim("id").asString().toInt()
+                val projectId = parseProjectId(call)
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "project_required"))
+
+                val debug = (call.request.queryParameters["debug"] == "1") ||
+                            (call.request.headers["X-Debug-Push"] == "1")
+                if (!debug) {
+                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "debug_only"))
+                }
+
+                val mode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
+                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
+                val zone = resolveZone(call)
+
+                // Load project + check membership
+                val projectRow = transaction {
+                    Projects
+                        .slice(Projects.id, Projects.lat, Projects.lng)
+                        .select { Projects.id eq projectId }
+                        .singleOrNull()
+                } ?: return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "project_not_found"))
+
+                if (!isMember(userId, projectId)) {
+                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "forbidden_not_member"))
+                }
+
+                val projLat = projectRow[Projects.lat]
+                val projLng = projectRow[Projects.lng]
+                if (projLat == null || projLng == null) {
+                    return@post call.respond(HttpStatusCode.Conflict, mapOf("error" to "project_location_missing"))
+                }
+
+                val nowZdt = ZonedDateTime.now(zone)
+                val fireAtZdt = nowZdt.plusSeconds(15)
+
+                // If we are replacing a real slot, require an active shift today
+                if (mode == "replace") {
+                    val shiftActive = isShiftActiveToday(userId, projectId, zone)
+                    if (!shiftActive) {
+                        return@post call.respond(
+                            HttpStatusCode.Conflict,
+                            mapOf(
+                                "error" to "no_active_shift",
+                                "message" to "Cannot replace slot when no IN log today",
+                                "shiftActive" to false
+                            )
+                        )
+                    }
+                }
+
+                fun chooseSlotByTime(h: Int): Short = when (h) {
+                    in 9..11 -> 1
+                    in 13..16 -> 2
+                    else -> 1
+                }.toShort()
+
+                val result = transaction {
+                    when (mode) {
+                        "replace" -> {
+                            val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
+                            val today = nowZdt.toLocalDate()
+                            val existing = Proofs.select {
+                                (Proofs.userId eq userId) and
+                                (Proofs.projectId eq projectId) and
+                                (Proofs.date eq today) and
+                                (Proofs.slot eq chosenSlot)
+                            }.singleOrNull()
+
+                            val proofId = if (existing != null) {
+                                Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
+                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                }
+                                existing[Proofs.id]
+                            } else {
+                                Proofs.insert {
+                                    it[Proofs.userId] = userId
+                                    it[Proofs.projectId] = projectId
+                                    it[Proofs.latitude] = projLat
+                                    it[Proofs.longitude] = projLng
+                                    it[Proofs.radius] = 150
+                                    it[Proofs.date] = today
+                                    it[Proofs.slot] = chosenSlot
+                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.responded] = false
+                                } get Proofs.id
+                            }
+                            mapOf(
+                                "id" to proofId,
+                                "slot" to chosenSlot.toInt(),
+                                "sentAt" to fireAtZdt.toInstant().toString(),
+                                "mode" to "replace"
+                            )
+                        }
+                        else -> { // adhoc
+                            val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
+                            val newId = Proofs.insert {
+                                it[Proofs.userId] = userId
+                                it[Proofs.projectId] = projectId
+                                it[Proofs.latitude] = projLat
+                                it[Proofs.longitude] = projLng
+                                it[Proofs.radius] = 150
+                                it[Proofs.date] = nowZdt.toLocalDate()
+                                it[Proofs.slot] = chosenSlot
+                                it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                it[Proofs.responded] = false
+                            } get Proofs.id
+                            mapOf(
+                                "id" to newId,
+                                "slot" to chosenSlot.toInt(),
+                                "sentAt" to fireAtZdt.toInstant().toString(),
+                                "mode" to "adhoc"
+                            )
+                        }
+                    }
+                }
+
+                call.respond(HttpStatusCode.OK, result)
+            }
+
+            // POST /proofs/create-test — shorthand alias (defaults to adhoc)
+            post("/create-test") {
+                val principal = call.principal<JWTPrincipal>()
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
+                val userId = principal.payload.getClaim("id").asString().toInt()
+                val projectId = parseProjectId(call)
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "project_required"))
+
+                val zone = resolveZone(call)
+
+                val projectRow = transaction {
+                    Projects
+                        .slice(Projects.id, Projects.lat, Projects.lng)
+                        .select { Projects.id eq projectId }
+                        .singleOrNull()
+                } ?: return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "project_not_found"))
+
+                if (!isMember(userId, projectId)) {
+                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "forbidden_not_member"))
+                }
+
+                val projLat = projectRow[Projects.lat]
+                val projLng = projectRow[Projects.lng]
+                if (projLat == null || projLng == null) {
+                    return@post call.respond(HttpStatusCode.Conflict, mapOf("error" to "project_location_missing"))
+                }
+
+                val nowZdt = ZonedDateTime.now(zone)
+                val fireAtZdt = nowZdt.plusSeconds(15)
+
+                fun chooseSlotByTime(h: Int): Short = when (h) {
+                    in 9..11 -> 1
+                    in 13..16 -> 2
+                    else -> 1
+                }.toShort()
+
+                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
+                val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
+                val newId = transaction {
+                    Proofs.insert {
+                        it[Proofs.userId] = userId
+                        it[Proofs.projectId] = projectId
+                        it[Proofs.latitude] = projLat
+                        it[Proofs.longitude] = projLng
+                        it[Proofs.radius] = 150
+                        it[Proofs.date] = nowZdt.toLocalDate()
+                        it[Proofs.slot] = chosenSlot
+                        it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                        it[Proofs.responded] = false
+                    } get Proofs.id
+                }
+
+                call.respond(HttpStatusCode.OK, mapOf(
+                    "id" to newId,
+                    "slot" to chosenSlot.toInt(),
+                    "sentAt" to fireAtZdt.toInstant().toString(),
+                    "mode" to "adhoc"
+                ))
+            }
         }
     }
 }
