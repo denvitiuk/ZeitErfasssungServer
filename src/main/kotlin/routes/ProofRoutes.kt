@@ -67,6 +67,64 @@ private fun parseProjectId(call: ApplicationCall): Int? {
     return (q ?: h)?.toIntOrNull()
 }
 
+private data class ProjectResolution(val id: Int?, val reason: String, val choices: List<Int> = emptyList())
+
+private fun autoResolveProject(call: ApplicationCall, userId: Int, zone: ZoneId): ProjectResolution {
+    // 1) Explicit projectId via query/header
+    val explicit = parseProjectId(call)
+    if (explicit != null) return ProjectResolution(explicit, "explicit")
+
+    val today = LocalDate.now(zone)
+
+    // 2) Last log today and active (IN) → use that project
+    val lastLog = transaction {
+        Logs
+            .slice(Logs.projectId, Logs.action, Logs.timestamp)
+            .select { Logs.userId eq userId }
+            .orderBy(Logs.timestamp, SortOrder.DESC)
+            .limit(1)
+            .singleOrNull()
+    }
+    if (lastLog != null) {
+        val ts = lastLog[Logs.timestamp]
+        val d = ts.atZone(zone).toLocalDate()
+        if (d == today && lastLog[Logs.action].equals("in", ignoreCase = true)) {
+            val pid = lastLog[Logs.projectId]
+            if (pid != null) return ProjectResolution(pid.value, "inferred_from_active_shift")
+        }
+    }
+
+    // 3) Last IN today across projects
+    val lastInToday = transaction {
+        Logs
+            .slice(Logs.projectId, Logs.timestamp)
+            .select { (Logs.userId eq userId) and (Logs.action eq "in") }
+            .orderBy(Logs.timestamp, SortOrder.DESC)
+            .limit(1)
+            .singleOrNull()
+    }
+    if (lastInToday != null) {
+        val ts = lastInToday[Logs.timestamp]
+        if (ts.atZone(zone).toLocalDate() == today) {
+            val pid = lastInToday[Logs.projectId]
+            if (pid != null) return ProjectResolution(pid.value, "inferred_from_last_in")
+        }
+    }
+
+    // 4) Single membership → use that project
+    val memberships: List<Int> = transaction {
+        ProjectMembers
+            .slice(ProjectMembers.projectId)
+            .select { ProjectMembers.userId eq userId }
+            .map { it[ProjectMembers.projectId].value }
+    }
+    return when (memberships.size) {
+        1 -> ProjectResolution(memberships.first(), "inferred_from_single_membership")
+        0 -> ProjectResolution(null, "project_required")
+        else -> ProjectResolution(null, "project_ambiguous", memberships)
+    }
+}
+
 private val rnd = SecureRandom()
 
 private fun randomLocalDateTimeInWindow(day: LocalDate, startHour: Int, endHourExclusive: Int, zone: ZoneId): LocalDateTime {
@@ -79,8 +137,8 @@ private fun randomLocalDateTimeInWindow(day: LocalDate, startHour: Int, endHourE
 // Membership check: is the user a member of the project?
 private fun isMember(userId: Int, projectId: Int): Boolean = transaction {
     ProjectMembers.select {
-        (ProjectMembers.projectId eq EntityID(projectId, Projects)) and
-        (ProjectMembers.userId eq EntityID(userId, Users))
+        (ProjectMembers.projectId eq projectId) and
+        (ProjectMembers.userId eq userId)
     }.any()
 }
 
@@ -109,10 +167,15 @@ fun Route.proofsRoutes() {
             get("/today") {
                 val principal = call.principal<JWTPrincipal>() ?: return@get call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
                 val userId = principal.payload.getClaim("id").asString().toInt()
-                val projectId = parseProjectId(call)
-                    ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "project_required"))
-
                 val zone = resolveZone(call)
+                val pr = autoResolveProject(call, userId, zone)
+                if (pr.id == null) {
+                    val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
+                    return@get call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                }
+                val projectId = pr.id
+                call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
+                call.response.headers.append("X-Reason", pr.reason)
 
                 // Load project and ensure it has coordinates
                 val projectRow = transaction {
@@ -236,10 +299,15 @@ fun Route.proofsRoutes() {
                 try {
                   val principal = call.principal<JWTPrincipal>() ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
                   val userId = principal.payload.getClaim("id").asString().toInt()
-                  val projectId = parseProjectId(call)
-                      ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "project_required"))
-
                   val zone = resolveZone(call)
+                  val pr = autoResolveProject(call, userId, zone)
+                  if (pr.id == null) {
+                      val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
+                      return@post call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                  }
+                  val projectId = pr.id
+                  call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
+                  call.response.headers.append("X-Reason", pr.reason)
 
                   // Load project coordinates
                   val projectRow = transaction {
@@ -337,8 +405,8 @@ fun Route.proofsRoutes() {
 
                     // Check membership inside transaction; if not, mark and abort
                     val member = ProjectMembers.select {
-                        (ProjectMembers.projectId eq EntityID(projectId, Projects)) and
-                        (ProjectMembers.userId eq EntityID(userId, Users))
+                        (ProjectMembers.projectId eq projectId) and
+                        (ProjectMembers.userId eq userId)
                     }.any()
                     if (!member) {
                         notMember = true
@@ -408,8 +476,15 @@ fun Route.proofsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
                 val userId = principal.payload.getClaim("id").asString().toInt()
-                val projectId = parseProjectId(call)
-                    ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "project_required"))
+                val zone = resolveZone(call)
+                val pr = autoResolveProject(call, userId, zone)
+                if (pr.id == null) {
+                    val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
+                    return@post call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                }
+                val projectId = pr.id
+                call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
+                call.response.headers.append("X-Reason", pr.reason)
 
                 val debug = (call.request.queryParameters["debug"] == "1") ||
                             (call.request.headers["X-Debug-Push"] == "1")
@@ -420,8 +495,6 @@ fun Route.proofsRoutes() {
 
                 val mode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
                 val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
-
-                val zone = resolveZone(call)
 
                 // Load project + check membership
                 val projectRow = transaction {
@@ -534,10 +607,15 @@ fun Route.proofsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
                 val userId = principal.payload.getClaim("id").asString().toInt()
-                val projectId = parseProjectId(call)
-                    ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "project_required"))
-
                 val zone = resolveZone(call)
+                val pr = autoResolveProject(call, userId, zone)
+                if (pr.id == null) {
+                    val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
+                    return@post call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                }
+                val projectId = pr.id
+                call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
+                call.response.headers.append("X-Reason", pr.reason)
 
                 // Load project + check membership
                 val projectRow = transaction {
@@ -599,8 +677,15 @@ fun Route.proofsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
                 val userId = principal.payload.getClaim("id").asString().toInt()
-                val projectId = parseProjectId(call)
-                    ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "project_required"))
+                val zone = resolveZone(call)
+                val pr = autoResolveProject(call, userId, zone)
+                if (pr.id == null) {
+                    val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
+                    return@post call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                }
+                val projectId = pr.id
+                call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
+                call.response.headers.append("X-Reason", pr.reason)
 
                 val debug = (call.request.queryParameters["debug"] == "1") ||
                             (call.request.headers["X-Debug-Push"] == "1")
@@ -610,7 +695,6 @@ fun Route.proofsRoutes() {
 
                 val mode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
                 val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
-                val zone = resolveZone(call)
 
                 // Load project + check membership
                 val projectRow = transaction {
@@ -722,10 +806,15 @@ fun Route.proofsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
                 val userId = principal.payload.getClaim("id").asString().toInt()
-                val projectId = parseProjectId(call)
-                    ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "project_required"))
-
                 val zone = resolveZone(call)
+                val pr = autoResolveProject(call, userId, zone)
+                if (pr.id == null) {
+                    val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
+                    return@post call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                }
+                val projectId = pr.id
+                call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
+                call.response.headers.append("X-Reason", pr.reason)
 
                 val projectRow = transaction {
                     Projects
