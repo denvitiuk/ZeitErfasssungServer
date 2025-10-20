@@ -16,6 +16,9 @@ import com.yourcompany.zeiterfassung.dto.ScanRequest
 import com.yourcompany.zeiterfassung.dto.ScanResponse
 import com.yourcompany.zeiterfassung.models.Logs
 import com.yourcompany.zeiterfassung.models.Nonces
+import com.yourcompany.zeiterfassung.db.Projects
+import com.yourcompany.zeiterfassung.dto.ProjectDTO
+import org.jetbrains.exposed.dao.id.EntityID
 
 import java.time.LocalDate
 import org.jetbrains.exposed.sql.SortOrder
@@ -46,6 +49,11 @@ fun Route.scanRoutes() {
                             (Nonces.userId eq userId)
                 }.firstOrNull() ?: return@transaction null
 
+                // Определяем projectId из запроса (query/header). Если клиент его не прислал, оставим null.
+                val projectIdFromQuery = call.request.queryParameters["projectId"]?.toIntOrNull()
+                val projectIdFromHeader = call.request.headers["X-Project-Id"]?.toIntOrNull()
+                val resolvedProjectId = projectIdFromQuery ?: projectIdFromHeader
+
                 // Определяем начало сегодняшнего дня (LocalDateTime)
                 val todayStart = LocalDate.now().atStartOfDay()
 
@@ -70,6 +78,9 @@ fun Route.scanRoutes() {
                     it[Logs.latitude]      = req.latitude
                     it[Logs.longitude]     = req.longitude
                     it[Logs.locationDesc]  = req.locationDescription
+                    if (resolvedProjectId != null) {
+                        it[Logs.projectId] = EntityID(resolvedProjectId!!, Projects)
+                    }
                 }
 
                 Nonces.update({ Nonces.nonce eq req.nonce }) {
