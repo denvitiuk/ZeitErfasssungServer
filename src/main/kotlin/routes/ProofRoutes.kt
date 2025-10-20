@@ -199,7 +199,7 @@ fun Route.proofsRoutes() {
                                 it[Proofs.responded] = false
                             }
                         } catch (_: Exception) {
-                            // ignore duplicates in case of race
+                            // ignore duplicates in case of raceы
                         }
                     }
                 }
