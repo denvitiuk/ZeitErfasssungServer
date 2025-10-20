@@ -22,6 +22,16 @@ import org.jetbrains.exposed.dao.id.EntityID
 
 import java.time.LocalDate
 import org.jetbrains.exposed.sql.SortOrder
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
+
+// Resolve timezone from query ?tz=... or header X-Timezone; default to Europe/Berlin
+private fun resolveZone(call: io.ktor.server.application.ApplicationCall): ZoneId {
+    val q = call.request.queryParameters["tz"]
+    val h = call.request.headers["X-Timezone"]
+    val id = q ?: h ?: "Europe/Berlin"
+    return try { ZoneId.of(id) } catch (_: Exception) { ZoneId.of("Europe/Berlin") }
+}
 
 /**
  * Handles scanning of QR codes (in/out actions).
@@ -39,6 +49,8 @@ fun Route.scanRoutes() {
             // 2. Читаем тело запроса
             val req = call.receive<ScanRequest>()
             val now = Instant.now()
+            val zone = resolveZone(call)
+            call.response.headers.append("X-Timezone-Used", zone.id)
 
             // 3. Транзакционно проверяем nonce, пишем лог, помечаем used и возвращаем action
             val actionPerformed: String? = transaction {
@@ -54,18 +66,19 @@ fun Route.scanRoutes() {
                 val projectIdFromHeader = call.request.headers["X-Project-Id"]?.toIntOrNull()
                 val resolvedProjectId = projectIdFromQuery ?: projectIdFromHeader
 
-                // Определяем начало сегодняшнего дня (LocalDateTime)
-                val todayStart = LocalDate.now().atStartOfDay()
+                // Определяем начало сегодняшнего дня в зоне пользователя
+                val todayStart = LocalDate.now(zone).atStartOfDay(zone).toLocalDateTime()
 
-                // Получаем последний лог этого пользователя за сегодня
-                val lastAction = Logs.select {
-                    (Logs.userId eq userId) and
-                    (Logs.timestamp greaterEq todayStart)
-                }
-                .orderBy(Logs.timestamp, SortOrder.DESC)
-                .limit(1)
-                .map { it[Logs.action] }
-                .firstOrNull()
+                val baseCond = (Logs.userId eq userId) and (Logs.timestamp greaterEq todayStart)
+                val cond = if (resolvedProjectId != null) {
+                    baseCond and (Logs.projectId eq EntityID(resolvedProjectId, Projects))
+                } else baseCond
+
+                val lastAction = Logs.select { cond }
+                    .orderBy(Logs.timestamp, SortOrder.DESC)
+                    .limit(1)
+                    .map { it[Logs.action] }
+                    .firstOrNull()
 
                 // Выбираем новое действие: если был "in" — ставим "out", иначе "in"
                 val action = if (lastAction == "in") "out" else "in"
@@ -74,7 +87,7 @@ fun Route.scanRoutes() {
                     it[Logs.userId]        = userId
                     it[Logs.terminalNonce] = req.nonce
                     it[Logs.action]        = action
-                    it[Logs.timestamp]     = LocalDateTime.ofInstant(now, ZoneId.systemDefault())
+                    it[Logs.timestamp]     = LocalDateTime.ofInstant(now, zone)
                     it[Logs.latitude]      = req.latitude
                     it[Logs.longitude]     = req.longitude
                     it[Logs.locationDesc]  = req.locationDescription
