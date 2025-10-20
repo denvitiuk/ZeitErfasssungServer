@@ -10,6 +10,7 @@ import io.ktor.http.*
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.transaction
 import com.yourcompany.zeiterfassung.models.Proofs
+import com.yourcompany.zeiterfassung.models.Logs
 import com.yourcompany.zeiterfassung.dto.ProofDto
 import com.yourcompany.zeiterfassung.dto.RespondProofRequest
 import com.yourcompany.zeiterfassung.dto.ProofResponse
@@ -83,6 +84,23 @@ private fun isMember(userId: Int, projectId: Int): Boolean = transaction {
     }.any()
 }
 
+// Shift gate: active if the last log for today is IN (in the requested zone)
+private fun isShiftActiveToday(userId: Int, projectId: Int, zone: ZoneId): Boolean = transaction {
+    val row = Logs
+        .slice(Logs.action, Logs.timestamp)
+        .select { (Logs.userId eq userId) and (Logs.projectId eq projectId) }
+        .orderBy(Logs.timestamp, SortOrder.DESC)
+        .limit(1)
+        .singleOrNull()
+
+    if (row == null) return@transaction false
+    val action = row[Logs.action]
+    val ts = row[Logs.timestamp]
+    val today = LocalDate.now(zone)
+    val d = ts.atZone(zone).toLocalDate()
+    return@transaction (d == today && action.equals("in", ignoreCase = true))
+}
+
 fun Route.proofsRoutes() {
     authenticate("bearerAuth") {
         route("/api/proofs") {
@@ -116,6 +134,27 @@ fun Route.proofsRoutes() {
                 }
 
                 val today = LocalDate.now(zone)
+
+                // ---- QR-gate: create slots only if today's shift is active (last log today = IN)
+                val requireShift = call.request.queryParameters["requireShift"] == "1" ||
+                                   call.request.queryParameters["requireActiveShift"] == "1"
+                val shiftActive = isShiftActiveToday(userId, projectId, zone)
+
+                if (!shiftActive) {
+                    if (requireShift) {
+                        return@get call.respond(
+                            HttpStatusCode.Conflict,
+                            mapOf(
+                                "error" to "no_active_shift",
+                                "message" to "No IN log for today — slots are not created",
+                                "shiftActive" to false
+                            )
+                        )
+                    } else {
+                        call.response.headers.append("X-Reason", "no_active_shift")
+                        return@get call.respond(emptyList<ProofDto>())
+                    }
+                }
 
                 // Ensure two slots exist for today for this user+project
                 transaction {
@@ -360,6 +399,135 @@ fun Route.proofsRoutes() {
                         )
                     )
                 }
+            }
+            // 🧪 POST /api/proofs/test?debug=1&push=1&mode=adhoc|replace[&slot=1|2]
+            // Minimal server-side for the Test button. It does **not** send APNs here —
+            // it only prepares a proof and returns its id/schedule. Your push worker
+            // (or a later step) may pick it up and deliver a real alert.
+            post("/test") {
+                val principal = call.principal<JWTPrincipal>()
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
+                val userId = principal.payload.getClaim("id").asString().toInt()
+                val projectId = parseProjectId(call)
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "project_required"))
+
+                val debug = (call.request.queryParameters["debug"] == "1") ||
+                            (call.request.headers["X-Debug-Push"] == "1")
+                // allow only debug for now — so боевые лимиты не трогаем
+                if (!debug) {
+                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "debug_only"))
+                }
+
+                val mode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
+                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
+
+                val zone = resolveZone(call)
+
+                // Load project + check membership
+                val projectRow = transaction {
+                    Projects
+                        .slice(Projects.id, Projects.lat, Projects.lng)
+                        .select { Projects.id eq projectId }
+                        .singleOrNull()
+                } ?: return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "project_not_found"))
+
+                if (!isMember(userId, projectId)) {
+                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "forbidden_not_member"))
+                }
+
+                val projLat = projectRow[Projects.lat]
+                val projLng = projectRow[Projects.lng]
+                if (projLat == null || projLng == null) {
+                    return@post call.respond(HttpStatusCode.Conflict, mapOf("error" to "project_location_missing"))
+                }
+
+                val nowZdt = ZonedDateTime.now(zone)
+                val fireAtZdt = nowZdt.plusSeconds(15)
+
+                // If we are replacing a real slot, require an active shift today
+                if (mode == "replace") {
+                    val shiftActive = isShiftActiveToday(userId, projectId, zone)
+                    if (!shiftActive) {
+                        return@post call.respond(
+                            HttpStatusCode.Conflict,
+                            mapOf(
+                                "error" to "no_active_shift",
+                                "message" to "Cannot replace slot when no IN log today",
+                                "shiftActive" to false
+                            )
+                        )
+                    }
+                }
+
+                // helper: choose slot by current time
+                fun chooseSlotByTime(h: Int): Short = when (h) {
+                    in 9..11 -> 1
+                    in 13..16 -> 2
+                    else -> 1 // default to 1 for adhoc
+                }.toShort()
+
+                val result = transaction {
+                    when (mode) {
+                        "replace" -> {
+                            val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
+                            // try update existing proof for today; if not exists — create it
+                            val today = nowZdt.toLocalDate()
+                            val existing = Proofs.select {
+                                (Proofs.userId eq userId) and
+                                (Proofs.projectId eq projectId) and
+                                (Proofs.date eq today) and
+                                (Proofs.slot eq chosenSlot)
+                            }.singleOrNull()
+
+                            val proofId = if (existing != null) {
+                                Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
+                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                }
+                                existing[Proofs.id]
+                            } else {
+                                Proofs.insert {
+                                    it[Proofs.userId] = userId
+                                    it[Proofs.projectId] = projectId
+                                    it[Proofs.latitude] = projLat
+                                    it[Proofs.longitude] = projLng
+                                    it[Proofs.radius] = 150
+                                    it[Proofs.date] = today
+                                    it[Proofs.slot] = chosenSlot
+                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.responded] = false
+                                } get Proofs.id
+                            }
+                            mapOf(
+                                "id" to proofId,
+                                "slot" to chosenSlot.toInt(),
+                                "sentAt" to fireAtZdt.toInstant().toString(),
+                                "mode" to "replace"
+                            )
+                        }
+                        else -> { // adhoc
+                            val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
+                            val newId = Proofs.insert {
+                                it[Proofs.userId] = userId
+                                it[Proofs.projectId] = projectId
+                                it[Proofs.latitude] = projLat
+                                it[Proofs.longitude] = projLng
+                                it[Proofs.radius] = 150
+                                it[Proofs.date] = nowZdt.toLocalDate()
+                                it[Proofs.slot] = chosenSlot
+                                it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                it[Proofs.responded] = false
+                            } get Proofs.id
+                            mapOf(
+                                "id" to newId,
+                                "slot" to chosenSlot.toInt(),
+                                "sentAt" to fireAtZdt.toInstant().toString(),
+                                "mode" to "adhoc"
+                            )
+                        }
+                    }
+                }
+
+                call.respond(HttpStatusCode.OK, result)
             }
         }
     }
