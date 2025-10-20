@@ -27,6 +27,7 @@ import com.yourcompany.zeiterfassung.db.Users
 import org.jetbrains.exposed.dao.id.EntityID
 import java.time.LocalTime
 import java.security.SecureRandom
+import kotlinx.serialization.Serializable
 
 // 🌍 Haversine formula
 private fun distanceMeters(
@@ -134,6 +135,21 @@ private fun randomLocalDateTimeInWindow(day: LocalDate, startHour: Int, endHourE
     return ZonedDateTime.of(day, LocalTime.of(hour, minute, second), zone).toLocalDateTime()
 }
 
+@Serializable
+data class ErrorRequired(val error: String = "project_required")
+
+@Serializable
+data class ErrorAmbiguous(val error: String = "project_ambiguous", val choices: List<Int>)
+
+@Serializable
+data class ErrorNoActiveShift(val error: String = "no_active_shift", val message: String, val shiftActive: Boolean)
+
+@Serializable
+data class ErrorDebugOnly(val error: String = "debug_only")
+
+@Serializable
+data class TestCreatedDto(val id: Int, val slot: Int, val sentAt: String, val mode: String)
+
 // Membership check: is the user a member of the project?
 private fun isMember(userId: Int, projectId: Int): Boolean = transaction {
     ProjectMembers.select {
@@ -207,11 +223,7 @@ fun Route.proofsRoutes() {
                     if (requireShift) {
                         return@get call.respond(
                             HttpStatusCode.Conflict,
-                            mapOf(
-                                "error" to "no_active_shift",
-                                "message" to "No IN log for today — slots are not created",
-                                "shiftActive" to false
-                            )
+                            ErrorNoActiveShift(message = "No IN log for today — slots are not created", shiftActive = false)
                         )
                     } else {
                         call.response.headers.append("X-Reason", "no_active_shift")
@@ -490,7 +502,7 @@ fun Route.proofsRoutes() {
                             (call.request.headers["X-Debug-Push"] == "1")
                 // allow only debug for now — so боевые лимиты не трогаем
                 if (!debug) {
-                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "debug_only"))
+                    return@post call.respond(HttpStatusCode.Forbidden, ErrorDebugOnly())
                 }
 
                 val mode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
@@ -523,11 +535,7 @@ fun Route.proofsRoutes() {
                     if (!shiftActive) {
                         return@post call.respond(
                             HttpStatusCode.Conflict,
-                            mapOf(
-                                "error" to "no_active_shift",
-                                "message" to "Cannot replace slot when no IN log today",
-                                "shiftActive" to false
-                            )
+                            ErrorNoActiveShift(message = "Cannot replace slot when no IN log today", shiftActive = false)
                         )
                     }
                 }
@@ -539,11 +547,10 @@ fun Route.proofsRoutes() {
                     else -> 1 // default to 1 for adhoc
                 }.toShort()
 
-                val result = transaction {
+                val result: TestCreatedDto = transaction {
                     when (mode) {
                         "replace" -> {
                             val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
-                            // try update existing proof for today; if not exists — create it
                             val today = nowZdt.toLocalDate()
                             val existing = Proofs.select {
                                 (Proofs.userId eq userId) and
@@ -552,13 +559,13 @@ fun Route.proofsRoutes() {
                                 (Proofs.slot eq chosenSlot)
                             }.singleOrNull()
 
-                            val proofId = if (existing != null) {
+                            val idVal = if (existing != null) {
                                 Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
                                     it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
                                 }
                                 existing[Proofs.id]
                             } else {
-                                Proofs.insert {
+                                (Proofs.insert {
                                     it[Proofs.userId] = userId
                                     it[Proofs.projectId] = projectId
                                     it[Proofs.latitude] = projLat
@@ -568,33 +575,49 @@ fun Route.proofsRoutes() {
                                     it[Proofs.slot] = chosenSlot
                                     it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
                                     it[Proofs.responded] = false
-                                } get Proofs.id
+                                } get Proofs.id)
                             }
-                            mapOf(
-                                "id" to proofId,
-                                "slot" to chosenSlot.toInt(),
-                                "sentAt" to fireAtZdt.toInstant().toString(),
-                                "mode" to "replace"
+                            TestCreatedDto(
+                                id = idVal,
+                                slot = chosenSlot.toInt(),
+                                sentAt = fireAtZdt.toInstant().toString(),
+                                mode = "replace"
                             )
                         }
-                        else -> { // adhoc
+                        else -> { // adhoc (idempotent)
                             val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
-                            val newId = Proofs.insert {
-                                it[Proofs.userId] = userId
-                                it[Proofs.projectId] = projectId
-                                it[Proofs.latitude] = projLat
-                                it[Proofs.longitude] = projLng
-                                it[Proofs.radius] = 150
-                                it[Proofs.date] = nowZdt.toLocalDate()
-                                it[Proofs.slot] = chosenSlot
-                                it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
-                                it[Proofs.responded] = false
-                            } get Proofs.id
-                            mapOf(
-                                "id" to newId,
-                                "slot" to chosenSlot.toInt(),
-                                "sentAt" to fireAtZdt.toInstant().toString(),
-                                "mode" to "adhoc"
+                            val today = nowZdt.toLocalDate()
+                            val existing = Proofs.select {
+                                (Proofs.userId eq userId) and
+                                (Proofs.projectId eq projectId) and
+                                (Proofs.date eq today) and
+                                (Proofs.slot eq chosenSlot)
+                            }.singleOrNull()
+
+                            val idVal = if (existing != null) {
+                                Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
+                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.responded] = false
+                                }
+                                existing[Proofs.id]
+                            } else {
+                                (Proofs.insert {
+                                    it[Proofs.userId] = userId
+                                    it[Proofs.projectId] = projectId
+                                    it[Proofs.latitude] = projLat
+                                    it[Proofs.longitude] = projLng
+                                    it[Proofs.radius] = 150
+                                    it[Proofs.date] = nowZdt.toLocalDate()
+                                    it[Proofs.slot] = chosenSlot
+                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.responded] = false
+                                } get Proofs.id)
+                            }
+                            TestCreatedDto(
+                                id = idVal,
+                                slot = chosenSlot.toInt(),
+                                sentAt = fireAtZdt.toInstant().toString(),
+                                mode = "adhoc"
                             )
                         }
                     }
@@ -646,26 +669,38 @@ fun Route.proofsRoutes() {
 
                 val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
                 val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
-                val newId = transaction {
-                    Proofs.insert {
-                        it[Proofs.userId] = userId
-                        it[Proofs.projectId] = projectId
-                        it[Proofs.latitude] = projLat
-                        it[Proofs.longitude] = projLng
-                        it[Proofs.radius] = 150
-                        it[Proofs.date] = nowZdt.toLocalDate()
-                        it[Proofs.slot] = chosenSlot
-                        it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
-                        it[Proofs.responded] = false
-                    } get Proofs.id
+                val result: TestCreatedDto = transaction {
+                    val today = nowZdt.toLocalDate()
+                    val existing = Proofs.select {
+                        (Proofs.userId eq userId) and
+                        (Proofs.projectId eq projectId) and
+                        (Proofs.date eq today) and
+                        (Proofs.slot eq chosenSlot)
+                    }.singleOrNull()
+
+                    val idVal = if (existing != null) {
+                        Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
+                            it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                            it[Proofs.responded] = false
+                        }
+                        existing[Proofs.id]
+                    } else {
+                        (Proofs.insert {
+                            it[Proofs.userId] = userId
+                            it[Proofs.projectId] = projectId
+                            it[Proofs.latitude] = projLat
+                            it[Proofs.longitude] = projLng
+                            it[Proofs.radius] = 150
+                            it[Proofs.date] = nowZdt.toLocalDate()
+                            it[Proofs.slot] = chosenSlot
+                            it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                            it[Proofs.responded] = false
+                        } get Proofs.id)
+                    }
+                    TestCreatedDto(id = idVal, slot = chosenSlot.toInt(), sentAt = fireAtZdt.toInstant().toString(), mode = "adhoc")
                 }
 
-                call.respond(HttpStatusCode.OK, mapOf(
-                    "id" to newId,
-                    "slot" to chosenSlot.toInt(),
-                    "sentAt" to fireAtZdt.toInstant().toString(),
-                    "mode" to "adhoc"
-                ))
+                call.respond(HttpStatusCode.OK, result)
             }
         }
         // ─────────────────────────────────────────────────────────────────
@@ -690,7 +725,7 @@ fun Route.proofsRoutes() {
                 val debug = (call.request.queryParameters["debug"] == "1") ||
                             (call.request.headers["X-Debug-Push"] == "1")
                 if (!debug) {
-                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "debug_only"))
+                    return@post call.respond(HttpStatusCode.Forbidden, ErrorDebugOnly())
                 }
 
                 val mode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
@@ -723,11 +758,7 @@ fun Route.proofsRoutes() {
                     if (!shiftActive) {
                         return@post call.respond(
                             HttpStatusCode.Conflict,
-                            mapOf(
-                                "error" to "no_active_shift",
-                                "message" to "Cannot replace slot when no IN log today",
-                                "shiftActive" to false
-                            )
+                            ErrorNoActiveShift(message = "Cannot replace slot when no IN log today", shiftActive = false)
                         )
                     }
                 }
@@ -738,7 +769,7 @@ fun Route.proofsRoutes() {
                     else -> 1
                 }.toShort()
 
-                val result = transaction {
+                val result: TestCreatedDto = transaction {
                     when (mode) {
                         "replace" -> {
                             val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
@@ -750,13 +781,13 @@ fun Route.proofsRoutes() {
                                 (Proofs.slot eq chosenSlot)
                             }.singleOrNull()
 
-                            val proofId = if (existing != null) {
+                            val idVal = if (existing != null) {
                                 Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
                                     it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
                                 }
                                 existing[Proofs.id]
                             } else {
-                                Proofs.insert {
+                                (Proofs.insert {
                                     it[Proofs.userId] = userId
                                     it[Proofs.projectId] = projectId
                                     it[Proofs.latitude] = projLat
@@ -766,33 +797,49 @@ fun Route.proofsRoutes() {
                                     it[Proofs.slot] = chosenSlot
                                     it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
                                     it[Proofs.responded] = false
-                                } get Proofs.id
+                                } get Proofs.id)
                             }
-                            mapOf(
-                                "id" to proofId,
-                                "slot" to chosenSlot.toInt(),
-                                "sentAt" to fireAtZdt.toInstant().toString(),
-                                "mode" to "replace"
+                            TestCreatedDto(
+                                id = idVal,
+                                slot = chosenSlot.toInt(),
+                                sentAt = fireAtZdt.toInstant().toString(),
+                                mode = "replace"
                             )
                         }
-                        else -> { // adhoc
+                        else -> { // adhoc (idempotent)
                             val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
-                            val newId = Proofs.insert {
-                                it[Proofs.userId] = userId
-                                it[Proofs.projectId] = projectId
-                                it[Proofs.latitude] = projLat
-                                it[Proofs.longitude] = projLng
-                                it[Proofs.radius] = 150
-                                it[Proofs.date] = nowZdt.toLocalDate()
-                                it[Proofs.slot] = chosenSlot
-                                it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
-                                it[Proofs.responded] = false
-                            } get Proofs.id
-                            mapOf(
-                                "id" to newId,
-                                "slot" to chosenSlot.toInt(),
-                                "sentAt" to fireAtZdt.toInstant().toString(),
-                                "mode" to "adhoc"
+                            val today = nowZdt.toLocalDate()
+                            val existing = Proofs.select {
+                                (Proofs.userId eq userId) and
+                                (Proofs.projectId eq projectId) and
+                                (Proofs.date eq today) and
+                                (Proofs.slot eq chosenSlot)
+                            }.singleOrNull()
+
+                            val idVal = if (existing != null) {
+                                Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
+                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.responded] = false
+                                }
+                                existing[Proofs.id]
+                            } else {
+                                (Proofs.insert {
+                                    it[Proofs.userId] = userId
+                                    it[Proofs.projectId] = projectId
+                                    it[Proofs.latitude] = projLat
+                                    it[Proofs.longitude] = projLng
+                                    it[Proofs.radius] = 150
+                                    it[Proofs.date] = nowZdt.toLocalDate()
+                                    it[Proofs.slot] = chosenSlot
+                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.responded] = false
+                                } get Proofs.id)
+                            }
+                            TestCreatedDto(
+                                id = idVal,
+                                slot = chosenSlot.toInt(),
+                                sentAt = fireAtZdt.toInstant().toString(),
+                                mode = "adhoc"
                             )
                         }
                     }
@@ -844,26 +891,38 @@ fun Route.proofsRoutes() {
 
                 val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
                 val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
-                val newId = transaction {
-                    Proofs.insert {
-                        it[Proofs.userId] = userId
-                        it[Proofs.projectId] = projectId
-                        it[Proofs.latitude] = projLat
-                        it[Proofs.longitude] = projLng
-                        it[Proofs.radius] = 150
-                        it[Proofs.date] = nowZdt.toLocalDate()
-                        it[Proofs.slot] = chosenSlot
-                        it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
-                        it[Proofs.responded] = false
-                    } get Proofs.id
+                val result: TestCreatedDto = transaction {
+                    val today = nowZdt.toLocalDate()
+                    val existing = Proofs.select {
+                        (Proofs.userId eq userId) and
+                        (Proofs.projectId eq projectId) and
+                        (Proofs.date eq today) and
+                        (Proofs.slot eq chosenSlot)
+                    }.singleOrNull()
+
+                    val idVal = if (existing != null) {
+                        Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
+                            it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                            it[Proofs.responded] = false
+                        }
+                        existing[Proofs.id]
+                    } else {
+                        (Proofs.insert {
+                            it[Proofs.userId] = userId
+                            it[Proofs.projectId] = projectId
+                            it[Proofs.latitude] = projLat
+                            it[Proofs.longitude] = projLng
+                            it[Proofs.radius] = 150
+                            it[Proofs.date] = nowZdt.toLocalDate()
+                            it[Proofs.slot] = chosenSlot
+                            it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                            it[Proofs.responded] = false
+                        } get Proofs.id)
+                    }
+                    TestCreatedDto(id = idVal, slot = chosenSlot.toInt(), sentAt = fireAtZdt.toInstant().toString(), mode = "adhoc")
                 }
 
-                call.respond(HttpStatusCode.OK, mapOf(
-                    "id" to newId,
-                    "slot" to chosenSlot.toInt(),
-                    "sentAt" to fireAtZdt.toInstant().toString(),
-                    "mode" to "adhoc"
-                ))
+                call.respond(HttpStatusCode.OK, result)
             }
         }
     }
