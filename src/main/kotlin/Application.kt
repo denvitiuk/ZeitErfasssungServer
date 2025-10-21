@@ -295,6 +295,9 @@ fun Application.module() {
 
         supportAutoReplyRoutes(env)
 
+        // Billing routes: webhook must be public (no JWT), other endpoints are fine here
+        registerBillingRoutes()
+
         authenticate("bearerAuth") {
             qrRoutes()
             scanRoutes()
@@ -317,9 +320,6 @@ fun Application.module() {
                 requestService = requestServiceImpl,
                 uploadService = uploadServiceImpl
             )
-
-
-
         }
     }
 }

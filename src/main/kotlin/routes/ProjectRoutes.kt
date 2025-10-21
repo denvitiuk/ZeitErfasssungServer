@@ -36,6 +36,13 @@ data class StandortDTO(
     val location: String? = null
 )
 
+@Serializable
+data class SeatLimitExceededError(
+    val error: String = "seat_limit_reached",
+    val used: Int,
+    val limit: Int
+)
+
 private fun principalCompanyId(principal: JWTPrincipal): Int =
     principal.payload.getClaim("companyId").asInt() ?: 0
 
@@ -100,6 +107,54 @@ private fun membersForProject(projectEntityId: EntityID<Int>): List<ProjectMembe
                 joinedAt = it[ProjectMembers.joinedAt].toString()
             )
         }
+}
+
+private fun parseUsedLimitFromThrowable(t: Throwable): Pair<Int, Int>? {
+    var cur: Throwable? = t
+    val re = Regex("used=(\\d+)\\s+limit=(\\d+)", RegexOption.IGNORE_CASE)
+    while (cur != null) {
+        val msg = cur.message ?: ""
+        val m = re.find(msg)
+        if (m != null) {
+            val used = m.groupValues[1].toIntOrNull()
+            val limit = m.groupValues[2].toIntOrNull()
+            if (used != null && limit != null) return used to limit
+        }
+        cur = cur.cause
+    }
+    return null
+}
+
+private fun companySeatsStatus(companyId: Int): Pair<Int, Int> = transaction {
+    var limit: Int? = null
+    exec("SELECT seats_limit FROM v_company_entitlements WHERE company_id = $companyId LIMIT 1") { rs ->
+        if (rs.next()) {
+            limit = rs.getInt(1)
+            if (rs.wasNull()) limit = null
+        }
+    }
+    if (limit == null) {
+        exec("SELECT max_seats FROM companies WHERE id = $companyId") { rs ->
+            if (rs.next()) {
+                limit = rs.getInt(1)
+                if (rs.wasNull()) limit = null
+            }
+        }
+    }
+    if (limit == null) limit = 5
+
+    var used = 0
+    exec(
+        """
+        SELECT COUNT(DISTINCT pm.user_id) AS c
+        FROM project_members pm
+        JOIN projects p ON p.id = pm.project_id
+        WHERE p.company_id = $companyId
+        """.trimIndent()
+    ) { rs ->
+        if (rs.next()) used = rs.getInt("c")
+    }
+    used to (limit ?: 5)
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +439,22 @@ fun Route.projectsRoutes() {
                     }
                     val members = membersForProject(row[Projects.id])
                     call.respond(HttpStatusCode.OK, members)
+                } catch (e: ExposedSQLException) {
+                    // Trigger from DB when company seats limit is reached
+                    val isSeatLimit = e.sqlState == "P0001" || (e.cause?.message?.contains("company_project_seat_limit_reached") == true)
+                    if (isSeatLimit) {
+                        val (used, limit) = parseUsedLimitFromThrowable(e) ?: companySeatsStatus(companyId)
+                        return@post call.respond(HttpStatusCode.Conflict, SeatLimitExceededError(used = used, limit = limit))
+                    }
+                    call.application.log.error("Add member failed", e)
+                    call.respond(HttpStatusCode.InternalServerError, ApiErrorProject("add_member_failed", e.message))
                 } catch (e: Exception) {
+                    // Fallback: try to recognize seat-limit via message chain
+                    val isSeatLimit = e.message?.contains("company_project_seat_limit_reached") == true || e.cause?.message?.contains("company_project_seat_limit_reached") == true
+                    if (isSeatLimit) {
+                        val (used, limit) = parseUsedLimitFromThrowable(e) ?: companySeatsStatus(companyId)
+                        return@post call.respond(HttpStatusCode.Conflict, SeatLimitExceededError(used = used, limit = limit))
+                    }
                     call.application.log.error("Add member failed", e)
                     call.respond(HttpStatusCode.InternalServerError, ApiErrorProject("add_member_failed", e.message))
                 }
@@ -462,7 +532,20 @@ fun Route.projectsRoutes() {
                     }
                     val members = membersForProject(row[Projects.id])
                     call.respond(HttpStatusCode.OK, members)
+                } catch (e: ExposedSQLException) {
+                    val isSeatLimit = e.sqlState == "P0001" || (e.cause?.message?.contains("company_project_seat_limit_reached") == true)
+                    if (isSeatLimit) {
+                        val (used, limit) = parseUsedLimitFromThrowable(e) ?: companySeatsStatus(companyId)
+                        return@post call.respond(HttpStatusCode.Conflict, SeatLimitExceededError(used = used, limit = limit))
+                    }
+                    call.application.log.error("Bulk set members failed", e)
+                    call.respond(HttpStatusCode.InternalServerError, ApiErrorProject("bulk_set_failed", e.message))
                 } catch (e: Exception) {
+                    val isSeatLimit = e.message?.contains("company_project_seat_limit_reached") == true || e.cause?.message?.contains("company_project_seat_limit_reached") == true
+                    if (isSeatLimit) {
+                        val (used, limit) = parseUsedLimitFromThrowable(e) ?: companySeatsStatus(companyId)
+                        return@post call.respond(HttpStatusCode.Conflict, SeatLimitExceededError(used = used, limit = limit))
+                    }
                     call.application.log.error("Bulk set members failed", e)
                     call.respond(HttpStatusCode.InternalServerError, ApiErrorProject("bulk_set_failed", e.message))
                 }

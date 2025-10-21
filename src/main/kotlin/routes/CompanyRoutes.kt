@@ -79,6 +79,13 @@ private data class CompanyCurrentSessionDTO(
     val minutes: Int
 )
 
+@Serializable
+data class SeatsStatusDTO(
+    val companyId: Int,
+    val limit: Int,
+    val used: Int
+)
+
 // === Metrics helpers =========================================================
 // Count open work sessions (last action == 'in'). If projectId is null/<=0 —
 // count across all projects (including NULL project_id).
@@ -286,6 +293,67 @@ fun Route.companiesRoutes() {
             route("/self") {
                 // GET /companies/self/metrics — company-scoped metrics (admin only)
                 get("/metrics") {
+                // GET /companies/self/seats — current seat limit & used count (admin only)
+                get("/seats") {
+                    val principal = call.principal<JWTPrincipal>()
+                        ?: return@get call.respond(
+                            HttpStatusCode.Unauthorized,
+                            ApiError("unauthorized", "Missing token")
+                        )
+
+                    val companyId = principal.payload.getClaim("companyId").asInt() ?: 0
+                    if (companyId <= 0) {
+                        return@get call.respond(
+                            HttpStatusCode.BadRequest,
+                            ApiError("no_company", "Token has no companyId")
+                        )
+                    }
+                    if (!isAdminForCompany(principal, companyId)) {
+                        return@get call.respond(
+                            HttpStatusCode.Forbidden,
+                            ApiError("forbidden", "Admin rights required for this company")
+                        )
+                    }
+
+                    try {
+                        var limit = 5
+                        var used  = 0
+                        transaction {
+                            // Limit from entitlements or fallback to companies.max_seats or 5
+                            exec(
+                                """
+                                SELECT COALESCE(vc.seats_limit, c.max_seats, 5) AS limit
+                                  FROM companies c
+                             LEFT JOIN v_company_entitlements vc ON vc.company_id = c.id
+                                 WHERE c.id = $companyId
+                                """.trimIndent()
+                            ) { rs ->
+                                if (rs.next()) {
+                                    limit = rs.getInt("limit")
+                                }
+                            }
+
+                            // Used = count of distinct users present in any project of the company
+                            exec(
+                                """
+                                SELECT COUNT(DISTINCT pm.user_id) AS used
+                                  FROM project_members pm
+                                  JOIN projects p ON p.id = pm.project_id
+                                 WHERE p.company_id = $companyId
+                                """.trimIndent()
+                            ) { rs ->
+                                if (rs.next()) {
+                                    used = rs.getInt("used")
+                                }
+                            }
+                        }
+
+                        call.respond(HttpStatusCode.OK, SeatsStatusDTO(companyId, limit, used))
+                    } catch (e: Exception) {
+                        call.application.log.error("Failed to fetch seats status for company $companyId", e)
+                        call.respond(HttpStatusCode.InternalServerError, ApiError("internal_error"))
+                    }
+                }
                     val principal = call.principal<JWTPrincipal>()
                         ?: return@get call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Missing token"))
 

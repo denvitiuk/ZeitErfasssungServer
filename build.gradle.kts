@@ -129,4 +129,5 @@ dependencies {
     implementation("com.sun.mail:jakarta.mail:1.6.7")
     implementation("com.googlecode.libphonenumber:libphonenumber:8.13.43")
     implementation("software.amazon.awssdk:s3:2.25.64")
+    implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.4.0")
 }
