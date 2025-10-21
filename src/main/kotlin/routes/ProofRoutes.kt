@@ -20,6 +20,7 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.ZonedDateTime
+import java.time.ZoneOffset
 import kotlin.math.*
 import com.yourcompany.zeiterfassung.db.Projects
 import com.yourcompany.zeiterfassung.db.ProjectMembers
@@ -55,10 +56,10 @@ private fun resolveZone(call: ApplicationCall): ZoneId {
         when {
             !q.isNullOrBlank() -> ZoneId.of(q)
             !h.isNullOrBlank() -> ZoneId.of(h)
-            else -> ZoneId.systemDefault()
+            else -> ZoneId.of("Europe/Berlin")
         }
     } catch (_: Exception) {
-        ZoneId.systemDefault()
+        ZoneId.of("Europe/Berlin")
     }
 }
 
@@ -252,7 +253,9 @@ fun Route.proofsRoutes() {
                                 it[Proofs.radius] = defaultRadius
                                 it[Proofs.date] = today
                                 it[Proofs.slot] = 1
-                                it[Proofs.sentAt] = sentAtLdt
+                                it[Proofs.sentAt] = ZonedDateTime.of(sentAtLdt, zone)
+                                    .withZoneSameInstant(ZoneOffset.UTC)
+                                    .toLocalDateTime()
                                 it[Proofs.responded] = false
                             }
                         } catch (_: Exception) {
@@ -270,7 +273,9 @@ fun Route.proofsRoutes() {
                                 it[Proofs.radius] = defaultRadius
                                 it[Proofs.date] = today
                                 it[Proofs.slot] = 2
-                                it[Proofs.sentAt] = sentAtLdt
+                                it[Proofs.sentAt] = ZonedDateTime.of(sentAtLdt, zone)
+                                    .withZoneSameInstant(ZoneOffset.UTC)
+                                    .toLocalDateTime()
                                 it[Proofs.responded] = false
                             }
                         } catch (_: Exception) {
@@ -289,7 +294,7 @@ fun Route.proofsRoutes() {
                     .orderBy(Proofs.slot to SortOrder.ASC)
                     .map {
                         val ldt = it[Proofs.sentAt]
-                        val instant = ldt?.atZone(zone)?.toInstant() ?: Instant.EPOCH
+                        val instant = ldt?.atZone(ZoneOffset.UTC)?.toInstant() ?: Instant.EPOCH
                         ProofDto(
                             id = it[Proofs.id],
                             latitude = it[Proofs.latitude],
@@ -356,7 +361,7 @@ fun Route.proofsRoutes() {
                       it[Proofs.radius] = 150
                       it[Proofs.date] = nowZdt.toLocalDate()
                       it[Proofs.slot] = slotVal
-                      it[Proofs.sentAt] = nowZdt.toLocalDateTime()
+                      it[Proofs.sentAt] = nowZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                       it[Proofs.responded] = false
                     } get Proofs.id
                   }
@@ -439,11 +444,13 @@ fun Route.proofsRoutes() {
                     val radius = row[Proofs.radius]
 
                     // 2) Check time window in correct zone
-                    val endLdt = when (slot) {
-                        1 -> sentAt.withHour(12).withMinute(0).withSecond(0).withNano(0)
-                        else -> sentAt.withHour(17).withMinute(0).withSecond(0).withNano(0)
+                    val sentZdt = sentAt.atZone(ZoneOffset.UTC).withZoneSameInstant(zone)
+                    val endZdt = if (slot == 1) {
+                        sentZdt.withHour(12).withMinute(0).withSecond(0).withNano(0)
+                    } else {
+                        sentZdt.withHour(17).withMinute(0).withSecond(0).withNano(0)
                     }
-                    val endSlotInstant = endLdt.atZone(zone).toInstant()
+                    val endSlotInstant = endZdt.toInstant()
                     if (now.isAfter(endSlotInstant)) {
                         details.getOrPut("slot") { mutableListOf() }.add("expired")
                         return@transaction false
@@ -459,7 +466,7 @@ fun Route.proofsRoutes() {
                     // Passed all checks → mark responded
                     Proofs.update({ Proofs.id eq proofId }) {
                         it[responded] = true
-                        it[respondedAt] = LocalDateTime.ofInstant(now, zone)
+                        it[respondedAt] = LocalDateTime.ofInstant(now, ZoneOffset.UTC)
                     }
                     true
                 }
@@ -561,7 +568,7 @@ fun Route.proofsRoutes() {
 
                             val idVal = if (existing != null) {
                                 Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
-                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                                 }
                                 existing[Proofs.id]
                             } else {
@@ -573,7 +580,7 @@ fun Route.proofsRoutes() {
                                     it[Proofs.radius] = 150
                                     it[Proofs.date] = today
                                     it[Proofs.slot] = chosenSlot
-                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                                     it[Proofs.responded] = false
                                 } get Proofs.id)
                             }
@@ -596,7 +603,7 @@ fun Route.proofsRoutes() {
 
                             val idVal = if (existing != null) {
                                 Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
-                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                                     it[Proofs.responded] = false
                                 }
                                 existing[Proofs.id]
@@ -609,7 +616,7 @@ fun Route.proofsRoutes() {
                                     it[Proofs.radius] = 150
                                     it[Proofs.date] = nowZdt.toLocalDate()
                                     it[Proofs.slot] = chosenSlot
-                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                                     it[Proofs.responded] = false
                                 } get Proofs.id)
                             }
@@ -680,7 +687,7 @@ fun Route.proofsRoutes() {
 
                     val idVal = if (existing != null) {
                         Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
-                            it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                            it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                             it[Proofs.responded] = false
                         }
                         existing[Proofs.id]
@@ -693,7 +700,7 @@ fun Route.proofsRoutes() {
                             it[Proofs.radius] = 150
                             it[Proofs.date] = nowZdt.toLocalDate()
                             it[Proofs.slot] = chosenSlot
-                            it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                            it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                             it[Proofs.responded] = false
                         } get Proofs.id)
                     }
@@ -902,7 +909,7 @@ fun Route.proofsRoutes() {
 
                     val idVal = if (existing != null) {
                         Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
-                            it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                            it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                             it[Proofs.responded] = false
                         }
                         existing[Proofs.id]
@@ -915,7 +922,7 @@ fun Route.proofsRoutes() {
                             it[Proofs.radius] = 150
                             it[Proofs.date] = nowZdt.toLocalDate()
                             it[Proofs.slot] = chosenSlot
-                            it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                            it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                             it[Proofs.responded] = false
                         } get Proofs.id)
                     }
