@@ -193,6 +193,7 @@ fun Route.proofsRoutes() {
                 val projectId = pr.id
                 call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
                 call.response.headers.append("X-Reason", pr.reason)
+                call.response.headers.append("X-Timezone-Used", zone.id)
 
                 // Load project and ensure it has coordinates
                 val projectRow = transaction {
@@ -220,6 +221,7 @@ fun Route.proofsRoutes() {
                                    call.request.queryParameters["requireActiveShift"] == "1"
                 val shiftActive = isShiftActiveToday(userId, projectId, zone)
 
+                val allowCreation = shiftActive
                 if (!shiftActive) {
                     if (requireShift) {
                         return@get call.respond(
@@ -228,58 +230,60 @@ fun Route.proofsRoutes() {
                         )
                     } else {
                         call.response.headers.append("X-Reason", "no_active_shift")
-                        return@get call.respond(emptyList<ProofDto>())
+                        // Do not return early: we will still return existing proofs for today
                     }
                 }
 
-                // Ensure two slots exist for today for this user+project
-                transaction {
-                    val existing = Proofs.select {
-                        (Proofs.userId eq userId) and
-                        (Proofs.projectId eq projectId) and
-                        (Proofs.date eq today)
-                    }.associateBy { it[Proofs.slot].toInt() }
+                // Ensure two slots exist for today only when the shift is active
+                if (allowCreation) {
+                    transaction {
+                        val existing = Proofs.select {
+                            (Proofs.userId eq userId) and
+                            (Proofs.projectId eq projectId) and
+                            (Proofs.date eq today)
+                        }.associateBy { it[Proofs.slot].toInt() }
 
-                    val defaultRadius = 150
+                        val defaultRadius = 150
 
-                    if (existing[1] == null) {
-                        val sentAtLdt = randomLocalDateTimeInWindow(today, 9, 12, zone)
-                        try {
-                            Proofs.insert {
-                                it[Proofs.userId] = userId
-                                it[Proofs.projectId] = projectId
-                                it[Proofs.latitude] = projLat
-                                it[Proofs.longitude] = projLng
-                                it[Proofs.radius] = defaultRadius
-                                it[Proofs.date] = today
-                                it[Proofs.slot] = 1
-                                it[Proofs.sentAt] = ZonedDateTime.of(sentAtLdt, zone)
-                                    .withZoneSameInstant(ZoneOffset.UTC)
-                                    .toLocalDateTime()
-                                it[Proofs.responded] = false
+                        if (existing[1] == null) {
+                            val sentAtLdt = randomLocalDateTimeInWindow(today, 9, 12, zone)
+                            try {
+                                Proofs.insert {
+                                    it[Proofs.userId] = userId
+                                    it[Proofs.projectId] = projectId
+                                    it[Proofs.latitude] = projLat
+                                    it[Proofs.longitude] = projLng
+                                    it[Proofs.radius] = defaultRadius
+                                    it[Proofs.date] = today
+                                    it[Proofs.slot] = 1
+                                    it[Proofs.sentAt] = ZonedDateTime.of(sentAtLdt, zone)
+                                        .withZoneSameInstant(ZoneOffset.UTC)
+                                        .toLocalDateTime()
+                                    it[Proofs.responded] = false
+                                }
+                            } catch (_: Exception) {
+                                // ignore duplicates in case of race
                             }
-                        } catch (_: Exception) {
-                            // ignore duplicates in case of race
                         }
-                    }
-                    if (existing[2] == null) {
-                        val sentAtLdt = randomLocalDateTimeInWindow(today, 13, 17, zone)
-                        try {
-                            Proofs.insert {
-                                it[Proofs.userId] = userId
-                                it[Proofs.projectId] = projectId
-                                it[Proofs.latitude] = projLat
-                                it[Proofs.longitude] = projLng
-                                it[Proofs.radius] = defaultRadius
-                                it[Proofs.date] = today
-                                it[Proofs.slot] = 2
-                                it[Proofs.sentAt] = ZonedDateTime.of(sentAtLdt, zone)
-                                    .withZoneSameInstant(ZoneOffset.UTC)
-                                    .toLocalDateTime()
-                                it[Proofs.responded] = false
+                        if (existing[2] == null) {
+                            val sentAtLdt = randomLocalDateTimeInWindow(today, 13, 17, zone)
+                            try {
+                                Proofs.insert {
+                                    it[Proofs.userId] = userId
+                                    it[Proofs.projectId] = projectId
+                                    it[Proofs.latitude] = projLat
+                                    it[Proofs.longitude] = projLng
+                                    it[Proofs.radius] = defaultRadius
+                                    it[Proofs.date] = today
+                                    it[Proofs.slot] = 2
+                                    it[Proofs.sentAt] = ZonedDateTime.of(sentAtLdt, zone)
+                                        .withZoneSameInstant(ZoneOffset.UTC)
+                                        .toLocalDateTime()
+                                    it[Proofs.responded] = false
+                                }
+                            } catch (_: Exception) {
+                                // ignore duplicates in case of raceы
                             }
-                        } catch (_: Exception) {
-                            // ignore duplicates in case of raceы
                         }
                     }
                 }
@@ -512,8 +516,10 @@ fun Route.proofsRoutes() {
                     return@post call.respond(HttpStatusCode.Forbidden, ErrorDebugOnly())
                 }
 
-                val mode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
+                val requestedMode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
                 val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
+                val fallback = call.request.queryParameters["fallback"]?.lowercase()
+                var effectiveMode = requestedMode
 
                 // Load project + check membership
                 val projectRow = transaction {
@@ -536,16 +542,23 @@ fun Route.proofsRoutes() {
                 val nowZdt = ZonedDateTime.now(zone)
                 val fireAtZdt = nowZdt.plusSeconds(15)
 
-                // If we are replacing a real slot, require an active shift today
-                if (mode == "replace") {
+                // If we are replacing a real slot, require an active shift today; allow safe downgrade in debug or when fallback=adhoc
+                if (requestedMode == "replace") {
                     val shiftActive = isShiftActiveToday(userId, projectId, zone)
                     if (!shiftActive) {
-                        return@post call.respond(
-                            HttpStatusCode.Conflict,
-                            ErrorNoActiveShift(message = "Cannot replace slot when no IN log today", shiftActive = false)
-                        )
+                        val allowFallback = (fallback == "adhoc") || debug
+                        if (allowFallback) {
+                            effectiveMode = "adhoc"
+                            call.response.headers.append("X-Mode-Downgraded", "replace→adhoc")
+                        } else {
+                            return@post call.respond(
+                                HttpStatusCode.Conflict,
+                                ErrorNoActiveShift(message = "Cannot replace slot when no IN log today", shiftActive = false)
+                            )
+                        }
                     }
                 }
+                call.response.headers.append("X-Effective-Mode", effectiveMode)
 
                 // helper: choose slot by current time
                 fun chooseSlotByTime(h: Int): Short = when (h) {
@@ -555,7 +568,7 @@ fun Route.proofsRoutes() {
                 }.toShort()
 
                 val result: TestCreatedDto = transaction {
-                    when (mode) {
+                    when (effectiveMode) {
                         "replace" -> {
                             val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
                             val today = nowZdt.toLocalDate()
@@ -588,7 +601,7 @@ fun Route.proofsRoutes() {
                                 id = idVal,
                                 slot = chosenSlot.toInt(),
                                 sentAt = fireAtZdt.toInstant().toString(),
-                                mode = "replace"
+                                mode = effectiveMode
                             )
                         }
                         else -> { // adhoc (idempotent)
@@ -624,7 +637,7 @@ fun Route.proofsRoutes() {
                                 id = idVal,
                                 slot = chosenSlot.toInt(),
                                 sentAt = fireAtZdt.toInstant().toString(),
-                                mode = "adhoc"
+                                mode = effectiveMode
                             )
                         }
                     }
@@ -735,8 +748,10 @@ fun Route.proofsRoutes() {
                     return@post call.respond(HttpStatusCode.Forbidden, ErrorDebugOnly())
                 }
 
-                val mode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
+                val requestedMode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
                 val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
+                val fallback = call.request.queryParameters["fallback"]?.lowercase()
+                var effectiveMode = requestedMode
 
                 // Load project + check membership
                 val projectRow = transaction {
@@ -759,16 +774,23 @@ fun Route.proofsRoutes() {
                 val nowZdt = ZonedDateTime.now(zone)
                 val fireAtZdt = nowZdt.plusSeconds(15)
 
-                // If we are replacing a real slot, require an active shift today
-                if (mode == "replace") {
+                // If we are replacing a real slot, require an active shift today; allow safe downgrade in debug or when fallback=adhoc
+                if (requestedMode == "replace") {
                     val shiftActive = isShiftActiveToday(userId, projectId, zone)
                     if (!shiftActive) {
-                        return@post call.respond(
-                            HttpStatusCode.Conflict,
-                            ErrorNoActiveShift(message = "Cannot replace slot when no IN log today", shiftActive = false)
-                        )
+                        val allowFallback = (fallback == "adhoc") || debug
+                        if (allowFallback) {
+                            effectiveMode = "adhoc"
+                            call.response.headers.append("X-Mode-Downgraded", "replace→adhoc")
+                        } else {
+                            return@post call.respond(
+                                HttpStatusCode.Conflict,
+                                ErrorNoActiveShift(message = "Cannot replace slot when no IN log today", shiftActive = false)
+                            )
+                        }
                     }
                 }
+                call.response.headers.append("X-Effective-Mode", effectiveMode)
 
                 fun chooseSlotByTime(h: Int): Short = when (h) {
                     in 9..11 -> 1
@@ -777,7 +799,7 @@ fun Route.proofsRoutes() {
                 }.toShort()
 
                 val result: TestCreatedDto = transaction {
-                    when (mode) {
+                    when (effectiveMode) {
                         "replace" -> {
                             val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
                             val today = nowZdt.toLocalDate()
@@ -790,7 +812,7 @@ fun Route.proofsRoutes() {
 
                             val idVal = if (existing != null) {
                                 Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
-                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                                 }
                                 existing[Proofs.id]
                             } else {
@@ -802,7 +824,7 @@ fun Route.proofsRoutes() {
                                     it[Proofs.radius] = 150
                                     it[Proofs.date] = today
                                     it[Proofs.slot] = chosenSlot
-                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                                     it[Proofs.responded] = false
                                 } get Proofs.id)
                             }
@@ -810,7 +832,7 @@ fun Route.proofsRoutes() {
                                 id = idVal,
                                 slot = chosenSlot.toInt(),
                                 sentAt = fireAtZdt.toInstant().toString(),
-                                mode = "replace"
+                                mode = effectiveMode
                             )
                         }
                         else -> { // adhoc (idempotent)
@@ -825,7 +847,7 @@ fun Route.proofsRoutes() {
 
                             val idVal = if (existing != null) {
                                 Proofs.update({ Proofs.id eq existing[Proofs.id] }) {
-                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                                     it[Proofs.responded] = false
                                 }
                                 existing[Proofs.id]
@@ -838,7 +860,7 @@ fun Route.proofsRoutes() {
                                     it[Proofs.radius] = 150
                                     it[Proofs.date] = nowZdt.toLocalDate()
                                     it[Proofs.slot] = chosenSlot
-                                    it[Proofs.sentAt] = fireAtZdt.toLocalDateTime()
+                                    it[Proofs.sentAt] = fireAtZdt.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime()
                                     it[Proofs.responded] = false
                                 } get Proofs.id)
                             }
@@ -846,7 +868,7 @@ fun Route.proofsRoutes() {
                                 id = idVal,
                                 slot = chosenSlot.toInt(),
                                 sentAt = fireAtZdt.toInstant().toString(),
-                                mode = "adhoc"
+                                mode = effectiveMode
                             )
                         }
                     }
