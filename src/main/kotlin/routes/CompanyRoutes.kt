@@ -291,8 +291,6 @@ fun Route.companiesRoutes() {
         authenticate("bearerAuth") {
             // ---- SELF scope: companyId taken from JWT ----
             route("/self") {
-                // GET /companies/self/metrics — company-scoped metrics (admin only)
-                get("/metrics") {
                 // GET /companies/self/seats — current seat limit & used count (admin only)
                 get("/seats") {
                     val principal = call.principal<JWTPrincipal>()
@@ -354,6 +352,9 @@ fun Route.companiesRoutes() {
                         call.respond(HttpStatusCode.InternalServerError, ApiError("internal_error"))
                     }
                 }
+
+                // GET /companies/self/metrics — company-scoped metrics (admin only)
+                get("/metrics") {
                     val principal = call.principal<JWTPrincipal>()
                         ?: return@get call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Missing token"))
 
