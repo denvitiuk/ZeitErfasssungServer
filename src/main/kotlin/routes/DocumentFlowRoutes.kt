@@ -9,6 +9,9 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.Serializable
 
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
+
 // --- Public DTOs & Enums ---
 
 @Serializable
@@ -385,6 +388,23 @@ fun Route.registerDocumentFlowRoutes(
             call.respond(HttpStatusCode.Created, presigned)
         }
 
+        // Universal storage download by storageKey (supports keys like "pg:6")
+        // Variant 1: /storage?key=pg:6
+        get("/storage") {
+            if (call.requireAuthOrRespond() == null) return@get
+            val raw = call.request.queryParameters["key"]
+                ?: return@get call.respondError(HttpStatusCode.BadRequest, "missing_key")
+            handleStorageKey(call, raw, uploadService)
+        }
+
+        // Variant 2: /storage/{key...} — captures the whole tail (e.g., "pg:6")
+        get("/storage/{key...}") {
+            if (call.requireAuthOrRespond() == null) return@get
+            val raw = call.parameters.getAll("key")?.joinToString("/") ?: ""
+            if (raw.isBlank()) return@get call.respondError(HttpStatusCode.BadRequest, "missing_key")
+            handleStorageKey(call, raw, uploadService)
+        }
+
         // File download for Postgres-backed template blobs, e.g. storageKey = "pg:{id}"
         get("/files/pg/{id}") {
             if (call.requireAuthOrRespond() == null) return@get
@@ -407,6 +427,53 @@ fun Route.registerDocumentFlowRoutes(
             }
 
             call.respondBytes(obj.bytes, contentType = ct)
+        }
+    }
+}
+
+private suspend fun handleStorageKey(
+    call: ApplicationCall,
+    rawKey: String,
+    uploadService: DocumentUploadService
+) {
+    val decoded = URLDecoder.decode(rawKey, StandardCharsets.UTF_8)
+    val parts = decoded.split(":", limit = 2)
+    if (parts.size != 2) {
+        call.respondError(HttpStatusCode.BadRequest, "bad_key")
+        return
+    }
+
+    val (scheme, idStr) = parts
+    when (scheme.lowercase()) {
+        "pg" -> {
+            val id = idStr.toLongOrNull()
+            if (id == null) {
+                call.respondError(HttpStatusCode.BadRequest, "invalid_id")
+                return
+            }
+
+            val obj = uploadService.downloadPgObject(id)
+            if (obj == null) {
+                call.respondError(HttpStatusCode.NotFound, "not_found")
+                return
+            }
+
+            val ct = runCatching { ContentType.parse(obj.contentType) }
+                .getOrElse { ContentType.Application.OctetStream }
+
+            obj.fileName?.let { fname ->
+                call.response.headers.append(
+                    HttpHeaders.ContentDisposition,
+                    ContentDisposition.Attachment
+                        .withParameter(ContentDisposition.Parameters.FileName, fname)
+                        .toString()
+                )
+            }
+
+            call.respondBytes(obj.bytes, contentType = ct)
+        }
+        else -> {
+            call.respondError(HttpStatusCode.NotFound, "not_found")
         }
     }
 }
