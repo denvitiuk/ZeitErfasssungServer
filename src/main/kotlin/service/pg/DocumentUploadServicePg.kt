@@ -11,14 +11,15 @@ import org.jetbrains.exposed.dao.id.LongIdTable
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
 
-// Local mapping for the `files` table (id, data, content_type, file_name, size_bytes, owner_user_id, company_id)
-private object FilesTablePg : LongIdTable("files") {
+// Local mapping for the `document_file_blobs` table (id, data, content_type, file_name, size_bytes, owner_user_id, company_id)
+private object DocumentFileBlobsTable : LongIdTable("document_file_blobs") {
     val data = binary("data")
     val contentType = text("content_type")
     val fileName = text("file_name")
     val sizeBytes = long("size_bytes").nullable()
     val ownerUserId = integer("owner_user_id").nullable()
     val companyId = integer("company_id").nullable()
+    // created_at exists in DB, but we don't need it for download here
 }
 
 /**
@@ -51,16 +52,16 @@ class DocumentUploadServicePg(
     }
 
     override suspend fun downloadPgObject(id: Long): DownloadedObject? = newSuspendedTransaction {
-        FilesTablePg
-            .slice(FilesTablePg.data, FilesTablePg.contentType, FilesTablePg.fileName)
-            .select { FilesTablePg.id eq id }
+        DocumentFileBlobsTable
+            .slice(DocumentFileBlobsTable.data, DocumentFileBlobsTable.contentType, DocumentFileBlobsTable.fileName)
+            .select { DocumentFileBlobsTable.id eq id }
             .limit(1)
             .firstOrNull()
             ?.let { row ->
                 DownloadedObject(
-                    bytes = row[FilesTablePg.data],
-                    contentType = row[FilesTablePg.contentType],
-                    fileName = row[FilesTablePg.fileName]
+                    bytes = row[DocumentFileBlobsTable.data],
+                    contentType = row[DocumentFileBlobsTable.contentType],
+                    fileName = row[DocumentFileBlobsTable.fileName]
                 )
             }
     }
