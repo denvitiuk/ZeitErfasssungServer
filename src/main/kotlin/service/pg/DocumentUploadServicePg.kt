@@ -7,6 +7,20 @@ import com.yourcompany.zeiterfassung.routes.PresignRequest
 import com.yourcompany.zeiterfassung.routes.PresignResponse
 import com.yourcompany.zeiterfassung.routes.UploadPurpose
 
+import org.jetbrains.exposed.dao.id.LongIdTable
+import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
+
+// Local mapping for the `files` table (id, data, content_type, file_name, size_bytes, owner_user_id, company_id)
+private object FilesTablePg : LongIdTable("files") {
+    val data = binary("data")
+    val contentType = text("content_type")
+    val fileName = text("file_name")
+    val sizeBytes = long("size_bytes").nullable()
+    val ownerUserId = integer("owner_user_id").nullable()
+    val companyId = integer("company_id").nullable()
+}
+
 /**
  * PG-mode implementation for upload presign.
  * We don't generate a signed URL here — client will upload via our own endpoint POST /uploads (multipart).
@@ -36,11 +50,19 @@ class DocumentUploadServicePg(
         )
     }
 
-    override suspend fun downloadPgObject(id: Long): DownloadedObject? {
-        // PG mode: binary download is handled by /uploads/{id} route (streamed directly from DB/storage).
-        // This service does not access blobs; return null so the caller can respond 404/Not Implemented.
-        // TODO: Wire a repository here if you decide to fetch bytes via service.
-        return null
+    override suspend fun downloadPgObject(id: Long): DownloadedObject? = newSuspendedTransaction {
+        FilesTablePg
+            .slice(FilesTablePg.data, FilesTablePg.contentType, FilesTablePg.fileName)
+            .select { FilesTablePg.id eq id }
+            .limit(1)
+            .firstOrNull()
+            ?.let { row ->
+                DownloadedObject(
+                    bytes = row[FilesTablePg.data],
+                    contentType = row[FilesTablePg.contentType],
+                    fileName = row[FilesTablePg.fileName]
+                )
+            }
     }
 
     companion object {
