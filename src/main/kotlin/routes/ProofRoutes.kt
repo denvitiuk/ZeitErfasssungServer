@@ -149,6 +149,18 @@ data class ErrorDebugOnly(val error: String = "debug_only")
 @Serializable
 data class TestCreatedDto(val id: Int, val slot: Int, val sentAt: String, val mode: String)
 
+@Serializable
+data class ErrorSimple(val error: String)
+
+@Serializable
+data class ErrorForbidden(val error: String = "forbidden_not_member")
+
+@Serializable
+data class ErrorProjectNotFound(val error: String = "project_not_found")
+
+@Serializable
+data class ErrorProjectLocationMissing(val error: String = "project_location_missing")
+
 // Membership check: is the user a member of the project?
 private fun isMember(userId: Int, projectId: Int): Boolean = transaction {
     ProjectMembers.select {
@@ -175,18 +187,21 @@ private fun isShiftActiveToday(userId: Int, projectId: Int, zone: ZoneId): Boole
 }
 
 fun Route.proofsRoutes() {
+    get("/health") { call.respond(HttpStatusCode.OK) }
     authenticate("bearerAuth") {
         route("/api/proofs") {
 
             // 📅 GET /api/proofs/today
             get("/today") {
-                val principal = call.principal<JWTPrincipal>() ?: return@get call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
+                val principal = call.principal<JWTPrincipal>() ?: return@get call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
                 val userId = principal.payload.getClaim("id").asString().toInt()
                 val zone = resolveZone(call)
                 val pr = autoResolveProject(call, userId, zone)
                 if (pr.id == null) {
-                    val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
-                    return@get call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                    return@get call.respond(
+                        if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest,
+                        if (pr.reason == "project_ambiguous") ErrorAmbiguous(choices = pr.choices) else ErrorRequired()
+                    )
                 }
                 val projectId = pr.id
                 call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
@@ -199,17 +214,17 @@ fun Route.proofsRoutes() {
                         .slice(Projects.id, Projects.lat, Projects.lng)
                         .select { Projects.id eq projectId }
                         .singleOrNull()
-                } ?: return@get call.respond(HttpStatusCode.NotFound, mapOf("error" to "project_not_found"))
+                } ?: return@get call.respond(HttpStatusCode.NotFound, ErrorProjectNotFound())
 
                 // Ensure the user is a member of this project
                 if (!isMember(userId, projectId)) {
-                    return@get call.respond(HttpStatusCode.Forbidden, mapOf("error" to "forbidden_not_member"))
+                    return@get call.respond(HttpStatusCode.Forbidden, ErrorForbidden())
                 }
 
                 val projLat = projectRow[Projects.lat]
                 val projLng = projectRow[Projects.lng]
                 if (projLat == null || projLng == null) {
-                    return@get call.respond(HttpStatusCode.Conflict, mapOf("error" to "project_location_missing"))
+                    return@get call.respond(HttpStatusCode.Conflict, ErrorProjectLocationMissing())
                 }
 
                 val today = LocalDate.now(zone)
@@ -313,13 +328,15 @@ fun Route.proofsRoutes() {
             // ✏️ POST /api/proofs — создание новой проверки
             post {
                 try {
-                  val principal = call.principal<JWTPrincipal>() ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
+                  val principal = call.principal<JWTPrincipal>() ?: return@post call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
                   val userId = principal.payload.getClaim("id").asString().toInt()
                   val zone = resolveZone(call)
                   val pr = autoResolveProject(call, userId, zone)
                   if (pr.id == null) {
-                      val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
-                      return@post call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                      return@post call.respond(
+                          if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest,
+                          if (pr.reason == "project_ambiguous") ErrorAmbiguous(choices = pr.choices) else ErrorRequired()
+                      )
                   }
                   val projectId = pr.id
                   call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
@@ -331,17 +348,17 @@ fun Route.proofsRoutes() {
                           .slice(Projects.id, Projects.lat, Projects.lng)
                           .select { Projects.id eq projectId }
                           .singleOrNull()
-                  } ?: return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "project_not_found"))
+                  } ?: return@post call.respond(HttpStatusCode.NotFound, ErrorProjectNotFound())
 
                   // Ensure the user is a member of this project
                   if (!isMember(userId, projectId)) {
-                      return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "forbidden_not_member"))
+                      return@post call.respond(HttpStatusCode.Forbidden, ErrorForbidden())
                   }
 
                   val projLat = projectRow[Projects.lat]
                   val projLng = projectRow[Projects.lng]
                   if (projLat == null || projLng == null) {
-                      return@post call.respond(HttpStatusCode.Conflict, mapOf("error" to "project_location_missing"))
+                      return@post call.respond(HttpStatusCode.Conflict, ErrorProjectLocationMissing())
                   }
 
                   val nowZdt = ZonedDateTime.now(zone)
@@ -378,7 +395,7 @@ fun Route.proofsRoutes() {
                   call.respond(created)
                 } catch (e: Throwable) {
                   call.application.log.error("Error creating proof", e)
-                  call.respond(HttpStatusCode.InternalServerError, mapOf("error" to (e.localizedMessage ?: "Unknown error")))
+                  call.respond(HttpStatusCode.InternalServerError, ErrorSimple(e.localizedMessage ?: "Unknown error"))
                 }
             }
 
@@ -473,7 +490,7 @@ fun Route.proofsRoutes() {
                 }
 
                 if (notMember) {
-                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "forbidden_not_member"))
+                    return@post call.respond(HttpStatusCode.Forbidden, ErrorForbidden())
                 }
 
                 if (success) {
@@ -494,13 +511,15 @@ fun Route.proofsRoutes() {
             // (or a later step) may pick it up and deliver a real alert.
             post("/test") {
                 val principal = call.principal<JWTPrincipal>()
-                    ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
                 val userId = principal.payload.getClaim("id").asString().toInt()
                 val zone = resolveZone(call)
                 val pr = autoResolveProject(call, userId, zone)
                 if (pr.id == null) {
-                    val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
-                    return@post call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                    return@post call.respond(
+                        if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest,
+                        if (pr.reason == "project_ambiguous") ErrorAmbiguous(choices = pr.choices) else ErrorRequired()
+                    )
                 }
                 val projectId = pr.id
                 call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
@@ -524,16 +543,16 @@ fun Route.proofsRoutes() {
                         .slice(Projects.id, Projects.lat, Projects.lng)
                         .select { Projects.id eq projectId }
                         .singleOrNull()
-                } ?: return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "project_not_found"))
+                } ?: return@post call.respond(HttpStatusCode.NotFound, ErrorProjectNotFound())
 
                 if (!isMember(userId, projectId)) {
-                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "forbidden_not_member"))
+                    return@post call.respond(HttpStatusCode.Forbidden, ErrorForbidden())
                 }
 
                 val projLat = projectRow[Projects.lat]
                 val projLng = projectRow[Projects.lng]
                 if (projLat == null || projLng == null) {
-                    return@post call.respond(HttpStatusCode.Conflict, mapOf("error" to "project_location_missing"))
+                    return@post call.respond(HttpStatusCode.Conflict, ErrorProjectLocationMissing())
                 }
 
                 val nowZdt = ZonedDateTime.now(zone)
@@ -646,13 +665,15 @@ fun Route.proofsRoutes() {
             // 🧪 POST /api/proofs/create-test — shorthand for adhoc test (defaults to debug mode)
             post("/create-test") {
                 val principal = call.principal<JWTPrincipal>()
-                    ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
                 val userId = principal.payload.getClaim("id").asString().toInt()
                 val zone = resolveZone(call)
                 val pr = autoResolveProject(call, userId, zone)
                 if (pr.id == null) {
-                    val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
-                    return@post call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                    return@post call.respond(
+                        if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest,
+                        if (pr.reason == "project_ambiguous") ErrorAmbiguous(choices = pr.choices) else ErrorRequired()
+                    )
                 }
                 val projectId = pr.id
                 call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
@@ -664,16 +685,16 @@ fun Route.proofsRoutes() {
                         .slice(Projects.id, Projects.lat, Projects.lng)
                         .select { Projects.id eq projectId }
                         .singleOrNull()
-                } ?: return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "project_not_found"))
+                } ?: return@post call.respond(HttpStatusCode.NotFound, ErrorProjectNotFound())
 
                 if (!isMember(userId, projectId)) {
-                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "forbidden_not_member"))
+                    return@post call.respond(HttpStatusCode.Forbidden, ErrorForbidden())
                 }
 
                 val projLat = projectRow[Projects.lat]
                 val projLng = projectRow[Projects.lng]
                 if (projLat == null || projLng == null) {
-                    return@post call.respond(HttpStatusCode.Conflict, mapOf("error" to "project_location_missing"))
+                    return@post call.respond(HttpStatusCode.Conflict, ErrorProjectLocationMissing())
                 }
 
                 val nowZdt = ZonedDateTime.now(zone)
@@ -729,13 +750,15 @@ fun Route.proofsRoutes() {
             // POST /proofs/test — same logic as /api/proofs/test
             post("/test") {
                 val principal = call.principal<JWTPrincipal>()
-                    ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
                 val userId = principal.payload.getClaim("id").asString().toInt()
                 val zone = resolveZone(call)
                 val pr = autoResolveProject(call, userId, zone)
                 if (pr.id == null) {
-                    val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
-                    return@post call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                    return@post call.respond(
+                        if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest,
+                        if (pr.reason == "project_ambiguous") ErrorAmbiguous(choices = pr.choices) else ErrorRequired()
+                    )
                 }
                 val projectId = pr.id
                 call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
@@ -758,16 +781,16 @@ fun Route.proofsRoutes() {
                         .slice(Projects.id, Projects.lat, Projects.lng)
                         .select { Projects.id eq projectId }
                         .singleOrNull()
-                } ?: return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "project_not_found"))
+                } ?: return@post call.respond(HttpStatusCode.NotFound, ErrorProjectNotFound())
 
                 if (!isMember(userId, projectId)) {
-                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "forbidden_not_member"))
+                    return@post call.respond(HttpStatusCode.Forbidden, ErrorForbidden())
                 }
 
                 val projLat = projectRow[Projects.lat]
                 val projLng = projectRow[Projects.lng]
                 if (projLat == null || projLng == null) {
-                    return@post call.respond(HttpStatusCode.Conflict, mapOf("error" to "project_location_missing"))
+                    return@post call.respond(HttpStatusCode.Conflict, ErrorProjectLocationMissing())
                 }
 
                 val nowZdt = ZonedDateTime.now(zone)
@@ -880,13 +903,15 @@ fun Route.proofsRoutes() {
             // POST /proofs/create-test — shorthand alias (defaults to adhoc)
             post("/create-test") {
                 val principal = call.principal<JWTPrincipal>()
-                    ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "unauthorized"))
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
                 val userId = principal.payload.getClaim("id").asString().toInt()
                 val zone = resolveZone(call)
                 val pr = autoResolveProject(call, userId, zone)
                 if (pr.id == null) {
-                    val body = if (pr.reason == "project_ambiguous") mapOf("error" to "project_ambiguous", "choices" to pr.choices) else mapOf("error" to "project_required")
-                    return@post call.respond(if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest, body)
+                    return@post call.respond(
+                        if (pr.reason == "project_ambiguous") HttpStatusCode.Conflict else HttpStatusCode.BadRequest,
+                        if (pr.reason == "project_ambiguous") ErrorAmbiguous(choices = pr.choices) else ErrorRequired()
+                    )
                 }
                 val projectId = pr.id
                 call.response.headers.append("X-Resolved-Project-Id", projectId.toString())
@@ -897,16 +922,16 @@ fun Route.proofsRoutes() {
                         .slice(Projects.id, Projects.lat, Projects.lng)
                         .select { Projects.id eq projectId }
                         .singleOrNull()
-                } ?: return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "project_not_found"))
+                } ?: return@post call.respond(HttpStatusCode.NotFound, ErrorProjectNotFound())
 
                 if (!isMember(userId, projectId)) {
-                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "forbidden_not_member"))
+                    return@post call.respond(HttpStatusCode.Forbidden, ErrorForbidden())
                 }
 
                 val projLat = projectRow[Projects.lat]
                 val projLng = projectRow[Projects.lng]
                 if (projLat == null || projLng == null) {
-                    return@post call.respond(HttpStatusCode.Conflict, mapOf("error" to "project_location_missing"))
+                    return@post call.respond(HttpStatusCode.Conflict, ErrorProjectLocationMissing())
                 }
 
                 val nowZdt = ZonedDateTime.now(zone)
