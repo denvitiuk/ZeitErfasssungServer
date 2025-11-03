@@ -403,7 +403,27 @@ fun Route.proofsRoutes() {
             post("/{proofId}/respond") {
                 val userId = call.principal<JWTPrincipal>()!!.payload.getClaim("id").asString().toInt()
                 val proofId = call.parameters["proofId"]!!.toInt()
-                val req = call.receive<RespondProofRequest>()
+                val req: RespondProofRequest? = when (call.request.contentType().withoutParameters()) {
+                    ContentType.Application.Json -> runCatching { call.receive<RespondProofRequest>() }.getOrNull()
+                    ContentType.Application.FormUrlEncoded -> {
+                        val p = call.receiveParameters()
+                        val la = p["latitude"]?.toDoubleOrNull()
+                        val lo = p["longitude"]?.toDoubleOrNull()
+                        if (la != null && lo != null) RespondProofRequest(latitude = la, longitude = lo) else null
+                    }
+                    else -> {
+                        val la = call.request.queryParameters["latitude"]?.toDoubleOrNull()
+                        val lo = call.request.queryParameters["longitude"]?.toDoubleOrNull()
+                        if (la != null && lo != null) RespondProofRequest(latitude = la, longitude = lo) else null
+                    }
+                }
+
+                if (req == null) {
+                    return@post call.respond(
+                        HttpStatusCode.UnsupportedMediaType,
+                        ErrorSimple("expected json body or latitude/longitude params")
+                    )
+                }
                 val now = Instant.now()
                 val zone = resolveZone(call)
 
