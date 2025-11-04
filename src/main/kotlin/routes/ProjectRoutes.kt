@@ -29,6 +29,14 @@ import org.jetbrains.exposed.sql.transactions.transaction
 data class ApiErrorProject(val error: String, val detail: String? = null)
 
 @Serializable
+private data class StandortUpdateRequest(
+    val lat: Double? = null,
+    val lng: Double? = null,
+    val radius: Int? = null,           // kept for forward compatibility; not persisted if column absent
+    val location: String? = null
+)
+
+@Serializable
 data class StandortDTO(
     val projectId: Int,
     val lat: Double,
@@ -264,6 +272,7 @@ fun Route.projectsRoutes() {
                     call.respond(HttpStatusCode.InternalServerError, ApiErrorProject("create_failed", e.message))
                 }
             }
+
             // GET /projects/{id}/standort — coordinates for active geofence
             get("/{id}/standort") {
                 val principal = call.principal<JWTPrincipal>()
@@ -290,6 +299,67 @@ fun Route.projectsRoutes() {
                     location = location
                 )
                 call.respond(HttpStatusCode.OK, dto)
+            }
+
+            // PATCH /projects/{id}/standort — update geofence/location for a project
+            patch("/{id}/standort") {
+                val principal = call.principal<JWTPrincipal>()
+                    ?: return@patch call.respond(HttpStatusCode.Unauthorized, ApiErrorProject("unauthorized", "Missing token"))
+                val idParam = call.parameters["id"] ?: return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing id"))
+                val projectId = idParam.toIntOrNull() ?: return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
+
+                val companyId = principalCompanyId(principal)
+                if (companyId <= 0)
+                    return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("no_company", "Token has no companyId"))
+
+                val row = requireSameCompanyOr404(projectId, companyId)
+                    ?: return@patch call.respond(HttpStatusCode.NotFound, ApiErrorProject("not_found", "Project not found"))
+
+                if (!isAdminForCompany(principal, companyId))
+                    return@patch call.respond(HttpStatusCode.Forbidden, ApiErrorProject("forbidden", "Admin rights required"))
+
+                // Lenient JSON parsing just like other endpoints
+                val body = try {
+                    call.receive<StandortUpdateRequest>()
+                } catch (_: Exception) {
+                    val raw = call.receiveText()
+                    try {
+                        lenientJson.decodeFromString(StandortUpdateRequest.serializer(), raw)
+                    } catch (e: Exception) {
+                        return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", e.message ?: "Body must be JSON"))
+                    }
+                }
+
+                if (body.lat == null && body.lng == null && body.location == null && body.radius == null) {
+                    return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Nothing to update"))
+                }
+
+                try {
+                    transaction {
+                        Projects.update({ Projects.id eq row[Projects.id] }) {
+                            if (body.location != null) it[location] = body.location
+                            if (body.lat      != null) it[lat]      = body.lat
+                            if (body.lng      != null) it[lng]      = body.lng
+                            // body.radius is accepted for forward compatibility but ignored here
+                        }
+                    }
+
+                    val updated = transaction {
+                        Projects.select { Projects.id eq row[Projects.id] }.single()
+                    }
+
+                    val dto = StandortDTO(
+                        projectId = projectId,
+                        lat = updated[Projects.lat] ?: return@patch call.respond(HttpStatusCode.NotFound, ApiErrorProject("not_found", "No coordinates set")),
+                        lng = updated[Projects.lng] ?: return@patch call.respond(HttpStatusCode.NotFound, ApiErrorProject("not_found", "No coordinates set")),
+                        // radius stays default (300) until DB column exists
+                        location = updated[Projects.location]
+                    )
+                    call.respond(HttpStatusCode.OK, dto)
+                } catch (e: Exception) {
+                    call.application.log.error("Update standort failed", e)
+                    call.respond(HttpStatusCode.InternalServerError, ApiErrorProject("update_standort_failed", e.message))
+                }
             }
 
             // GET /projects/{id} — details with optional ?include=members
