@@ -78,13 +78,36 @@ fun Application.module() {
         })
     }
 
+    // CORS_ALLOWED_ORIGINS can be set to a comma-separated list (e.g., https://app.example.com,https://admin.example.com)
+    // When switching to strict origins, replace anyHost() with a predicate:
+    // allowOrigins { origin -> (System.getenv("CORS_ALLOWED_ORIGINS") ?: "").split(',').map { it.trim() }.filter { it.isNotEmpty() }.any { it.equals(origin, ignoreCase = true) } }
     // 2. CORS
     install(CORS) {
+        // Dev: allow all origins. For prod, switch to explicit hosts via env (see note below)
         anyHost()
-        allowMethod(HttpMethod.Put)
+
+        // Credentials + proper preflight
         allowCredentials = true
+        allowNonSimpleContentTypes = true
+        allowSameOrigin = true
+
+        // Methods (include OPTIONS for preflight)
+        allowMethod(HttpMethod.Options)
+        allowMethod(HttpMethod.Get)
+        allowMethod(HttpMethod.Post)
+        allowMethod(HttpMethod.Put)
+        allowMethod(HttpMethod.Patch)
+        allowMethod(HttpMethod.Delete)
+
+        // Headers
         allowHeader(HttpHeaders.ContentType)
         allowHeader(HttpHeaders.Authorization)
+        allowHeader("X-Requested-With")
+        allowHeader("X-CSRF-Token")
+        allowHeader("x-bot-key")
+
+        // Expose useful response headers
+        exposeHeader(HttpHeaders.ContentDisposition)
     }
 
     // ✅ 3. Error handling

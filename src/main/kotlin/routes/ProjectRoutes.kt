@@ -14,6 +14,7 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import org.jetbrains.exposed.dao.id.EntityID
 import org.jetbrains.exposed.exceptions.ExposedSQLException
 import org.jetbrains.exposed.sql.*
@@ -42,6 +43,12 @@ data class SeatLimitExceededError(
     val used: Int,
     val limit: Int
 )
+
+private val lenientJson = Json {
+    ignoreUnknownKeys = true
+    isLenient = true
+    explicitNulls = false
+}
 
 private fun principalCompanyId(principal: JWTPrincipal): Int =
     principal.payload.getClaim("companyId").asInt() ?: 0
@@ -217,8 +224,15 @@ fun Route.projectsRoutes() {
                 if (!isAdminForCompany(principal, companyId))
                     return@post call.respond(HttpStatusCode.Forbidden, ApiErrorProject("forbidden", "Admin rights required"))
 
-                val body = try { call.receive<ProjectCreateRequest>() } catch (e: Exception) {
-                    return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Body must be JSON"))
+                val body = try {
+                    call.receive<ProjectCreateRequest>()
+                } catch (_: Exception) {
+                    val raw = call.receiveText()
+                    try {
+                        lenientJson.decodeFromString(ProjectCreateRequest.serializer(), raw)
+                    } catch (e: Exception) {
+                        return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", e.message ?: "Body must be JSON"))
+                    }
                 }
                 if (body.title.isBlank())
                     return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("title_required"))
@@ -335,8 +349,15 @@ fun Route.projectsRoutes() {
                 if (!isAdminForCompany(principal, companyId))
                     return@patch call.respond(HttpStatusCode.Forbidden, ApiErrorProject("forbidden", "Admin rights required"))
 
-                val body = try { call.receive<ProjectUpdateRequest>() } catch (e: Exception) {
-                    return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Body must be JSON"))
+                val body = try {
+                    call.receive<ProjectUpdateRequest>()
+                } catch (_: Exception) {
+                    val raw = call.receiveText()
+                    try {
+                        lenientJson.decodeFromString(ProjectUpdateRequest.serializer(), raw)
+                    } catch (e: Exception) {
+                        return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", e.message ?: "Body must be JSON"))
+                    }
                 }
 
                 try {
