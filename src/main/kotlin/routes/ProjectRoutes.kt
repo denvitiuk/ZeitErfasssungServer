@@ -331,7 +331,14 @@ fun Route.projectsRoutes() {
                 }
 
                 if (body.lat == null && body.lng == null && body.location == null && body.radius == null) {
-                    return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Nothing to update"))
+                    // NO-OP: return current coordinates if available
+                    val dto = StandortDTO(
+                        projectId = projectId,
+                        lat = row[Projects.lat] ?: return@patch call.respond(HttpStatusCode.NotFound, ApiErrorProject("not_found", "No coordinates set")),
+                        lng = row[Projects.lng] ?: return@patch call.respond(HttpStatusCode.NotFound, ApiErrorProject("not_found", "No coordinates set")),
+                        location = row[Projects.location]
+                    )
+                    return@patch call.respond(HttpStatusCode.OK, dto)
                 }
 
                 try {
@@ -419,15 +426,25 @@ fun Route.projectsRoutes() {
                 if (!isAdminForCompany(principal, companyId))
                     return@patch call.respond(HttpStatusCode.Forbidden, ApiErrorProject("forbidden", "Admin rights required"))
 
-                val body = try {
-                    call.receive<ProjectUpdateRequest>()
-                } catch (_: Exception) {
-                    val raw = call.receiveText()
+                // Read body once; treat empty or '{}' as NO-OP (return current state)
+                val raw = call.receiveText()
+                val body: ProjectUpdateRequest? = if (raw.isBlank()) {
+                    null
+                } else {
                     try {
                         lenientJson.decodeFromString(ProjectUpdateRequest.serializer(), raw)
                     } catch (e: Exception) {
                         return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", e.message ?: "Body must be JSON"))
                     }
+                }
+
+                // If nothing to update, return current project (200 OK)
+                if (body == null ||
+                    (body.title == null && body.description == null && body.location == null && body.lat == null && body.lng == null)
+                ) {
+                    val current = transaction { Projects.select { Projects.id eq row[Projects.id] }.single() }
+                    val membersCount = transaction { ProjectMembers.select { ProjectMembers.projectId eq EntityID(projectId, Projects) }.count().toInt() }
+                    return@patch call.respond(HttpStatusCode.OK, current.toProjectDTO(membersCount))
                 }
 
                 try {
