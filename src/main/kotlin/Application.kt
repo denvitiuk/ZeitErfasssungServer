@@ -60,6 +60,7 @@ import org.quartz.*
 import org.quartz.impl.StdSchedulerFactory
 import java.util.TimeZone
 import io.ktor.server.application.ApplicationStopped
+import io.ktor.server.request.path
 
 // In-memory cache for phone verification codes (5-minute TTL)
 val verificationCodeCache: Cache<String, String> = Caffeine.newBuilder()
@@ -125,9 +126,16 @@ fun Application.module() {
             )
         }
         status(HttpStatusCode.Unauthorized) { call, _ ->
+            val path = call.request.path()
+            // For auth endpoints we may keep a more specific message; for everything else use a generic one.
+            val msg = if (path.startsWith("/login") || path.startsWith("/complete-registration")) {
+                "Bitte geben Sie das richtige Passwort oder die richtige E-Mail-Adresse ein."
+            } else {
+                "Unauthorized"
+            }
             call.respond(
                 HttpStatusCode.Unauthorized,
-                mapOf("error" to "Bitte geben Sie das richtige Passwort oder die richtige E-Mail-Adresse ein.")
+                mapOf("error" to msg)
             )
         }
     }
@@ -161,6 +169,17 @@ fun Application.module() {
                 ?: env["JWT_AUDIENCE"] ?: "dev-audience"
             realm = cfg.propertyOrNull("ktor.jwt.realm")?.getString()
                 ?: env["JWT_REALM"] ?: "zeiterfassung"
+
+            // Refresh-token settings (used by /refresh endpoint; kept here so env/config is centralized)
+            // NOTE: We do NOT log the pepper.
+            val refreshValidityMs = cfg.propertyOrNull("auth.refresh.validityMs")?.getString()?.toLongOrNull()
+                ?: env["REFRESH_VALIDITY_MS"]?.toLongOrNull()
+                ?: 1000L * 60 * 60 * 24 * 30 // 30 days default
+            val refreshPepperConfigured = !(
+                cfg.propertyOrNull("auth.refresh.pepper")?.getString().isNullOrBlank() &&
+                    env["REFRESH_PEPPER"].isNullOrBlank()
+                )
+            this@module.environment.log.info("Refresh tokens enabled config present: $refreshPepperConfigured, validityMs=$refreshValidityMs")
 
             verifier(
                 JWT.require(Algorithm.HMAC256(jwtSecret))

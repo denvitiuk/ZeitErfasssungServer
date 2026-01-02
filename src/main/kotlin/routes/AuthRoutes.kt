@@ -35,6 +35,9 @@ import java.time.LocalDate
 import com.auth0.jwt.JWT
 import com.auth0.jwt.algorithms.Algorithm
 import java.util.Date
+import java.security.SecureRandom
+import java.security.MessageDigest
+import java.util.Base64
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
@@ -52,6 +55,7 @@ import io.ktor.http.content.streamProvider
 import io.ktor.server.request.receiveMultipart
 import io.ktor.server.request.receiveText
 import org.jetbrains.exposed.dao.id.EntityID
+import org.jetbrains.exposed.dao.id.IntIdTable
 import org.jetbrains.exposed.sql.Column
 import org.jetbrains.exposed.sql.and
 import java.io.File
@@ -73,10 +77,25 @@ data class SentCodeResponse(val sent: Boolean)
 data class VerifyCodeResponse(val verified: Boolean)
 
 @Serializable
-data class CompleteRegistrationResponse(val completed: Boolean, val token: String)
+data class CompleteRegistrationResponse(
+    val completed: Boolean,
+    val token: String,
+    val refreshToken: String? = null,
+    val expiresInMs: Long? = null
+)
 
 @Serializable
 data class ErrorResponse(val error: String)
+
+@Serializable
+data class RefreshRequest(val refreshToken: String, val deviceId: String? = null)
+
+@Serializable
+data class TokenResponse(
+    val token: String,
+    val refreshToken: String? = null,
+    val expiresInMs: Long? = null
+)
 
 @Serializable
 data class ProfileResponse(
@@ -101,8 +120,23 @@ data class LinkCompanyResponse(
     val companyId: Int,
     val companyName: String,
     val isCompanyAdmin: Boolean,
-    val alreadyLinked: Boolean = false
+    val alreadyLinked: Boolean = false,
+    val refreshToken: String? = null,
+    val expiresInMs: Long? = null
 )
+
+// --- Refresh sessions (server-side) ---
+// NOTE: The physical table must exist in Postgres (create it via Neon SQL Editor).
+private object RefreshSessions : IntIdTable("refresh_sessions") {
+    val userId = reference("user_id", Users)
+    val tokenHash = varchar("token_hash", 64).uniqueIndex()
+    val createdAtMs = long("created_at_ms")
+    val expiresAtMs = long("expires_at_ms")
+    val revokedAtMs = long("revoked_at_ms").nullable()
+    val replacedByHash = varchar("replaced_by_hash", 64).nullable()
+    val deviceId = varchar("device_id", 128).nullable()
+}
+// --- End refresh sessions ---
 
 // --- Helpers: phone normalization (E.164-ish for DE) and SMS throttle ---
 private fun ApplicationCall.preferredRegion(default: String = "DE"): String {
@@ -155,7 +189,138 @@ private fun shouldThrottle(phone: String): Boolean {
     }
 }
 // --- End helpers ---
+
+private data class RefreshCfg(val validityMs: Long, val pepper: String)
+
+private fun refreshCfg(call: ApplicationCall): RefreshCfg {
+    val cfg = call.application.environment.config
+    val env = System.getenv()
+
+    val validityMs = cfg.propertyOrNull("auth.refresh.validityMs")?.getString()?.toLongOrNull()
+        ?: env["REFRESH_VALIDITY_MS"]?.toLongOrNull()
+        ?: 1000L * 60 * 60 * 24 * 30 // 30 days
+
+    // Pepper is required for hashing; fallback to JWT secret in dev to avoid breaking local setups.
+    val pepper = cfg.propertyOrNull("auth.refresh.pepper")?.getString()
+        ?: env["REFRESH_PEPPER"]
+        ?: cfg.propertyOrNull("ktor.jwt.secret")?.getString()
+        ?: "dev-pepper"
+
+    return RefreshCfg(validityMs = validityMs, pepper = pepper)
+}
+
+private val refreshRng = SecureRandom()
+
+private fun generateRefreshToken(): String {
+    val bytes = ByteArray(48)
+    refreshRng.nextBytes(bytes)
+    return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+}
+
+private fun hashRefreshToken(refreshToken: String, pepper: String): String {
+    val md = MessageDigest.getInstance("SHA-256")
+    val digest = md.digest((pepper + refreshToken).toByteArray())
+    return digest.joinToString("") { "%02x".format(it) }
+}
+
+private fun issueJwt(
+    call: ApplicationCall,
+    userId: Int,
+    companyId: Int,
+    isCompanyAdmin: Boolean,
+    isGlobalAdmin: Boolean
+): Pair<String, Long> {
+    val jwtConfig = call.application.environment.config.config("ktor.jwt")
+    val issuer = jwtConfig.property("issuer").getString()
+    val audience = jwtConfig.property("audience").getString()
+    val secret = jwtConfig.property("secret").getString()
+    val expiresIn = jwtConfig.property("validityMs").getString().toLong()
+
+    val token = JWT.create()
+        .withIssuer(issuer)
+        .withAudience(audience)
+        .withClaim("id", userId.toString())
+        .withClaim("companyId", companyId)
+        .withClaim("isCompanyAdmin", isCompanyAdmin)
+        .withClaim("isGlobalAdmin", isGlobalAdmin)
+        .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
+        .sign(Algorithm.HMAC256(secret))
+
+    return token to expiresIn
+}
 fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
+
+    // Refresh access token using a long-lived refresh token (rotation).
+    route("/refresh") {
+        post {
+            val dto = call.receive<RefreshRequest>()
+            val raw = dto.refreshToken.trim()
+            if (raw.isEmpty()) {
+                return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("refresh_token_required"))
+            }
+
+            val cfg = refreshCfg(call)
+            val now = System.currentTimeMillis()
+            val oldHash = hashRefreshToken(raw, cfg.pepper)
+
+            val result = transaction {
+                val sessionRow = RefreshSessions
+                    .select { (RefreshSessions.tokenHash eq oldHash) and (RefreshSessions.revokedAtMs.isNull()) }
+                    .limit(1)
+                    .singleOrNull()
+                    ?: return@transaction null
+
+                val expiresAt = sessionRow[RefreshSessions.expiresAtMs]
+                if (expiresAt <= now) {
+                    RefreshSessions.update({ RefreshSessions.tokenHash eq oldHash }) {
+                        it[revokedAtMs] = now
+                    }
+                    return@transaction null
+                }
+
+                val userId = sessionRow[RefreshSessions.userId].value
+                val user = Users.select { Users.id eq userId }.singleOrNull() ?: return@transaction null
+
+                val companyId = user[Users.companyId]?.value ?: 0
+                val isCompanyAdmin = user[Users.isCompanyAdmin]
+                val isGlobalAdmin = user[Users.isGlobalAdmin]
+
+                val (newJwt, jwtExpiresInMs) = issueJwt(
+                    call = call,
+                    userId = userId,
+                    companyId = companyId,
+                    isCompanyAdmin = isCompanyAdmin,
+                    isGlobalAdmin = isGlobalAdmin
+                )
+
+                val newRefresh = generateRefreshToken()
+                val newHash = hashRefreshToken(newRefresh, cfg.pepper)
+
+                RefreshSessions.insert {
+                    it[RefreshSessions.userId] = sessionRow[RefreshSessions.userId]
+                    it[tokenHash] = newHash
+                    it[createdAtMs] = now
+                    it[expiresAtMs] = now + cfg.validityMs
+                    it[revokedAtMs] = null
+                    it[replacedByHash] = null
+                    it[deviceId] = dto.deviceId ?: sessionRow[RefreshSessions.deviceId]
+                }
+
+                RefreshSessions.update({ RefreshSessions.tokenHash eq oldHash }) {
+                    it[revokedAtMs] = now
+                    it[replacedByHash] = newHash
+                }
+
+                TokenResponse(token = newJwt, refreshToken = newRefresh, expiresInMs = jwtExpiresInMs)
+            }
+
+            if (result == null) {
+                return@post call.respond(HttpStatusCode.Unauthorized, ErrorResponse("invalid_refresh_token"))
+            }
+
+            call.respond(HttpStatusCode.OK, result)
+        }
+    }
 
     // Phase 1: Register unverified user (idempotent, upsert pending draft)
     route("/register-unverified") {
@@ -377,26 +542,41 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 }
             }
 
-            // 8) JWT
-            val jwtConfig = call.application.environment.config.config("ktor.jwt")
-            val issuer = jwtConfig.property("issuer").getString()
-            val audience = jwtConfig.property("audience").getString()
-            val secret = jwtConfig.property("secret").getString()
-            val expiresIn = jwtConfig.property("validityMs").getString().toLong()
+            // 8) JWT + Refresh (non-breaking: keeps `token` and adds optional fields)
+            val companyIdInt = companyId?.value ?: 0
+            val (jwt, jwtExpiresInMs) = issueJwt(
+                call = call,
+                userId = draftUserId,
+                companyId = companyIdInt,
+                isCompanyAdmin = isAdmin,
+                isGlobalAdmin = false
+            )
 
-            val token = JWT.create()
-                .withIssuer(issuer)
-                .withAudience(audience)
-                .withClaim("id", draftUserId.toString())
-                .withClaim("companyId", companyId?.value ?: 0)
-                .withClaim("isCompanyAdmin", isAdmin)
-                .withClaim("isGlobalAdmin", false)
-                .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
-                .sign(Algorithm.HMAC256(secret))
+            val rCfg = refreshCfg(call)
+            val refreshToken = generateRefreshToken()
+            val refreshHash = hashRefreshToken(refreshToken, rCfg.pepper)
+            val now = System.currentTimeMillis()
+
+            transaction {
+                RefreshSessions.insert {
+                    it[userId] = EntityID(draftUserId, Users)
+                    it[tokenHash] = refreshHash
+                    it[createdAtMs] = now
+                    it[expiresAtMs] = now + rCfg.validityMs
+                    it[revokedAtMs] = null
+                    it[replacedByHash] = null
+                    it[deviceId] = call.request.headers["X-Device-Id"]
+                }
+            }
 
             call.respond(
                 HttpStatusCode.OK,
-                CompleteRegistrationResponse(completed = true, token = token)
+                CompleteRegistrationResponse(
+                    completed = true,
+                    token = jwt,
+                    refreshToken = refreshToken,
+                    expiresInMs = jwtExpiresInMs
+                )
             )
         }
     }
@@ -436,23 +616,35 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             val isCompanyAdmin = user[Users.isCompanyAdmin]
             val isGlobalAdmin = user[Users.isGlobalAdmin]
 
-            val jwtConfig = call.application.environment.config.config("ktor.jwt")
-            val issuer = jwtConfig.property("issuer").getString()
-            val audience = jwtConfig.property("audience").getString()
-            val secret = jwtConfig.property("secret").getString()
-            val expiresIn = jwtConfig.property("validityMs").getString().toLong()
+            val (jwt, jwtExpiresInMs) = issueJwt(
+                call = call,
+                userId = user[Users.id].value,
+                companyId = companyId,
+                isCompanyAdmin = isCompanyAdmin,
+                isGlobalAdmin = isGlobalAdmin
+            )
 
-            val token = JWT.create()
-                .withIssuer(issuer)
-                .withAudience(audience)
-                .withClaim("id", user[Users.id].value.toString())
-                .withClaim("companyId", companyId)
-                .withClaim("isCompanyAdmin", isCompanyAdmin)
-                .withClaim("isGlobalAdmin", isGlobalAdmin)
-                .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
-                .sign(Algorithm.HMAC256(secret))
+            val rCfg = refreshCfg(call)
+            val refreshToken = generateRefreshToken()
+            val refreshHash = hashRefreshToken(refreshToken, rCfg.pepper)
+            val now = System.currentTimeMillis()
 
-            call.respond(HttpStatusCode.OK, mapOf("token" to token))
+            transaction {
+                RefreshSessions.insert {
+                    it[userId] = user[Users.id]
+                    it[tokenHash] = refreshHash
+                    it[createdAtMs] = now
+                    it[expiresAtMs] = now + rCfg.validityMs
+                    it[revokedAtMs] = null
+                    it[replacedByHash] = null
+                    it[deviceId] = call.request.headers["X-Device-Id"]
+                }
+            }
+
+            call.respond(
+                HttpStatusCode.OK,
+                TokenResponse(token = jwt, refreshToken = refreshToken, expiresInMs = jwtExpiresInMs)
+            )
         }
     }
 
