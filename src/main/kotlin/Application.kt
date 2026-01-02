@@ -84,8 +84,19 @@ fun Application.module() {
     // allowOrigins { origin -> (System.getenv("CORS_ALLOWED_ORIGINS") ?: "").split(',').map { it.trim() }.filter { it.isNotEmpty() }.any { it.equals(origin, ignoreCase = true) } }
     // 2. CORS
     install(CORS) {
-        // Dev: allow all origins. For prod, switch to explicit hosts via env (see note below)
-        anyHost()
+        // CORS_ALLOWED_ORIGINS: comma-separated list of allowed origins. If not set, allow anyHost() for dev/local.
+        val allowedOrigins = (System.getenv("CORS_ALLOWED_ORIGINS") ?: "")
+            .split(',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+
+        if (allowedOrigins.isEmpty()) {
+            // Dev/local default
+            anyHost()
+        } else {
+            // Production allow-list
+            allowOrigins { origin -> allowedOrigins.any { it.equals(origin, ignoreCase = true) } }
+        }
 
         // Credentials + proper preflight
         allowCredentials = true
@@ -106,6 +117,7 @@ fun Application.module() {
         allowHeader("X-Requested-With")
         allowHeader("X-CSRF-Token")
         allowHeader("x-bot-key")
+        allowHeader("X-Device-Id")
 
         // Expose useful response headers
         exposeHeader(HttpHeaders.ContentDisposition)
@@ -127,16 +139,19 @@ fun Application.module() {
         }
         status(HttpStatusCode.Unauthorized) { call, _ ->
             val path = call.request.path()
-            // For auth endpoints we may keep a more specific message; for everything else use a generic one.
-            val msg = if (path.startsWith("/login") || path.startsWith("/complete-registration")) {
-                "Bitte geben Sie das richtige Passwort oder die richtige E-Mail-Adresse ein."
-            } else {
-                "Unauthorized"
+
+            // IMPORTANT:
+            // Do not override route-specific 401 responses (e.g. `/refresh` returning `invalid_refresh_token`).
+            // Only customize the 401 body for login/registration endpoints.
+            val isAuthUiEndpoint = path.startsWith("/login") || path.startsWith("/complete-registration")
+            if (!isAuthUiEndpoint) return@status
+
+            if (!call.response.isCommitted) {
+                call.respond(
+                    HttpStatusCode.Unauthorized,
+                    mapOf("error" to "Bitte geben Sie das richtige Passwort oder die richtige E-Mail-Adresse ein.")
+                )
             }
-            call.respond(
-                HttpStatusCode.Unauthorized,
-                mapOf("error" to msg)
-            )
         }
     }
 
