@@ -15,7 +15,7 @@ object EmailTemplates {
      */
     fun buildResetPasswordHtml(code: String): String = """
 <!DOCTYPE html>
-<html lang="de">    А
+<html lang="de">    
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
