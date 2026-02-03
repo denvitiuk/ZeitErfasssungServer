@@ -32,6 +32,7 @@ import com.auth0.jwt.algorithms.Algorithm
 import com.yourcompany.zeiterfassung.db.configureDatabases
 import com.yourcompany.zeiterfassung.routes.*
 import com.yourcompany.zeiterfassung.service.AccountDeletionService
+import com.yourcompany.zeiterfassung.routes.HttpStatusException
 
 // --- Document Flow imports ---
 import com.yourcompany.zeiterfassung.routes.registerDocumentFlowRoutes
@@ -140,6 +141,12 @@ fun Application.module() {
                 HttpStatusCode.BadRequest,
                 mapOf("error" to (cause.message ?: "Unkorrekter Antrag"))
             )
+        }
+        exception<HttpStatusException> { call, cause ->
+            // Used by tracking routes for clean 403/404/409 responses
+            if (!call.response.isCommitted) {
+                call.respond(cause.status, mapOf("error" to cause.message))
+            }
         }
         exception<Throwable> { call, cause ->
             call.respond(

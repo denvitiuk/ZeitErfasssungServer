@@ -4,6 +4,7 @@ import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.auth.*
 import io.ktor.server.auth.jwt.*
+import io.ktor.server.plugins.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -12,8 +13,11 @@ import io.ktor.websocket.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import org.jetbrains.exposed.sql.TextColumnType
+import org.jetbrains.exposed.sql.Transaction
 import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.exec
+import org.jetbrains.exposed.sql.statements.api.PreparedStatementApi
+import java.sql.ResultSet
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -21,6 +25,47 @@ import java.util.concurrent.ConcurrentHashMap
 private val json = Json {
     encodeDefaults = true
     ignoreUnknownKeys = true
+}
+
+// --- Simple HTTP exceptions (map via StatusPages in Application.module) -----
+class HttpStatusException(val status: HttpStatusCode, override val message: String) : RuntimeException(message)
+
+private fun forbidden(msg: String = "Forbidden"): Nothing = throw HttpStatusException(HttpStatusCode.Forbidden, msg)
+private fun notFound(msg: String = "Not found"): Nothing = throw HttpStatusException(HttpStatusCode.NotFound, msg)
+private fun conflict(msg: String = "Conflict"): Nothing = throw HttpStatusException(HttpStatusCode.Conflict, msg)
+
+private val NULL_TYPE = TextColumnType()
+
+// --- Minimal JDBC helpers inside Exposed transaction ------------------------
+private inline fun <T> Transaction.queryOne(
+    sql: String,
+    params: List<Any?>,
+    crossinline mapper: (ResultSet) -> T
+): T? {
+    val stmt: PreparedStatementApi = connection.prepareStatement(sql, false)
+    try {
+        params.forEachIndexed { idx, v ->
+            if (v == null) stmt.setNull(idx + 1, NULL_TYPE) else stmt.set(idx + 1, v)
+        }
+        val rs = stmt.executeQuery()
+        rs.use {
+            return if (it.next()) mapper(it) else null
+        }
+    } finally {
+        stmt.closeIfPossible()
+    }
+}
+
+private fun Transaction.execUpdate(sql: String, params: List<Any?>) {
+    val stmt: PreparedStatementApi = connection.prepareStatement(sql, false)
+    try {
+        params.forEachIndexed { idx, v ->
+            if (v == null) stmt.setNull(idx + 1, NULL_TYPE) else stmt.set(idx + 1, v)
+        }
+        stmt.executeUpdate()
+    } finally {
+        stmt.closeIfPossible()
+    }
 }
 
 @Serializable
@@ -37,9 +82,9 @@ private fun ApplicationCall.requireUserId(): Long {
 }
 
 private fun loadUserContext(userId: Long): UserContext = transaction {
-    exec(
+    queryOne(
         """
-        SELECT 
+        SELECT
           id,
           company_id,
           COALESCE(is_global_admin, false) OR COALESCE(is_company_admin, false) AS is_admin
@@ -48,65 +93,58 @@ private fun loadUserContext(userId: Long): UserContext = transaction {
         """.trimIndent(),
         listOf(userId)
     ) { rs ->
-        if (!rs.next()) error("User not found: $userId")
         UserContext(
             userId = rs.getLong("id"),
             companyId = rs.getInt("company_id"),
             isAdmin = rs.getBoolean("is_admin")
         )
-    }!!
+    } ?: error("User not found: $userId")
 }
 
 private fun requireAdmin(ctx: UserContext) {
-    if (!ctx.isAdmin) throw ForbiddenException("Admin only")
+    if (!ctx.isAdmin) forbidden("Admin only")
 }
 
 private fun requireSameCompany(sessionId: UUID, companyId: Int) = transaction {
-    exec(
+    val sessCompany = queryOne(
         "SELECT company_id FROM tracking_sessions WHERE id = ?",
         listOf(sessionId)
-    ) { rs ->
-        if (!rs.next()) throw NotFoundException("Session not found")
-        val sessCompany = rs.getInt("company_id")
-        if (sessCompany != companyId) throw ForbiddenException("Wrong company")
-        true
-    }
-}!!
+    ) { rs -> rs.getInt("company_id") } ?: notFound("Session not found")
+
+    if (sessCompany != companyId) forbidden("Wrong company")
+    true
+}
 
 private fun requireOwnedActiveSession(sessionId: UUID, userId: Long): Unit = transaction {
-    exec(
+    val row = queryOne(
         """
         SELECT user_id, is_active
         FROM tracking_sessions
         WHERE id = ?
         """.trimIndent(),
         listOf(sessionId)
-    ) { rs ->
-        if (!rs.next()) throw NotFoundException("Session not found")
-        val owner = rs.getLong("user_id")
-        val active = rs.getBoolean("is_active")
-        if (owner != userId) throw ForbiddenException("Not your session")
-        if (!active) throw ConflictException("Session is not active")
-        Unit
-    }
+    ) { rs -> Pair(rs.getLong("user_id"), rs.getBoolean("is_active")) } ?: notFound("Session not found")
+
+    val owner = row.first
+    val active = row.second
+
+    if (owner != userId) forbidden("Not your session")
+    if (!active) conflict("Session is not active")
 }
 
 private fun insertAdminWatchLog(adminId: Long, sessionId: UUID): Long = transaction {
-    exec(
+    queryOne(
         """
         INSERT INTO admin_watch_logs (company_id, admin_user_id, session_id, opened_at)
         VALUES (0, ?, ?, now())
         RETURNING id
         """.trimIndent(),
         listOf(adminId, sessionId)
-    ) { rs ->
-        rs.next()
-        rs.getLong("id")
-    }!!
+    ) { rs -> rs.getLong("id") }!!
 }
 
 private fun closeAdminWatchLog(logId: Long) = transaction {
-    exec(
+    execUpdate(
         "UPDATE admin_watch_logs SET closed_at = now() WHERE id = ? AND closed_at IS NULL",
         listOf(logId)
     )
@@ -190,15 +228,13 @@ data class ActiveSessionDto(
 fun Route.trackingRoutes() {
     route("/tracking") {
 
-        /**
-         * USER: start tracking (one active session per user enforced by DB)
-         */
+        // USER: start tracking (one active session per user enforced by DB)
         post("/sessions/start") {
             val userId = call.requireUserId()
             val ctx = loadUserContext(userId)
 
             val existing = transaction {
-                exec(
+                queryOne(
                     """
                     SELECT id, started_at
                     FROM tracking_sessions
@@ -208,7 +244,6 @@ fun Route.trackingRoutes() {
                     """.trimIndent(),
                     listOf(userId)
                 ) { rs ->
-                    if (!rs.next()) return@exec null
                     Pair(rs.getObject("id", UUID::class.java), rs.getString("started_at"))
                 }
             }
@@ -219,7 +254,7 @@ fun Route.trackingRoutes() {
             }
 
             val created = transaction {
-                exec(
+                queryOne(
                     """
                     INSERT INTO tracking_sessions (company_id, user_id, started_at, is_active)
                     VALUES (?, ?, now(), TRUE)
@@ -227,7 +262,6 @@ fun Route.trackingRoutes() {
                     """.trimIndent(),
                     listOf(ctx.companyId, userId)
                 ) { rs ->
-                    rs.next()
                     Pair(rs.getObject("id", UUID::class.java), rs.getString("started_at"))
                 }!!
             }
@@ -235,18 +269,15 @@ fun Route.trackingRoutes() {
             call.respond(StartSessionResp(created.first.toString(), created.second))
         }
 
-        /**
-         * USER: stop tracking
-         */
+        // USER: stop tracking
         post("/sessions/{id}/stop") {
             val userId = call.requireUserId()
             val sessionId = UUID.fromString(call.parameters["id"] ?: throw BadRequestException("Missing id"))
 
-            // must own & active
             requireOwnedActiveSession(sessionId, userId)
 
             val endedAt = transaction {
-                exec(
+                queryOne(
                     """
                     UPDATE tracking_sessions
                     SET is_active = FALSE, ended_at = now()
@@ -254,10 +285,7 @@ fun Route.trackingRoutes() {
                     RETURNING ended_at
                     """.trimIndent(),
                     listOf(sessionId, userId)
-                ) { rs ->
-                    rs.next()
-                    rs.getString("ended_at")
-                }!!
+                ) { rs -> rs.getString("ended_at") } ?: conflict("Session already stopped")
             }
 
             val evt = StoppedEvent(
@@ -270,34 +298,24 @@ fun Route.trackingRoutes() {
             call.respond(StopSessionResp(sessionId.toString(), endedAt))
         }
 
-        /**
-         * USER: send point
-         */
+        // USER: send point
         post("/points") {
             val userId = call.requireUserId()
             val req = call.receive<TrackPointReq>()
             val sessionId = UUID.fromString(req.sessionId)
 
-            // must own & active
             requireOwnedActiveSession(sessionId, userId)
 
             val ts = req.tsEpochSeconds ?: Instant.now().epochSecond
             val tsIso = Instant.ofEpochSecond(ts).toString()
 
             transaction {
-                exec(
+                execUpdate(
                     """
                     INSERT INTO tracking_points (session_id, latitude, longitude, speed_mps, heading_deg, ts)
-                    VALUES (?, ?, ?, ?, ?, ?::timestamptz)
+                    VALUES (?, ?, ?, ?::real, ?::real, ?::timestamptz)
                     """.trimIndent(),
-                    listOf(
-                        sessionId,
-                        req.lat,
-                        req.lon,
-                        req.speedMps,
-                        req.headingDeg,
-                        tsIso
-                    )
+                    listOf(sessionId, req.lat, req.lon, req.speedMps, req.headingDeg, tsIso)
                 )
             }
 
@@ -315,46 +333,48 @@ fun Route.trackingRoutes() {
             call.respond(HttpStatusCode.OK)
         }
 
-        /**
-         * ADMIN: list active sessions in same company
-         */
+        // ADMIN: list active sessions in same company
         get("/sessions/active") {
             val userId = call.requireUserId()
             val ctx = loadUserContext(userId)
             requireAdmin(ctx)
 
             val rows = transaction {
-                exec(
+                val stmt = connection.prepareStatement(
                     """
                     SELECT id, user_id, started_at
                     FROM tracking_sessions
                     WHERE company_id = ? AND is_active = TRUE
                     ORDER BY started_at DESC
                     """.trimIndent(),
-                    listOf(ctx.companyId)
-                ) { rs ->
-                    val out = mutableListOf<ActiveSessionDto>()
-                    while (rs.next()) {
-                        out.add(
-                            ActiveSessionDto(
-                                sessionId = rs.getObject("id", UUID::class.java).toString(),
-                                userId = rs.getLong("user_id"),
-                                startedAt = rs.getString("started_at")
+                    false
+                )
+                try {
+                    stmt.set(1, ctx.companyId)
+                    val rs = stmt.executeQuery()
+                    rs.use {
+                        val out = mutableListOf<ActiveSessionDto>()
+                        while (it.next()) {
+                            out.add(
+                                ActiveSessionDto(
+                                    sessionId = it.getObject("id", UUID::class.java).toString(),
+                                    userId = it.getLong("user_id"),
+                                    startedAt = it.getString("started_at")
+                                )
                             )
-                        )
+                        }
+                        out
                     }
-                    out
-                }!!
+                } finally {
+                    stmt.closeIfPossible()
+                }
             }
 
             call.respond(rows)
         }
     }
 
-    /**
-     * ADMIN: WebSocket stream for a specific sessionId
-     * GET /ws/admin-tracking?sessionId=...
-     */
+    // ADMIN: WebSocket stream for a specific sessionId
     webSocket("/ws/admin-tracking") {
         val sessionIdStr = call.request.queryParameters["sessionId"]
             ?: throw BadRequestException("Missing sessionId")
@@ -364,14 +384,12 @@ fun Route.trackingRoutes() {
         val ctx = loadUserContext(adminId)
         requireAdmin(ctx)
 
-        // enforce same company
         requireSameCompany(sessionId, ctx.companyId)
 
         val logId = insertAdminWatchLog(adminId, sessionId)
         TrackingHub.subscribe(sessionId, this)
 
         try {
-            // keep WS open; we don't require client messages, but we'll consume to detect close
             for (frame in incoming) {
                 if (frame is Frame.Close) break
             }
