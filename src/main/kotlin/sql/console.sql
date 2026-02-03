@@ -676,3 +676,215 @@ END;
 $$;
 
 SELECT * FROM v_company_entitlements ORDER BY company_id;
+
+
+-- === Real-time Tracking (Admin ↔ User) =====================================
+-- Goal:
+-- 1) User (employee) starts/stops a tracking session during work.
+-- 2) User app sends location points to backend.
+-- 3) Admin app subscribes to a session (WS) and sees points in real time.
+-- 4) (Optional) Store Live Activity push token if you later decide to update Live Activity remotely.
+
+-- Ensure UUID support
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- 1) Tracking sessions (one active session per user is recommended)
+CREATE TABLE IF NOT EXISTS tracking_sessions (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    company_id   INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at     TIMESTAMPTZ,
+    is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+
+    -- Optional metadata
+    started_by_admin_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    stop_reason         TEXT
+);
+
+-- Fast lookups
+CREATE INDEX IF NOT EXISTS idx_tracking_sessions_company_active
+    ON tracking_sessions(company_id, is_active, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tracking_sessions_user_active
+    ON tracking_sessions(user_id, is_active);
+
+-- Enforce: at most one active session per user
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tracking_sessions_one_active_per_user
+    ON tracking_sessions(user_id)
+    WHERE is_active = TRUE;
+
+-- Enforce: user must belong to the same company as the session
+CREATE OR REPLACE FUNCTION ensure_same_company_tracking_session()
+RETURNS TRIGGER AS $$
+DECLARE
+    user_company INTEGER;
+BEGIN
+    SELECT company_id INTO user_company FROM users WHERE id = NEW.user_id;
+    IF user_company IS NULL OR user_company <> NEW.company_id THEN
+        RAISE EXCEPTION 'User % must belong to the same company %', NEW.user_id, NEW.company_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_tracking_sessions_same_company'
+    ) THEN
+        CREATE TRIGGER trg_tracking_sessions_same_company
+            BEFORE INSERT OR UPDATE ON tracking_sessions
+            FOR EACH ROW EXECUTE FUNCTION ensure_same_company_tracking_session();
+    END IF;
+END;
+$$;
+
+-- 2) Location points streamed from user app
+-- Keep it lean: you can store only recent history if desired.
+CREATE TABLE IF NOT EXISTS tracking_points (
+    id          BIGSERIAL PRIMARY KEY,
+    session_id  UUID NOT NULL REFERENCES tracking_sessions(id) ON DELETE CASCADE,
+
+    latitude    DOUBLE PRECISION NOT NULL,
+    longitude   DOUBLE PRECISION NOT NULL,
+    speed_mps   REAL,
+    heading_deg REAL,
+
+    -- Timestamp from device (preferred) or server time fallback
+    ts          TIMESTAMPTZ NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT tracking_points_lat_check CHECK (latitude >= -90 AND latitude <= 90),
+    CONSTRAINT tracking_points_lng_check CHECK (longitude >= -180 AND longitude <= 180)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tracking_points_session_ts
+    ON tracking_points(session_id, ts DESC);
+
+-- 3) Admin watch/audit log (who watched whom and when)
+CREATE TABLE IF NOT EXISTS admin_watch_logs (
+    id            BIGSERIAL PRIMARY KEY,
+    company_id    INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+
+    admin_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id    UUID NOT NULL REFERENCES tracking_sessions(id) ON DELETE CASCADE,
+
+    opened_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    closed_at     TIMESTAMPTZ,
+    reason        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_watch_logs_company_opened
+    ON admin_watch_logs(company_id, opened_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_admin_watch_logs_session
+    ON admin_watch_logs(session_id, opened_at DESC);
+
+-- Enforce: admin must belong to the same company
+CREATE OR REPLACE FUNCTION ensure_same_company_admin_watch()
+RETURNS TRIGGER AS $$
+DECLARE
+    admin_company INTEGER;
+    sess_company  INTEGER;
+BEGIN
+    SELECT company_id INTO admin_company FROM users WHERE id = NEW.admin_user_id;
+    SELECT company_id INTO sess_company  FROM tracking_sessions WHERE id = NEW.session_id;
+
+    IF admin_company IS NULL OR sess_company IS NULL OR admin_company <> sess_company THEN
+        RAISE EXCEPTION 'Admin % and session % must belong to the same company', NEW.admin_user_id, NEW.session_id;
+    END IF;
+
+    NEW.company_id := sess_company;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_admin_watch_logs_same_company'
+    ) THEN
+        CREATE TRIGGER trg_admin_watch_logs_same_company
+            BEFORE INSERT OR UPDATE ON admin_watch_logs
+            FOR EACH ROW EXECUTE FUNCTION ensure_same_company_admin_watch();
+    END IF;
+END;
+$$;
+
+-- 4) (Optional) Live Activity push tokens (only if you later want server-driven updates)
+-- For your current plan (local updates on the same device), you may NOT need this.
+CREATE TABLE IF NOT EXISTS live_activity_tokens (
+    id           BIGSERIAL PRIMARY KEY,
+    company_id   INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id   UUID NOT NULL REFERENCES tracking_sessions(id) ON DELETE CASCADE,
+
+    activity_id  TEXT NOT NULL,
+    token_hex    TEXT NOT NULL,
+
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT uq_live_activity_token UNIQUE (activity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_activity_tokens_session
+    ON live_activity_tokens(session_id, updated_at DESC);
+
+-- Keep updated_at in sync for token refreshes
+CREATE OR REPLACE FUNCTION live_activity_tokens_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_live_activity_tokens_updated_at'
+    ) THEN
+        CREATE TRIGGER trg_live_activity_tokens_updated_at
+            BEFORE UPDATE ON live_activity_tokens
+            FOR EACH ROW EXECUTE FUNCTION live_activity_tokens_set_updated_at();
+    END IF;
+END;
+$$;
+
+-- Enforce: token owner must belong to the same company as the session
+CREATE OR REPLACE FUNCTION ensure_same_company_live_activity_token()
+RETURNS TRIGGER AS $$
+DECLARE
+    user_company INTEGER;
+    sess_company INTEGER;
+BEGIN
+    SELECT company_id INTO user_company FROM users WHERE id = NEW.user_id;
+    SELECT company_id INTO sess_company FROM tracking_sessions WHERE id = NEW.session_id;
+
+    IF user_company IS NULL OR sess_company IS NULL OR user_company <> sess_company THEN
+        RAISE EXCEPTION 'User % and session % must belong to the same company', NEW.user_id, NEW.session_id;
+    END IF;
+
+    NEW.company_id := sess_company;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_live_activity_tokens_same_company'
+    ) THEN
+        CREATE TRIGGER trg_live_activity_tokens_same_company
+            BEFORE INSERT OR UPDATE ON live_activity_tokens
+            FOR EACH ROW EXECUTE FUNCTION ensure_same_company_live_activity_token();
+    END IF;
+END;
+$$;
+
+-- === End Real-time Tracking ================================================

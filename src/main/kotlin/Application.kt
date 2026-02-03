@@ -22,6 +22,8 @@ import io.ktor.server.routing.*
 import io.ktor.server.plugins.statuspages.*
 import io.ktor.server.response.*
 import io.ktor.server.plugins.BadRequestException
+import io.ktor.server.websocket.*
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.serialization.json.Json
 
 import com.auth0.jwt.JWT
@@ -77,6 +79,14 @@ fun Application.module() {
         json(Json {
             ignoreUnknownKeys = true
         })
+    }
+
+    // 1.1 WebSockets (for real-time admin tracking)
+    install(WebSockets) {
+        pingPeriod = 15.seconds
+        timeout = 30.seconds
+        maxFrameSize = Long.MAX_VALUE
+        masking = false
     }
 
     // CORS_ALLOWED_ORIGINS can be set to a comma-separated list (e.g., https://app.example.com,https://admin.example.com)
@@ -371,6 +381,7 @@ fun Application.module() {
             companyTimesheetRoutes()
             registerEntitlementsRoutes()
             accountDeletionRoutes(deletionService)
+            trackingRoutes()
             // Document Flow
             registerDocumentFlowRoutes(
                 templateStorage = templateStorageImpl,
