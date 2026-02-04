@@ -154,25 +154,62 @@ private object TrackingHub {
     // sessionId -> connected admin websockets
     private val subs = ConcurrentHashMap<UUID, MutableSet<DefaultWebSocketServerSession>>()
 
-    fun subscribe(sessionId: UUID, ws: DefaultWebSocketServerSession) {
+    suspend fun subscribe(sessionId: UUID, ws: DefaultWebSocketServerSession) {
         val set = subs.computeIfAbsent(sessionId) { ConcurrentHashMap.newKeySet() }
         set.add(ws)
+
+        // Send an ACK so we can verify via websocat that the subscribe actually happened.
+        try {
+            ws.send(
+                Frame.Text(
+                    json.encodeToString(
+                        mapOf(
+                            "type" to "hello",
+                            "sessionId" to sessionId.toString(),
+                            "subscribers" to set.size
+                        )
+                    )
+                )
+            )
+        } catch (t: Throwable) {
+            // If we can't even send hello, the socket is likely not usable.
+            set.remove(ws)
+        }
+
+        println("👀 [TrackingHub] subscribe session=${sessionId} subs=${set.size}")
     }
 
     fun unsubscribe(sessionId: UUID, ws: DefaultWebSocketServerSession) {
         subs[sessionId]?.remove(ws)
         if (subs[sessionId]?.isEmpty() == true) subs.remove(sessionId)
+        println("👋 [TrackingHub] unsubscribe session=${sessionId} subs=${subs[sessionId]?.size ?: 0}")
     }
 
     suspend fun broadcast(sessionId: UUID, msg: String) {
-        val set = subs[sessionId]?.toList() ?: return
+        val set = subs[sessionId]?.toList() ?: run {
+            println("📣 [TrackingHub] broadcast session=${sessionId} subs=0 (no listeners)")
+            return
+        }
+
+        var ok = 0
+        var failed = 0
+
         for (ws in set) {
             try {
                 ws.send(Frame.Text(msg))
+                ok++
             } catch (_: Throwable) {
-                // ignore; connection will be cleaned up on next unsubscribe
+                failed++
+                // Clean up dead session eagerly
+                subs[sessionId]?.remove(ws)
             }
         }
+
+        if (subs[sessionId]?.isEmpty() == true) subs.remove(sessionId)
+
+        println(
+            "📣 [TrackingHub] broadcast session=${sessionId} subs=${set.size} ok=${ok} failed=${failed}"
+        )
     }
 }
 
@@ -294,6 +331,7 @@ fun Route.trackingRoutes() {
                 tsEpochSeconds = Instant.now().epochSecond
             )
             TrackingHub.broadcast(sessionId, json.encodeToString(evt))
+            println("🛑 [tracking/stop] userId=${userId} sessionId=${sessionId}")
 
             call.respond(StopSessionResp(sessionId.toString(), endedAt))
         }
@@ -329,6 +367,7 @@ fun Route.trackingRoutes() {
                 tsEpochSeconds = ts
             )
             TrackingHub.broadcast(sessionId, json.encodeToString(evt))
+            println("🛰️ [tracking/points] userId=${userId} sessionId=${sessionId} lat=${req.lat} lon=${req.lon}")
 
             call.respond(HttpStatusCode.OK)
         }
