@@ -21,6 +21,7 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.statements.api.PreparedStatementApi
 import java.sql.ResultSet
 import java.sql.DriverManager
+import java.util.Properties
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -180,6 +181,7 @@ private object TrackingHub {
             )
         } catch (t: Throwable) {
             // If we can't even send hello, the socket is likely not usable.
+            println("❌ [TrackingHub] hello send failed: ${t.message}")
             set.remove(ws)
         }
 
@@ -248,7 +250,23 @@ private object PgTrackingBus {
                 }
 
                 try {
-                    val conn = DriverManager.getConnection(url)
+                    val user = System.getenv("DB_USER")
+                    val pass = System.getenv("DB_PASSWORD")
+
+                    println(
+                        "🧩 [PgTrackingBus] connect urlSet=${!url.isNullOrBlank()} userSet=${!user.isNullOrBlank()} passSet=${!pass.isNullOrBlank()}"
+                    )
+
+                    val props = Properties().apply {
+                        if (!user.isNullOrBlank()) setProperty("user", user)
+                        if (!pass.isNullOrBlank()) setProperty("password", pass)
+                    }
+
+                    val conn = if (user.isNullOrBlank() && pass.isNullOrBlank()) {
+                        DriverManager.getConnection(url)
+                    } else {
+                        DriverManager.getConnection(url, props)
+                    }
                     conn.createStatement().use { it.execute("LISTEN $CHANNEL") }
                     val pg = conn.unwrap(PGConnection::class.java)
                     println("✅ [PgTrackingBus] LISTEN $CHANNEL (cross-instance tracking enabled)")
@@ -506,6 +524,7 @@ fun Route.trackingRoutes() {
         requireAdmin(ctx)
 
         requireSameCompany(sessionId, ctx.companyId)
+        println("🧷 [ws/admin-tracking] OPEN sessionId=${sessionId} adminId=${adminId}")
 
         val logId = insertAdminWatchLog(ctx.companyId, adminId, sessionId)
         TrackingHub.subscribe(sessionId, this)
@@ -515,6 +534,7 @@ fun Route.trackingRoutes() {
                 if (frame is Frame.Close) break
             }
         } finally {
+            println("🧷 [ws/admin-tracking] CLOSE sessionId=${sessionId} adminId=${adminId}")
             TrackingHub.unsubscribe(sessionId, this)
             closeAdminWatchLog(logId)
         }
