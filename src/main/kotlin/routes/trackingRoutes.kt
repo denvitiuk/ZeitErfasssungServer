@@ -13,14 +13,18 @@ import io.ktor.websocket.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.jetbrains.exposed.sql.TextColumnType
 import org.jetbrains.exposed.sql.Transaction
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.statements.api.PreparedStatementApi
 import java.sql.ResultSet
+import java.sql.DriverManager
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import org.postgresql.PGConnection
 
 private val json = Json {
     encodeDefaults = true
@@ -132,14 +136,14 @@ private fun requireOwnedActiveSession(sessionId: UUID, userId: Long): Unit = tra
     if (!active) conflict("Session is not active")
 }
 
-private fun insertAdminWatchLog(adminId: Long, sessionId: UUID): Long = transaction {
+private fun insertAdminWatchLog(companyId: Int, adminId: Long, sessionId: UUID): Long = transaction {
     queryOne(
         """
         INSERT INTO admin_watch_logs (company_id, admin_user_id, session_id, opened_at)
-        VALUES (0, ?, ?, now())
+        VALUES (?, ?, ?, now())
         RETURNING id
         """.trimIndent(),
-        listOf(adminId, sessionId)
+        listOf(companyId, adminId, sessionId)
     ) { rs -> rs.getLong("id") }!!
 }
 
@@ -151,10 +155,13 @@ private fun closeAdminWatchLog(logId: Long) = transaction {
 }
 
 private object TrackingHub {
-    // sessionId -> connected admin websockets
+    // sessionId -> connected admin websockets (local to this instance)
     private val subs = ConcurrentHashMap<UUID, MutableSet<DefaultWebSocketServerSession>>()
 
     suspend fun subscribe(sessionId: UUID, ws: DefaultWebSocketServerSession) {
+        // ensure postgres listener is running so cross-instance broadcasts arrive here too
+        PgTrackingBus.ensureStarted()
+
         val set = subs.computeIfAbsent(sessionId) { ConcurrentHashMap.newKeySet() }
         set.add(ws)
 
@@ -185,9 +192,10 @@ private object TrackingHub {
         println("👋 [TrackingHub] unsubscribe session=${sessionId} subs=${subs[sessionId]?.size ?: 0}")
     }
 
-    suspend fun broadcast(sessionId: UUID, msg: String) {
+    // Local-only broadcast (does NOT re-publish to Postgres)
+    suspend fun broadcastLocal(sessionId: UUID, msg: String, source: String = "local") {
         val set = subs[sessionId]?.toList() ?: run {
-            println("📣 [TrackingHub] broadcast session=${sessionId} subs=0 (no listeners)")
+            println("📣 [TrackingHub] broadcastLocal($source) session=${sessionId} subs=0")
             return
         }
 
@@ -208,8 +216,82 @@ private object TrackingHub {
         if (subs[sessionId]?.isEmpty() == true) subs.remove(sessionId)
 
         println(
-            "📣 [TrackingHub] broadcast session=${sessionId} subs=${set.size} ok=${ok} failed=${failed}"
+            "📣 [TrackingHub] broadcastLocal($source) session=${sessionId} subs=${set.size} ok=${ok} failed=${failed}"
         )
+    }
+
+    // Broadcast to local subscribers AND publish to Postgres so other instances can deliver too.
+    suspend fun broadcast(sessionId: UUID, msg: String) {
+        broadcastLocal(sessionId, msg, source = "local")
+        PgTrackingBus.publish(sessionId, msg)
+    }
+}
+
+private object PgTrackingBus {
+    private const val CHANNEL = "tracking_events"
+
+    @Volatile private var started = false
+
+    fun ensureStarted() {
+        if (started) return
+        synchronized(this) {
+            if (started) return
+            started = true
+            Thread {
+                val url = System.getenv("DATABASE_URL")
+                    ?: System.getenv("JDBC_DATABASE_URL")
+                    ?: System.getenv("NEON_DATABASE_URL")
+
+                if (url.isNullOrBlank()) {
+                    println("⚠️ [PgTrackingBus] DATABASE_URL is not set. Cross-instance WS will NOT work.")
+                    return@Thread
+                }
+
+                try {
+                    val conn = DriverManager.getConnection(url)
+                    conn.createStatement().use { it.execute("LISTEN $CHANNEL") }
+                    val pg = conn.unwrap(PGConnection::class.java)
+                    println("✅ [PgTrackingBus] LISTEN $CHANNEL (cross-instance tracking enabled)")
+
+                    while (true) {
+                        val notifs = pg.notifications
+                        if (notifs != null) {
+                            for (n in notifs) {
+                                if (n.name != CHANNEL) continue
+                                val payload = n.parameter
+                                try {
+                                    val el = json.parseToJsonElement(payload).jsonObject
+                                    val sid = UUID.fromString(el["sessionId"]?.jsonPrimitive?.content)
+                                    val msg = el["msg"]?.jsonPrimitive?.content ?: continue
+                                    // deliver to local subscribers without re-publishing
+                                    kotlinx.coroutines.runBlocking {
+                                        TrackingHub.broadcastLocal(sid, msg, source = "pg")
+                                    }
+                                } catch (t: Throwable) {
+                                    println("⚠️ [PgTrackingBus] bad payload: ${t.message}")
+                                }
+                            }
+                        }
+                        Thread.sleep(75)
+                    }
+                } catch (t: Throwable) {
+                    println("❌ [PgTrackingBus] listener crashed: ${t.message}")
+                }
+            }.start()
+        }
+    }
+
+    fun publish(sessionId: UUID, msg: String) {
+        // publish a small envelope so all instances can route by sessionId
+        val payload = json.encodeToString(mapOf("sessionId" to sessionId.toString(), "msg" to msg))
+        try {
+            transaction {
+                // pg_notify(channel, payload)
+                queryOne("SELECT pg_notify('$CHANNEL', ?)", listOf(payload)) { _ -> true }
+            }
+        } catch (t: Throwable) {
+            println("⚠️ [PgTrackingBus] publish failed: ${t.message}")
+        }
     }
 }
 
@@ -425,7 +507,7 @@ fun Route.trackingRoutes() {
 
         requireSameCompany(sessionId, ctx.companyId)
 
-        val logId = insertAdminWatchLog(adminId, sessionId)
+        val logId = insertAdminWatchLog(ctx.companyId, adminId, sessionId)
         TrackingHub.subscribe(sessionId, this)
 
         try {
