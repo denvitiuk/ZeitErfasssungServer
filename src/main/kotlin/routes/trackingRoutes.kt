@@ -32,6 +32,19 @@ private val json = Json {
     ignoreUnknownKeys = true
 }
 
+@Serializable
+data class HelloEvent(
+    val type: String = "hello",
+    val sessionId: String,
+    val subscribers: Int
+)
+
+@Serializable
+data class PgEnvelope(
+    val sessionId: String,
+    val msg: String
+)
+
 // --- Simple HTTP exceptions (map via StatusPages in Application.module) -----
 class HttpStatusException(val status: HttpStatusCode, override val message: String) : RuntimeException(message)
 
@@ -171,10 +184,9 @@ private object TrackingHub {
             ws.send(
                 Frame.Text(
                     json.encodeToString(
-                        mapOf(
-                            "type" to "hello",
-                            "sessionId" to sessionId.toString(),
-                            "subscribers" to set.size
+                        HelloEvent(
+                            sessionId = sessionId.toString(),
+                            subscribers = set.size
                         )
                     )
                 )
@@ -301,7 +313,7 @@ private object PgTrackingBus {
 
     fun publish(sessionId: UUID, msg: String) {
         // publish a small envelope so all instances can route by sessionId
-        val payload = json.encodeToString(mapOf("sessionId" to sessionId.toString(), "msg" to msg))
+        val payload = json.encodeToString(PgEnvelope(sessionId = sessionId.toString(), msg = msg))
         try {
             transaction {
                 // pg_notify(channel, payload)
