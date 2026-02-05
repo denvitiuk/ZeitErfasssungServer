@@ -12,6 +12,7 @@ import io.ktor.server.websocket.*
 import io.ktor.websocket.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -43,6 +44,36 @@ data class HelloEvent(
 data class PgEnvelope(
     val sessionId: String,
     val msg: String
+)
+
+@Serializable
+data class AdminCommand(
+    val type: String,
+    val sessionId: String? = null
+)
+
+@Serializable
+data class UserCommand(
+    val type: String,
+    val sessionId: String
+)
+
+@Serializable
+data class RefreshRequestedEvent(
+    val type: String = "refresh_requested",
+    val sessionId: String,
+    val adminId: Long,
+    val tsEpochSeconds: Long
+)
+
+@Serializable
+data class TrackPointDto(
+    val pointId: Long,
+    val lat: Double,
+    val lon: Double,
+    val speedMps: Float? = null,
+    val headingDeg: Float? = null,
+    val ts: String
 )
 
 // --- Simple HTTP exceptions (map via StatusPages in Application.module) -----
@@ -352,6 +383,7 @@ data class PointEvent(
     val type: String = "point",
     val sessionId: String,
     val userId: Long,
+    val pointId: Long,
     val lat: Double,
     val lon: Double,
     val speedMps: Float? = null,
@@ -458,20 +490,21 @@ fun Route.trackingRoutes() {
 
             val ts = req.tsEpochSeconds ?: Instant.now().epochSecond
             val tsIso = Instant.ofEpochSecond(ts).toString()
-
-            transaction {
-                execUpdate(
+            val pointId: Long = transaction {
+                queryOne(
                     """
                     INSERT INTO tracking_points (session_id, latitude, longitude, speed_mps, heading_deg, ts)
                     VALUES (?, ?, ?, ?::real, ?::real, ?::timestamptz)
+                    RETURNING id
                     """.trimIndent(),
                     listOf(sessionId, req.lat, req.lon, req.speedMps, req.headingDeg, tsIso)
-                )
+                ) { rs -> rs.getLong("id") }!!
             }
 
             val evt = PointEvent(
                 sessionId = sessionId.toString(),
                 userId = userId,
+                pointId = pointId,
                 lat = req.lat,
                 lon = req.lon,
                 speedMps = req.speedMps,
@@ -523,6 +556,59 @@ fun Route.trackingRoutes() {
 
             call.respond(rows)
         }
+
+        // ADMIN: fetch stored points for a session (history / recovery)
+        get("/sessions/{id}/points") {
+            val adminId = call.requireUserId()
+            val ctx = loadUserContext(adminId)
+            requireAdmin(ctx)
+
+            val sessionId = UUID.fromString(call.parameters["id"] ?: throw BadRequestException("Missing id"))
+            requireSameCompany(sessionId, ctx.companyId)
+
+            val limit = (call.request.queryParameters["limit"]?.toIntOrNull() ?: 1000).coerceIn(1, 5000)
+            val afterPointId = call.request.queryParameters["afterPointId"]?.toLongOrNull() ?: 0L
+
+            val rows = transaction {
+                val stmt = connection.prepareStatement(
+                    """
+                    SELECT id, latitude, longitude, speed_mps, heading_deg, ts
+                    FROM tracking_points
+                    WHERE session_id = ? AND id > ?
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """.trimIndent(),
+                    false
+                )
+                try {
+                    stmt.set(1, sessionId)
+                    stmt.set(2, afterPointId)
+                    stmt.set(3, limit)
+
+                    val rs = stmt.executeQuery()
+                    rs.use {
+                        val out = mutableListOf<TrackPointDto>()
+                        while (it.next()) {
+                            out.add(
+                                TrackPointDto(
+                                    pointId = it.getLong("id"),
+                                    lat = it.getDouble("latitude"),
+                                    lon = it.getDouble("longitude"),
+                                    speedMps = it.getObject("speed_mps")?.let { _ -> it.getFloat("speed_mps") },
+                                    headingDeg = it.getObject("heading_deg")?.let { _ -> it.getFloat("heading_deg") },
+                                    ts = it.getString("ts")
+                                )
+                            )
+                        }
+                        out
+                    }
+                } finally {
+                    stmt.closeIfPossible()
+                }
+            }
+
+            call.respond(rows)
+        }
     }
 
     // ADMIN: WebSocket stream for a specific sessionId
@@ -544,11 +630,111 @@ fun Route.trackingRoutes() {
         try {
             for (frame in incoming) {
                 if (frame is Frame.Close) break
+
+                if (frame is Frame.Text) {
+                    val txt = frame.readText()
+                    try {
+                        val cmd = json.decodeFromString(AdminCommand.serializer(), txt)
+                        val t = cmd.type
+                        if (t == "refresh" || t == "request_location_now") {
+                            println("🔁 [ws/admin-tracking] refresh command adminId=${adminId} sessionId=${sessionId}")
+
+                            // forward to user socket (if connected)
+                            UserHub.requestRefresh(sessionId)
+
+                            // optional: notify admins that refresh was requested
+                            val evt = RefreshRequestedEvent(
+                                sessionId = sessionId.toString(),
+                                adminId = adminId,
+                                tsEpochSeconds = Instant.now().epochSecond
+                            )
+                            TrackingHub.broadcastLocal(sessionId, json.encodeToString(evt), source = "local")
+                        }
+                    } catch (_: Throwable) {
+                        // ignore non-command payloads
+                    }
+                }
             }
         } finally {
             println("🧷 [ws/admin-tracking] CLOSE sessionId=${sessionId} adminId=${adminId}")
             TrackingHub.unsubscribe(sessionId, this)
             closeAdminWatchLog(logId)
+        }
+    }
+
+    // USER: WebSocket for live commands (e.g., admin requests immediate location refresh)
+    webSocket("/ws/user-tracking") {
+        val sessionIdStr = call.request.queryParameters["sessionId"]
+            ?: throw BadRequestException("Missing sessionId")
+        val sessionId = UUID.fromString(sessionIdStr)
+
+        val userId = call.requireUserId()
+        requireOwnedActiveSession(sessionId, userId)
+
+        println("🧷 [ws/user-tracking] OPEN sessionId=${sessionId} userId=${userId}")
+        UserHub.attach(sessionId, this)
+
+        try {
+            for (frame in incoming) {
+                if (frame is Frame.Close) break
+                // (optional) ignore user->server messages for now
+            }
+        } finally {
+            println("🧷 [ws/user-tracking] CLOSE sessionId=${sessionId} userId=${userId}")
+            UserHub.detach(sessionId, this)
+        }
+    }
+}
+
+private object UserHub {
+    // sessionId -> user websocket (local to this instance; 1 active connection per session)
+    private val userWs = ConcurrentHashMap<UUID, DefaultWebSocketServerSession>()
+
+    suspend fun attach(sessionId: UUID, ws: DefaultWebSocketServerSession) {
+        // ensure postgres listener is running so cross-instance admin sockets also work
+        PgTrackingBus.ensureStarted()
+
+        userWs[sessionId] = ws
+        println("👤 [UserHub] attach session=${sessionId} userSockets=${userWs.size}")
+
+        // ACK for debugging
+        try {
+            ws.send(
+                Frame.Text(
+                    json.encodeToString(
+                        UserCommand(type = "hello_user", sessionId = sessionId.toString())
+                    )
+                )
+            )
+        } catch (t: Throwable) {
+            println("❌ [UserHub] hello_user send failed: ${t.message}")
+        }
+    }
+
+    fun detach(sessionId: UUID, ws: DefaultWebSocketServerSession) {
+        if (userWs[sessionId] === ws) {
+            userWs.remove(sessionId)
+        }
+        println("👤 [UserHub] detach session=${sessionId} userSockets=${userWs.size}")
+    }
+
+    suspend fun requestRefresh(sessionId: UUID) {
+        val ws = userWs[sessionId]
+        if (ws == null) {
+            println("⚠️ [UserHub] refresh requested but no user socket session=${sessionId}")
+            return
+        }
+        try {
+            ws.send(
+                Frame.Text(
+                    json.encodeToString(
+                        UserCommand(type = "request_location_now", sessionId = sessionId.toString())
+                    )
+                )
+            )
+            println("📨 [UserHub] request_location_now sent session=${sessionId}")
+        } catch (t: Throwable) {
+            println("❌ [UserHub] request_location_now failed: ${t.message}")
         }
     }
 }
