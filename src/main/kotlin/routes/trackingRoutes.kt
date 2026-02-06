@@ -403,6 +403,7 @@ data class StoppedEvent(
 data class ActiveSessionDto(
     val sessionId: String,
     val userId: Long,
+    val userName: String,
     val startedAt: String
 )
 
@@ -526,10 +527,15 @@ fun Route.trackingRoutes() {
             val rows = transaction {
                 val stmt = connection.prepareStatement(
                     """
-                    SELECT id, user_id, started_at
-                    FROM tracking_sessions
-                    WHERE company_id = ? AND is_active = TRUE
-                    ORDER BY started_at DESC
+                    SELECT
+                      s.id,
+                      s.user_id,
+                      TRIM(CONCAT(u.first_name, ' ', u.last_name)) AS user_name,
+                      s.started_at
+                    FROM tracking_sessions s
+                    JOIN users u ON u.id = s.user_id
+                    WHERE s.company_id = ? AND s.is_active = TRUE
+                    ORDER BY s.started_at DESC
                     """.trimIndent(),
                     false
                 )
@@ -543,6 +549,7 @@ fun Route.trackingRoutes() {
                                 ActiveSessionDto(
                                     sessionId = it.getObject("id", UUID::class.java).toString(),
                                     userId = it.getLong("user_id"),
+                                    userName = it.getString("user_name"),
                                     startedAt = it.getString("started_at")
                                 )
                             )
