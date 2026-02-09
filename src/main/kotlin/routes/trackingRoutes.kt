@@ -24,6 +24,7 @@ import java.sql.ResultSet
 import java.sql.DriverManager
 import java.util.Properties
 import java.time.Instant
+import java.time.LocalDate
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import org.postgresql.PGConnection
@@ -407,6 +408,17 @@ data class ActiveSessionDto(
     val startedAt: String
 )
 
+@Serializable
+data class AdminSessionDto(
+    val sessionId: String,
+    val userId: Long,
+    val userName: String,
+    val startedAt: String,
+    val endedAt: String? = null,
+    val isActive: Boolean,
+    val lastPointTs: String? = null
+)
+
 fun Route.trackingRoutes() {
     route("/tracking") {
 
@@ -518,6 +530,76 @@ fun Route.trackingRoutes() {
             call.respond(HttpStatusCode.OK)
         }
 
+        // ADMIN: list sessions for a specific day (history). Date is in YYYY-MM-DD.
+        // Returns both active and stopped sessions started on that date, scoped to admin's company.
+        get("/sessions") {
+            val adminId = call.requireUserId()
+            val ctx = loadUserContext(adminId)
+            requireAdmin(ctx)
+
+            val dateStr = call.request.queryParameters["date"]
+                ?: throw BadRequestException("Missing date (YYYY-MM-DD)")
+
+            // basic validation
+            try { LocalDate.parse(dateStr) } catch (_: Throwable) {
+                throw BadRequestException("Invalid date format. Expected YYYY-MM-DD")
+            }
+
+            val rows = transaction {
+                val stmt = connection.prepareStatement(
+                    """
+                    SELECT
+                      s.id,
+                      s.user_id,
+                      TRIM(CONCAT(u.first_name, ' ', u.last_name)) AS user_name,
+                      s.started_at,
+                      s.ended_at,
+                      s.is_active,
+                      (
+                        SELECT MAX(p.ts)
+                        FROM tracking_points p
+                        WHERE p.session_id = s.id
+                      ) AS last_point_ts
+                    FROM tracking_sessions s
+                    JOIN users u ON u.id = s.user_id
+                    WHERE s.company_id = ?
+                      AND s.started_at >= (?::date)
+                      AND s.started_at < ((?::date) + interval '1 day')
+                    ORDER BY s.started_at DESC
+                    """.trimIndent(),
+                    false
+                )
+                try {
+                    stmt.set(1, ctx.companyId)
+                    stmt.set(2, dateStr)
+                    stmt.set(3, dateStr)
+
+                    val rs = stmt.executeQuery()
+                    rs.use {
+                        val out = mutableListOf<AdminSessionDto>()
+                        while (it.next()) {
+                            out.add(
+                                AdminSessionDto(
+                                    sessionId = it.getObject("id", UUID::class.java).toString(),
+                                    userId = it.getLong("user_id"),
+                                    userName = it.getString("user_name"),
+                                    startedAt = it.getString("started_at"),
+                                    endedAt = it.getString("ended_at"),
+                                    isActive = it.getBoolean("is_active"),
+                                    lastPointTs = it.getString("last_point_ts")
+                                )
+                            )
+                        }
+                        out
+                    }
+                } finally {
+                    stmt.closeIfPossible()
+                }
+            }
+
+            call.respond(rows)
+        }
+
         // ADMIN: list active sessions in same company
         get("/sessions/active") {
             val userId = call.requireUserId()
@@ -531,7 +613,12 @@ fun Route.trackingRoutes() {
                       s.id,
                       s.user_id,
                       TRIM(CONCAT(u.first_name, ' ', u.last_name)) AS user_name,
-                      s.started_at
+                      s.started_at,
+                      (
+                        SELECT MAX(p.ts)
+                        FROM tracking_points p
+                        WHERE p.session_id = s.id
+                      ) AS last_point_ts
                     FROM tracking_sessions s
                     JOIN users u ON u.id = s.user_id
                     WHERE s.company_id = ? AND s.is_active = TRUE
