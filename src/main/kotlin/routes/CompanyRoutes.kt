@@ -21,7 +21,7 @@ import com.yourcompany.zeiterfassung.models.PauseSessions
 import java.time.*
 
 import com.yourcompany.zeiterfassung.db.Users
-import io.ktor.server.application.log
+import io.ktor.server.application.*
 import org.jetbrains.exposed.dao.id.EntityID
 import org.jetbrains.exposed.sql.SortOrder
 
@@ -995,27 +995,74 @@ fun Route.companiesRoutes() {
             }
         }
 
-        // POST /companies (authenticated, global admin only)
+        // POST /companies — create company.
+        // Allowed for:
+        //  - global admin
+        //  - a user who is not yet attached to any company (companyId==0/null) => becomes company admin
         authenticate("bearerAuth") {
+            // Insert after /self block, before invite-code endpoints
             post {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Missing token"))
+
                 val isGlobalAdmin = principal.payload.getClaim("isGlobalAdmin").asBoolean() ?: false
-                if (!isGlobalAdmin) {
-                    return@post call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Global admin rights required"))
+
+                // user id is stored in token as "id" (sometimes string)
+                val userId: Int = runCatching { principal.payload.getClaim("id")?.asString()?.toInt() }.getOrNull()
+                    ?: runCatching { principal.payload.getClaim("id")?.asInt() }.getOrNull()
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Token has no user id"))
+
+                // companyId from token (0 means not in company yet)
+                val tokenCompanyId = principal.payload.getClaim("companyId").asInt() ?: 0
+
+                if (!isGlobalAdmin && tokenCompanyId > 0) {
+                    return@post call.respond(
+                        HttpStatusCode.Forbidden,
+                        ApiError("forbidden", "You already belong to a company")
+                    )
                 }
 
                 try {
                     val req = call.receive<CompanyRequest>()
                     val normalizedName = normalizeCompanyName(req.name)
                     if (!isValidCompanyName(normalizedName)) {
-                        return@post call.respond(HttpStatusCode.BadRequest, ApiError("invalid_name", "Name must be 2–80 chars; letters/digits/spaces and - & . ' ( ) _ / , : allowed"))
+                        return@post call.respond(
+                            HttpStatusCode.BadRequest,
+                            ApiError(
+                                "invalid_name",
+                                "Name must be 2–80 chars; letters/digits/spaces and - & . ' ( ) _ / , : allowed"
+                            )
+                        )
                     }
 
                     val newCompany = transaction {
+                        // For non-global-admin: double-check DB state (prevents capture if token is stale)
+                        if (!isGlobalAdmin) {
+                            val dbCompanyId = Users
+                                .slice(Users.companyId)
+                                .select { Users.id eq EntityID(userId, Users) }
+                                .map { it[Users.companyId]?.value ?: 0 }
+                                .singleOrNull() ?: 0
+
+                            if (dbCompanyId > 0) {
+                                throw IllegalStateException("user_already_in_company")
+                            }
+                        }
+
+                        val newCode = normalizeCode(java.util.UUID.randomUUID().toString().replace("-", "").take(16))
+
                         val id = Companies.insert {
                             it[Companies.name] = normalizedName
+                            it[Companies.inviteCode] = newCode
                         } get Companies.id
+
+                        // Attach creator as company admin (only for the self-registration flow)
+                        if (!isGlobalAdmin) {
+                            Users.update({ Users.id eq EntityID(userId, Users) }) {
+                                it[companyId] = EntityID(id.value, Companies)
+                                it[isCompanyAdmin] = true
+                            }
+                        }
 
                         Companies.select { Companies.id eq id }
                             .map {
@@ -1031,6 +1078,15 @@ fun Route.companiesRoutes() {
 
                     call.respond(HttpStatusCode.Created, newCompany)
 
+                } catch (e: IllegalStateException) {
+                    if (e.message == "user_already_in_company") {
+                        return@post call.respond(
+                            HttpStatusCode.Forbidden,
+                            ApiError("forbidden", "You already belong to a company")
+                        )
+                    }
+                    call.application.log.error("Unexpected state on company create", e)
+                    call.respond(HttpStatusCode.InternalServerError, ApiError("internal_error"))
                 } catch (e: ContentTransformationException) {
                     call.respond(HttpStatusCode.BadRequest, ApiError("invalid_request", "Invalid request format"))
                 } catch (e: ExposedSQLException) {
@@ -1039,9 +1095,6 @@ fun Route.companiesRoutes() {
                     }
                     call.application.log.error("Database error on company create", e)
                     call.respond(HttpStatusCode.BadRequest, ApiError("db_error"))
-                } catch (e: IllegalStateException) {
-                    call.application.log.error("Unexpected state on company create", e)
-                    call.respond(HttpStatusCode.InternalServerError, ApiError("internal_error"))
                 } catch (e: Exception) {
                     call.application.log.error("Unexpected error on company create", e)
                     call.respond(HttpStatusCode.InternalServerError, ApiError("internal_error"))
