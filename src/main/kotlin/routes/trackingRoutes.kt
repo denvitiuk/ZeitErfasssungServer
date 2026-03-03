@@ -423,6 +423,7 @@ data class AdminSessionDto(
 @Serializable
 data class UserSessionDto(
     val sessionId: String,
+    val userId: Long,
     val startedAt: String,
     val endedAt: String? = null,
     val isActive: Boolean,
@@ -541,9 +542,11 @@ fun Route.trackingRoutes() {
         }
 
         // USER: list own sessions for a specific day (history). Date is in YYYY-MM-DD.
-        // Includes both active and stopped sessions started on that date.
+        // Includes sessions that OVERLAP the day (started before midnight but ended today, etc.).
+        // Debug helper: if caller is admin, can pass ?userId=38 to inspect an employee.
         get("/me/sessions") {
-            val userId = call.requireUserId()
+            val callerId = call.requireUserId()
+            val callerCtx = loadUserContext(callerId)
 
             val dateStr = call.request.queryParameters["date"]
                 ?: throw BadRequestException("Missing date (YYYY-MM-DD)")
@@ -553,11 +556,20 @@ fun Route.trackingRoutes() {
                 throw BadRequestException("Invalid date format. Expected YYYY-MM-DD")
             }
 
+            val requestedUserId = call.request.queryParameters["userId"]?.toLongOrNull()
+            val targetUserId: Long = if (requestedUserId != null) {
+                requireAdmin(callerCtx)
+                requestedUserId
+            } else {
+                callerId
+            }
+
             val rows = transaction {
                 val stmt = connection.prepareStatement(
                     """
                     SELECT
                       s.id,
+                      s.user_id,
                       s.started_at,
                       s.ended_at,
                       s.is_active,
@@ -568,14 +580,15 @@ fun Route.trackingRoutes() {
                       ) AS last_point_ts
                     FROM tracking_sessions s
                     WHERE s.user_id = ?
-                      AND s.started_at >= (?::date)
+                      -- Overlap filter: session intersects [dayStart, dayEnd)
                       AND s.started_at < ((?::date) + interval '1 day')
+                      AND COALESCE(s.ended_at, now()) >= (?::date)
                     ORDER BY s.started_at DESC
                     """.trimIndent(),
                     false
                 )
                 try {
-                    stmt.set(1, userId)
+                    stmt.set(1, targetUserId)
                     stmt.set(2, dateStr)
                     stmt.set(3, dateStr)
 
@@ -586,6 +599,7 @@ fun Route.trackingRoutes() {
                             out.add(
                                 UserSessionDto(
                                     sessionId = it.getObject("id", UUID::class.java).toString(),
+                                    userId = it.getLong("user_id"),
                                     startedAt = it.getString("started_at"),
                                     endedAt = it.getString("ended_at"),
                                     isActive = it.getBoolean("is_active"),
