@@ -1,4 +1,3 @@
-
 // src/main/kotlin/com/yourcompany/zeiterfassung/routes/PauseRoutes.kt
 package com.yourcompany.zeiterfassung.routes
 
@@ -14,8 +13,9 @@ import com.yourcompany.zeiterfassung.dto.PauseResponse
 import io.ktor.http.HttpStatusCode
 import java.time.Instant
 import java.time.LocalDateTime
-import java.time.ZoneId
 import java.time.LocalTime
+import java.time.ZoneId
+import java.time.ZoneOffset
 
 fun Route.pauseRoutes() {
     authenticate("bearerAuth") {
@@ -23,10 +23,12 @@ fun Route.pauseRoutes() {
             // POST /api/pause/start
             post("/start") {
                 val userId = call.principal<JWTPrincipal>()!!.payload.getClaim("id").asString().toInt()
-                val now = LocalDateTime.ofInstant(Instant.now(), ZoneId.systemDefault())
+                val nowInstant = Instant.now()
+                val nowBerlin = LocalDateTime.ofInstant(nowInstant, ZoneId.of("Europe/Berlin"))
+                val nowUtc = LocalDateTime.ofInstant(nowInstant, ZoneOffset.UTC)
 
                 // Allow pause only between 12:00 and 13:00
-                val nowTime = now.toLocalTime()
+                val nowTime = nowBerlin.toLocalTime()
                 val lunchStart = LocalTime.of(12, 0)
                 val lunchEnd = LocalTime.of(13, 0)
                 if (nowTime.isBefore(lunchStart) || nowTime.isAfter(lunchEnd)) {
@@ -40,7 +42,7 @@ fun Route.pauseRoutes() {
                 val sessionId = transaction {
                     PauseSessions.insertAndGetId { row ->
                         row[PauseSessions.userId] = userId
-                        row[PauseSessions.startedAt] = now
+                        row[PauseSessions.startedAt] = nowUtc
                         row[PauseSessions.isActive] = true
                     }.value
                 }
@@ -49,7 +51,7 @@ fun Route.pauseRoutes() {
                     PauseResponse(
                         status = "started",
                         sessionId = sessionId,
-                        timestamp = Instant.now().toString()
+                        timestamp = nowInstant.toString()
                     )
                 )
             }
@@ -57,13 +59,14 @@ fun Route.pauseRoutes() {
             // POST /api/pause/stop
             post("/stop") {
                 val userId = call.principal<JWTPrincipal>()!!.payload.getClaim("id").asString().toInt()
-                val now = LocalDateTime.ofInstant(Instant.now(), ZoneId.systemDefault())
+                val nowInstant = Instant.now()
+                val nowUtc = LocalDateTime.ofInstant(nowInstant, ZoneOffset.UTC)
 
                 val updated = transaction {
                     PauseSessions.update({
                         (PauseSessions.userId eq userId) and (PauseSessions.isActive eq true)
                     }) { row ->
-                        row[PauseSessions.endedAt] = now
+                        row[PauseSessions.endedAt] = nowUtc
                         row[PauseSessions.isActive] = false
                     }
                 }
@@ -73,7 +76,7 @@ fun Route.pauseRoutes() {
                         PauseResponse(
                             status = "stopped",
                             sessionId = null,
-                            timestamp = Instant.now().toString()
+                            timestamp = nowInstant.toString()
                         )
                     )
                 } else {

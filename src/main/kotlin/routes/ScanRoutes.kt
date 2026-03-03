@@ -66,10 +66,14 @@ fun Route.scanRoutes() {
                 val projectIdFromHeader = call.request.headers["X-Project-Id"]?.toIntOrNull()
                 val resolvedProjectId = projectIdFromQuery ?: projectIdFromHeader
 
-                // Определяем начало сегодняшнего дня в зоне пользователя
-                val todayStart = LocalDate.now(zone).atStartOfDay(zone).toLocalDateTime()
+                // Определяем начало сегодняшнего дня в зоне пользователя,
+                // но переводим его в UTC, потому что в БД мы храним timestamp как UTC.
+                val todayStartUtc = LocalDate.now(zone)
+                    .atStartOfDay(zone)
+                    .toInstant()
+                    .let { LocalDateTime.ofInstant(it, ZoneOffset.UTC) }
 
-                val baseCond = (Logs.userId eq userId) and (Logs.timestamp greaterEq todayStart)
+                val baseCond = (Logs.userId eq userId) and (Logs.timestamp greaterEq todayStartUtc)
                 val cond = if (resolvedProjectId != null) {
                     baseCond and (Logs.projectId eq EntityID(resolvedProjectId, Projects))
                 } else baseCond
@@ -87,12 +91,13 @@ fun Route.scanRoutes() {
                     it[Logs.userId]        = userId
                     it[Logs.terminalNonce] = req.nonce
                     it[Logs.action]        = action
-                    it[Logs.timestamp]     = LocalDateTime.ofInstant(now, zone)
+                    // IMPORTANT: store UTC in DB to avoid timezone shifts (Berlin/Kyiv/etc.)
+                    it[Logs.timestamp]     = LocalDateTime.ofInstant(now, ZoneOffset.UTC)
                     it[Logs.latitude]      = req.latitude
                     it[Logs.longitude]     = req.longitude
                     it[Logs.locationDesc]  = req.locationDescription
                     if (resolvedProjectId != null) {
-                        it[Logs.projectId] = EntityID(resolvedProjectId!!, Projects)
+                        it[Logs.projectId] = EntityID(resolvedProjectId, Projects)
                     }
                 }
 
