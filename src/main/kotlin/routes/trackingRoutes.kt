@@ -420,6 +420,15 @@ data class AdminSessionDto(
     val lastPointTs: String? = null
 )
 
+@Serializable
+data class UserSessionDto(
+    val sessionId: String,
+    val startedAt: String,
+    val endedAt: String? = null,
+    val isActive: Boolean,
+    val lastPointTs: String? = null
+)
+
 fun Route.trackingRoutes() {
     route("/tracking") {
 
@@ -529,6 +538,128 @@ fun Route.trackingRoutes() {
             println("🛰️ [tracking/points] userId=${userId} sessionId=${sessionId} lat=${req.lat} lon=${req.lon}")
 
             call.respond(HttpStatusCode.OK)
+        }
+
+        // USER: list own sessions for a specific day (history). Date is in YYYY-MM-DD.
+        // Includes both active and stopped sessions started on that date.
+        get("/me/sessions") {
+            val userId = call.requireUserId()
+
+            val dateStr = call.request.queryParameters["date"]
+                ?: throw BadRequestException("Missing date (YYYY-MM-DD)")
+
+            // basic validation
+            try { LocalDate.parse(dateStr) } catch (_: Throwable) {
+                throw BadRequestException("Invalid date format. Expected YYYY-MM-DD")
+            }
+
+            val rows = transaction {
+                val stmt = connection.prepareStatement(
+                    """
+                    SELECT
+                      s.id,
+                      s.started_at,
+                      s.ended_at,
+                      s.is_active,
+                      (
+                        SELECT MAX(p.ts)
+                        FROM tracking_points p
+                        WHERE p.session_id = s.id
+                      ) AS last_point_ts
+                    FROM tracking_sessions s
+                    WHERE s.user_id = ?
+                      AND s.started_at >= (?::date)
+                      AND s.started_at < ((?::date) + interval '1 day')
+                    ORDER BY s.started_at DESC
+                    """.trimIndent(),
+                    false
+                )
+                try {
+                    stmt.set(1, userId)
+                    stmt.set(2, dateStr)
+                    stmt.set(3, dateStr)
+
+                    val rs = stmt.executeQuery()
+                    rs.use {
+                        val out = mutableListOf<UserSessionDto>()
+                        while (it.next()) {
+                            out.add(
+                                UserSessionDto(
+                                    sessionId = it.getObject("id", UUID::class.java).toString(),
+                                    startedAt = it.getString("started_at"),
+                                    endedAt = it.getString("ended_at"),
+                                    isActive = it.getBoolean("is_active"),
+                                    lastPointTs = it.getString("last_point_ts")
+                                )
+                            )
+                        }
+                        out
+                    }
+                } finally {
+                    stmt.closeIfPossible()
+                }
+            }
+
+            call.respond(rows)
+        }
+
+        // USER: fetch stored points for OWN session (history / recovery)
+        get("/me/sessions/{id}/points") {
+            val userId = call.requireUserId()
+            val sessionId = UUID.fromString(call.parameters["id"] ?: throw BadRequestException("Missing id"))
+
+            // Ownership check (no company/admin required)
+            transaction {
+                val owner = queryOne(
+                    "SELECT user_id FROM tracking_sessions WHERE id = ?",
+                    listOf(sessionId)
+                ) { rs -> rs.getLong("user_id") } ?: notFound("Session not found")
+
+                if (owner != userId) forbidden("Not your session")
+            }
+
+            val limit = (call.request.queryParameters["limit"]?.toIntOrNull() ?: 1000).coerceIn(1, 5000)
+            val afterPointId = call.request.queryParameters["afterPointId"]?.toLongOrNull() ?: 0L
+
+            val rows = transaction {
+                val stmt = connection.prepareStatement(
+                    """
+                    SELECT id, latitude, longitude, speed_mps, heading_deg, ts
+                    FROM tracking_points
+                    WHERE session_id = ? AND id > ?
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """.trimIndent(),
+                    false
+                )
+                try {
+                    stmt.set(1, sessionId)
+                    stmt.set(2, afterPointId)
+                    stmt.set(3, limit)
+
+                    val rs = stmt.executeQuery()
+                    rs.use {
+                        val out = mutableListOf<TrackPointDto>()
+                        while (it.next()) {
+                            out.add(
+                                TrackPointDto(
+                                    pointId = it.getLong("id"),
+                                    lat = it.getDouble("latitude"),
+                                    lon = it.getDouble("longitude"),
+                                    speedMps = it.getObject("speed_mps")?.let { _ -> it.getFloat("speed_mps") },
+                                    headingDeg = it.getObject("heading_deg")?.let { _ -> it.getFloat("heading_deg") },
+                                    ts = it.getString("ts")
+                                )
+                            )
+                        }
+                        out
+                    }
+                } finally {
+                    stmt.closeIfPossible()
+                }
+            }
+
+            call.respond(rows)
         }
 
         // ADMIN: list sessions for a specific day (history). Date is in YYYY-MM-DD.
