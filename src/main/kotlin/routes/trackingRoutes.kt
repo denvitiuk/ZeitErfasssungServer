@@ -405,7 +405,8 @@ data class ActiveSessionDto(
     val sessionId: String,
     val userId: Long,
     val userName: String,
-    val startedAt: String
+    val startedAt: String,
+    val effectiveStartedAt: String? = null
 )
 
 @Serializable
@@ -546,6 +547,38 @@ fun Route.trackingRoutes() {
             }
 
             val rows = transaction {
+                // Auto-heal: if attendance logs say the user is OUT, the tracking session must not remain active.
+                // This prevents "zombie" active sessions (e.g. 98 hours) when stop was not called.
+                execUpdate(
+                    """
+                    WITH last_log AS (
+                      SELECT
+                        l.user_id,
+                        MAX(l."timestamp") AS last_ts,
+                        (ARRAY_AGG(l.action ORDER BY l."timestamp" DESC))[1] AS last_action
+                      FROM logs l
+                      GROUP BY l.user_id
+                    ),
+                    last_out AS (
+                      SELECT user_id, MAX("timestamp") AS last_out_ts
+                      FROM logs
+                      WHERE action = 'out'
+                      GROUP BY user_id
+                    )
+                    UPDATE tracking_sessions s
+                    SET
+                      is_active = FALSE,
+                      ended_at = COALESCE(o.last_out_ts, now())
+                    FROM last_log ll
+                    LEFT JOIN last_out o ON o.user_id = ll.user_id
+                    WHERE s.company_id = ?
+                      AND s.is_active = TRUE
+                      AND s.user_id = ll.user_id
+                      AND ll.last_action = 'out'
+                    """.trimIndent(),
+                    listOf(ctx.companyId)
+                )
+
                 val stmt = connection.prepareStatement(
                     """
                     SELECT
@@ -618,7 +651,22 @@ fun Route.trackingRoutes() {
                         SELECT MAX(p.ts)
                         FROM tracking_points p
                         WHERE p.session_id = s.id
-                      ) AS last_point_ts
+                      ) AS last_point_ts,
+                      (
+                        SELECT MAX(l."timestamp")
+                        FROM logs l
+                        WHERE l.user_id = s.user_id
+                          AND l.action = 'in'
+                          AND l."timestamp" > COALESCE(
+                            (
+                              SELECT MAX(l2."timestamp")
+                              FROM logs l2
+                              WHERE l2.user_id = s.user_id
+                                AND l2.action = 'out'
+                            ),
+                            '1970-01-01'::timestamptz
+                          )
+                      ) AS effective_started_at
                     FROM tracking_sessions s
                     JOIN users u ON u.id = s.user_id
                     WHERE s.company_id = ? AND s.is_active = TRUE
@@ -637,7 +685,8 @@ fun Route.trackingRoutes() {
                                     sessionId = it.getObject("id", UUID::class.java).toString(),
                                     userId = it.getLong("user_id"),
                                     userName = it.getString("user_name"),
-                                    startedAt = it.getString("started_at")
+                                    startedAt = it.getString("started_at"),
+                                    effectiveStartedAt = it.getString("effective_started_at")
                                 )
                             )
                         }
