@@ -420,6 +420,7 @@ data class AdminSessionDto(
     val lastPointTs: String? = null
 )
 
+
 @Serializable
 data class UserSessionDto(
     val sessionId: String,
@@ -428,6 +429,39 @@ data class UserSessionDto(
     val endedAt: String? = null,
     val isActive: Boolean,
     val lastPointTs: String? = null
+)
+
+@Serializable
+data class TimesheetDetailedSessionDto(
+    val start: String,
+    val end: String? = null,
+    val minutes: Int
+)
+
+@Serializable
+data class TimesheetDetailedDayDto(
+    val day: Int,
+    val start: String? = null,
+    val end: String? = null,
+    val minutes: Int,
+    val sessionCount: Int,
+    val sessions: List<TimesheetDetailedSessionDto>
+)
+
+@Serializable
+data class TimesheetDetailedEmployeeDto(
+    val id: Long,
+    val name: String,
+    val days: List<TimesheetDetailedDayDto>
+)
+
+@Serializable
+data class TimesheetDetailedResponseDto(
+    val companyId: Int,
+    val companyName: String,
+    val companyTimeZone: String,
+    val month: String,
+    val employees: List<TimesheetDetailedEmployeeDto>
 )
 
 fun Route.trackingRoutes() {
@@ -776,6 +810,152 @@ fun Route.trackingRoutes() {
             }
 
             call.respond(rows)
+        }
+
+        // ADMIN: detailed monthly timesheet data for PDF/export.
+        // Returns company metadata plus raw session intervals grouped by employee and day.
+        get("/timesheet-detailed") {
+            val adminId = call.requireUserId()
+            val ctx = loadUserContext(adminId)
+            requireAdmin(ctx)
+
+            val month = call.request.queryParameters["month"]
+                ?: throw BadRequestException("Missing month (YYYY-MM)")
+            val tz = call.request.queryParameters["tz"]?.takeIf { it.isNotBlank() } ?: "Europe/Berlin"
+
+            val monthStart = try {
+                java.time.YearMonth.parse(month).atDay(1)
+            } catch (_: Throwable) {
+                throw BadRequestException("Invalid month format. Expected YYYY-MM")
+            }
+            val monthEndExclusive = monthStart.plusMonths(1)
+
+            val companyName = transaction {
+                queryOne(
+                    "SELECT name FROM companies WHERE id = ?",
+                    listOf(ctx.companyId)
+                ) { rs -> rs.getString("name") } ?: "Company ${ctx.companyId}"
+            }
+
+            data class RawRow(
+                val userId: Long,
+                val userName: String,
+                val startedAt: java.time.OffsetDateTime,
+                val endedAt: java.time.OffsetDateTime?
+            )
+
+            val zoneId = try {
+                java.time.ZoneId.of(tz)
+            } catch (_: Throwable) {
+                java.time.ZoneId.of("Europe/Berlin")
+            }
+
+            val rawRows: List<RawRow> = transaction {
+                val stmt = connection.prepareStatement(
+                    """
+                    SELECT
+                      s.user_id,
+                      TRIM(CONCAT(u.first_name, ' ', u.last_name)) AS user_name,
+                      s.started_at,
+                      s.ended_at
+                    FROM tracking_sessions s
+                    JOIN users u ON u.id = s.user_id
+                    WHERE s.company_id = ?
+                      AND s.started_at < (?::date)
+                      AND COALESCE(s.ended_at, now()) >= (?::date)
+                    ORDER BY s.user_id ASC, s.started_at ASC
+                    """.trimIndent(),
+                    false
+                )
+                try {
+                    stmt.set(1, ctx.companyId)
+                    stmt.set(2, monthEndExclusive.toString())
+                    stmt.set(3, monthStart.toString())
+
+                    val rs = stmt.executeQuery()
+                    rs.use {
+                        val out = mutableListOf<RawRow>()
+                        while (it.next()) {
+                            val started = it.getObject("started_at", java.time.OffsetDateTime::class.java)
+                            val ended = it.getObject("ended_at", java.time.OffsetDateTime::class.java)
+                            out.add(
+                                RawRow(
+                                    userId = it.getLong("user_id"),
+                                    userName = it.getString("user_name"),
+                                    startedAt = started,
+                                    endedAt = ended
+                                )
+                            )
+                        }
+                        out
+                    }
+                } finally {
+                    stmt.closeIfPossible()
+                }
+            }
+
+            val outTimeFormatter = java.time.format.DateTimeFormatter.ofPattern("HH:mm")
+
+            val employees = rawRows
+                .groupBy { it.userId to it.userName }
+                .map { (userPair, rows) ->
+                    val dayGroups = rows.groupBy { row ->
+                        row.startedAt.atZoneSameInstant(zoneId).dayOfMonth
+                    }
+
+                    val days = dayGroups
+                        .map { (day, dayRows) ->
+                            val parsed = dayRows
+                                .map { row ->
+                                    val localStart = row.startedAt.atZoneSameInstant(zoneId)
+                                    val localEnd = row.endedAt?.atZoneSameInstant(zoneId)
+                                    Triple(localStart, localEnd, row)
+                                }
+                                .sortedBy { it.first.toInstant() }
+
+                            val sessions = parsed.map { (start, end, _) ->
+                                val minutes = if (end != null) {
+                                    java.time.Duration.between(start.toInstant(), end.toInstant()).toMinutes().toInt().coerceAtLeast(0)
+                                } else 0
+                                TimesheetDetailedSessionDto(
+                                    start = start.format(outTimeFormatter),
+                                    end = end?.format(outTimeFormatter),
+                                    minutes = minutes
+                                )
+                            }
+
+                            val earliest = parsed.firstOrNull()?.first?.format(outTimeFormatter)
+                            val latest = parsed.lastOrNull()?.second?.format(outTimeFormatter)
+                            val totalMinutes = sessions.sumOf { it.minutes }
+
+                            TimesheetDetailedDayDto(
+                                day = day,
+                                start = earliest,
+                                end = latest,
+                                minutes = totalMinutes,
+                                sessionCount = sessions.size,
+                                sessions = sessions
+                            )
+                        }
+                        .sortedBy { it.day }
+
+                    TimesheetDetailedEmployeeDto(
+                        id = userPair.first,
+                        name = userPair.second,
+                        days = days
+                    )
+                }
+                .sortedBy { it.name }
+
+            call.respond(
+                TimesheetDetailedResponseDto(
+                    companyId = ctx.companyId,
+                    companyName = companyName,
+                    companyTimeZone = zoneId.id,
+                    month = month,
+                    employees = employees
+                )
+            )
         }
 
         // ADMIN: list active sessions in same company
