@@ -438,7 +438,8 @@ data class UserSessionDto(
 data class TimesheetDetailedSessionDto(
     val start: String,
     val end: String? = null,
-    val minutes: Int
+    val minutes: Int,
+    val note: String? = null
 )
 
 @Serializable
@@ -855,9 +856,17 @@ fun Route.trackingRoutes() {
             }
 
             data class EffectiveSession(
+                val originalStart: ZonedDateTime,
+                val originalEnd: ZonedDateTime,
                 val localStart: ZonedDateTime,
-                val localEnd: ZonedDateTime,
-                val day: Int
+                val localEnd: ZonedDateTime
+            )
+
+            data class EffectiveSessionChunk(
+                val day: Int,
+                val start: ZonedDateTime,
+                val end: ZonedDateTime,
+                val note: String? = null
             )
 
             data class DayBucket(
@@ -883,10 +892,44 @@ fun Route.trackingRoutes() {
                 if (!effectiveEnd.isAfter(effectiveStart)) return null
 
                 return EffectiveSession(
+                    originalStart = startLocal,
+                    originalEnd = endLocal,
                     localStart = effectiveStart,
-                    localEnd = effectiveEnd,
-                    day = effectiveStart.dayOfMonth
+                    localEnd = effectiveEnd
                 )
+            }
+
+            fun splitByDay(session: EffectiveSession): List<EffectiveSessionChunk> {
+                val chunks = mutableListOf<EffectiveSessionChunk>()
+                var cursor = session.localStart
+
+                while (cursor.toLocalDate().isBefore(session.localEnd.toLocalDate())) {
+                    val nextDayStart = cursor.toLocalDate().plusDays(1).atStartOfDay(zoneId)
+                    val chunkEnd = nextDayStart
+                    val note = "Session started ${session.originalStart.toLocalDate()} ${session.originalStart.toLocalTime().withSecond(0).withNano(0)} and ended ${session.originalEnd.toLocalDate()} ${session.originalEnd.toLocalTime().withSecond(0).withNano(0)}"
+                    chunks += EffectiveSessionChunk(
+                        day = cursor.dayOfMonth,
+                        start = cursor,
+                        end = chunkEnd,
+                        note = note
+                    )
+                    cursor = nextDayStart
+                }
+
+                val finalNote = if (session.localStart.toLocalDate() != session.localEnd.toLocalDate()) {
+                    "Session started ${session.originalStart.toLocalDate()} ${session.originalStart.toLocalTime().withSecond(0).withNano(0)} and ended ${session.originalEnd.toLocalDate()} ${session.originalEnd.toLocalTime().withSecond(0).withNano(0)}"
+                } else {
+                    null
+                }
+
+                chunks += EffectiveSessionChunk(
+                    day = cursor.dayOfMonth,
+                    start = cursor,
+                    end = session.localEnd,
+                    note = finalNote
+                )
+
+                return chunks.filter { it.end.isAfter(it.start) }
             }
 
             val rawRows: List<RawRow> = transaction {
@@ -943,21 +986,23 @@ fun Route.trackingRoutes() {
                     rows.forEach { row ->
                         val effective = clipToMonth(row) ?: return@forEach
 
-                        val minutes = java.time.Duration
-                            .between(effective.localStart.toInstant(), effective.localEnd.toInstant())
-                            .toMinutes()
-                            .toInt()
-                            .coerceAtLeast(0)
+                        splitByDay(effective).forEach { chunk ->
+                            val minutes = java.time.Duration
+                                .between(chunk.start.toInstant(), chunk.end.toInstant())
+                                .toMinutes()
+                                .toInt()
+                                .coerceAtLeast(0)
 
-                        // Skip empty or fully invalid intervals after clipping.
-                        if (minutes <= 0) return@forEach
+                            if (minutes <= 0) return@forEach
 
-                        val bucket = buckets.getOrPut(effective.day) { DayBucket(day = effective.day) }
-                        bucket.sessions += TimesheetDetailedSessionDto(
-                            start = effective.localStart.format(outTimeFormatter),
-                            end = effective.localEnd.format(outTimeFormatter),
-                            minutes = minutes
-                        )
+                            val bucket = buckets.getOrPut(chunk.day) { DayBucket(day = chunk.day) }
+                            bucket.sessions += TimesheetDetailedSessionDto(
+                                start = chunk.start.format(outTimeFormatter),
+                                end = if (chunk.end.toLocalTime() == java.time.LocalTime.MIDNIGHT) "23:59" else chunk.end.format(outTimeFormatter),
+                                minutes = if (chunk.end.toLocalTime() == java.time.LocalTime.MIDNIGHT) 24 * 60 else minutes,
+                                note = chunk.note
+                            )
+                        }
                     }
 
                     val days = buckets.values
