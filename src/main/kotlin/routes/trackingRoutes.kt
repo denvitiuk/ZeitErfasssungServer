@@ -25,6 +25,9 @@ import java.sql.DriverManager
 import java.util.Properties
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.YearMonth
+import java.time.ZonedDateTime
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import org.postgresql.PGConnection
@@ -823,12 +826,13 @@ fun Route.trackingRoutes() {
                 ?: throw BadRequestException("Missing month (YYYY-MM)")
             val tz = call.request.queryParameters["tz"]?.takeIf { it.isNotBlank() } ?: "Europe/Berlin"
 
-            val monthStart = try {
-                java.time.YearMonth.parse(month).atDay(1)
+            val yearMonth = try {
+                YearMonth.parse(month)
             } catch (_: Throwable) {
                 throw BadRequestException("Invalid month format. Expected YYYY-MM")
             }
-            val monthEndExclusive = monthStart.plusMonths(1)
+            val monthStart = yearMonth.atDay(1)
+            val monthEndExclusive = yearMonth.plusMonths(1).atDay(1)
 
             val companyName = transaction {
                 queryOne(
@@ -848,6 +852,41 @@ fun Route.trackingRoutes() {
                 java.time.ZoneId.of(tz)
             } catch (_: Throwable) {
                 java.time.ZoneId.of("Europe/Berlin")
+            }
+
+            data class EffectiveSession(
+                val localStart: ZonedDateTime,
+                val localEnd: ZonedDateTime,
+                val day: Int
+            )
+
+            data class DayBucket(
+                val day: Int,
+                val sessions: MutableList<TimesheetDetailedSessionDto> = mutableListOf()
+            )
+
+            fun clipToMonth(row: RawRow): EffectiveSession? {
+                val startLocal = row.startedAt.atZoneSameInstant(zoneId)
+                val rawEnd = row.endedAt ?: return null
+                val endLocal = rawEnd.atZoneSameInstant(zoneId)
+
+                // Ignore broken/negative intervals.
+                if (!endLocal.isAfter(startLocal)) return null
+
+                val monthStartZdt = monthStart.atStartOfDay(zoneId)
+                val monthEndZdt = monthEndExclusive.atStartOfDay(zoneId)
+
+                val effectiveStart = if (startLocal.isBefore(monthStartZdt)) monthStartZdt else startLocal
+                val effectiveEnd = if (endLocal.isAfter(monthEndZdt)) monthEndZdt else endLocal
+
+                // Nothing remains inside the selected month after clipping.
+                if (!effectiveEnd.isAfter(effectiveStart)) return null
+
+                return EffectiveSession(
+                    localStart = effectiveStart,
+                    localEnd = effectiveEnd,
+                    day = effectiveStart.dayOfMonth
+                )
             }
 
             val rawRows: List<RawRow> = transaction {
@@ -899,42 +938,45 @@ fun Route.trackingRoutes() {
             val employees = rawRows
                 .groupBy { it.userId to it.userName }
                 .map { (userPair, rows) ->
-                    val dayGroups = rows.groupBy { row ->
-                        row.startedAt.atZoneSameInstant(zoneId).dayOfMonth
+                    val buckets = linkedMapOf<Int, DayBucket>()
+
+                    rows.forEach { row ->
+                        val effective = clipToMonth(row) ?: return@forEach
+
+                        val minutes = java.time.Duration
+                            .between(effective.localStart.toInstant(), effective.localEnd.toInstant())
+                            .toMinutes()
+                            .toInt()
+                            .coerceAtLeast(0)
+
+                        // Skip empty or fully invalid intervals after clipping.
+                        if (minutes <= 0) return@forEach
+
+                        val bucket = buckets.getOrPut(effective.day) { DayBucket(day = effective.day) }
+                        bucket.sessions += TimesheetDetailedSessionDto(
+                            start = effective.localStart.format(outTimeFormatter),
+                            end = effective.localEnd.format(outTimeFormatter),
+                            minutes = minutes
+                        )
                     }
 
-                    val days = dayGroups
-                        .map { (day, dayRows) ->
-                            val parsed = dayRows
-                                .map { row ->
-                                    val localStart = row.startedAt.atZoneSameInstant(zoneId)
-                                    val localEnd = row.endedAt?.atZoneSameInstant(zoneId)
-                                    Triple(localStart, localEnd, row)
-                                }
-                                .sortedBy { it.first.toInstant() }
-
-                            val sessions = parsed.map { (start, end, _) ->
-                                val minutes = if (end != null) {
-                                    java.time.Duration.between(start.toInstant(), end.toInstant()).toMinutes().toInt().coerceAtLeast(0)
-                                } else 0
-                                TimesheetDetailedSessionDto(
-                                    start = start.format(outTimeFormatter),
-                                    end = end?.format(outTimeFormatter),
-                                    minutes = minutes
-                                )
+                    val days = buckets.values
+                        .map { bucket ->
+                            val sortedSessions = bucket.sessions.sortedBy { session ->
+                                LocalDateTime.parse("${yearMonth}-" + bucket.day.toString().padStart(2, '0') + "T${session.start}:00")
                             }
 
-                            val earliest = parsed.firstOrNull()?.first?.format(outTimeFormatter)
-                            val latest = parsed.lastOrNull()?.second?.format(outTimeFormatter)
-                            val totalMinutes = sessions.sumOf { it.minutes }
+                            val earliest = sortedSessions.firstOrNull()?.start
+                            val latest = sortedSessions.lastOrNull()?.end
+                            val totalMinutes = sortedSessions.sumOf { it.minutes }
 
                             TimesheetDetailedDayDto(
-                                day = day,
+                                day = bucket.day,
                                 start = earliest,
                                 end = latest,
                                 minutes = totalMinutes,
-                                sessionCount = sessions.size,
-                                sessions = sessions
+                                sessionCount = sortedSessions.size,
+                                sessions = sortedSessions
                             )
                         }
                         .sortedBy { it.day }
