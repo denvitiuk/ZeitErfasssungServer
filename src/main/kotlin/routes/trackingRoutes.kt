@@ -906,7 +906,7 @@ fun Route.trackingRoutes() {
                 while (cursor.toLocalDate().isBefore(session.localEnd.toLocalDate())) {
                     val nextDayStart = cursor.toLocalDate().plusDays(1).atStartOfDay(zoneId)
                     val chunkEnd = nextDayStart
-                    val note = "Session started ${session.originalStart.toLocalDate()} ${session.originalStart.toLocalTime().withSecond(0).withNano(0)} and ended ${session.originalEnd.toLocalDate()} ${session.originalEnd.toLocalTime().withSecond(0).withNano(0)}"
+                    val note = "SPAN|${session.originalStart.toLocalDate()}|${session.originalStart.toLocalTime().withSecond(0).withNano(0)}|${session.originalEnd.toLocalDate()}|${session.originalEnd.toLocalTime().withSecond(0).withNano(0)}"
                     chunks += EffectiveSessionChunk(
                         day = cursor.dayOfMonth,
                         start = cursor,
@@ -917,7 +917,7 @@ fun Route.trackingRoutes() {
                 }
 
                 val finalNote = if (session.localStart.toLocalDate() != session.localEnd.toLocalDate()) {
-                    "Session started ${session.originalStart.toLocalDate()} ${session.originalStart.toLocalTime().withSecond(0).withNano(0)} and ended ${session.originalEnd.toLocalDate()} ${session.originalEnd.toLocalTime().withSecond(0).withNano(0)}"
+                    "SPAN|${session.originalStart.toLocalDate()}|${session.originalStart.toLocalTime().withSecond(0).withNano(0)}|${session.originalEnd.toLocalDate()}|${session.originalEnd.toLocalTime().withSecond(0).withNano(0)}"
                 } else {
                     null
                 }
