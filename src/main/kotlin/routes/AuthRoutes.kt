@@ -91,6 +91,9 @@ data class ErrorResponse(val error: String)
 data class RefreshRequest(val refreshToken: String, val deviceId: String? = null)
 
 @Serializable
+data class LogoutRequest(val refreshToken: String)
+
+@Serializable
 data class TokenResponse(
     val token: String,
     val refreshToken: String? = null,
@@ -249,6 +252,38 @@ private fun issueJwt(
     return token to expiresIn
 }
 fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
+
+    // Logout: revoke the current refresh token/session.
+    route("/logout") {
+        post {
+            val dto = call.receive<LogoutRequest>()
+            val raw = dto.refreshToken.trim()
+            if (raw.isEmpty()) {
+                return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("refresh_token_required"))
+            }
+
+            val cfg = refreshCfg(call)
+            val now = System.currentTimeMillis()
+            val tokenHash = hashRefreshToken(raw, cfg.pepper)
+
+            val updated = transaction {
+                RefreshSessions.update({
+                    (RefreshSessions.tokenHash eq tokenHash) and (RefreshSessions.revokedAtMs.isNull())
+                }) {
+                    it[revokedAtMs] = now
+                }
+            }
+
+            // Idempotent logout: respond OK even if the session was already gone/revoked.
+            if (updated == 0) {
+                call.application.environment.log.info("logout: refresh session already revoked or missing")
+            } else {
+                call.application.environment.log.info("logout: revoked refresh session")
+            }
+
+            call.respond(HttpStatusCode.OK, mapOf("ok" to true))
+        }
+    }
 
     // Refresh access token using a long-lived refresh token (rotation).
     route("/refresh") {
@@ -810,26 +845,36 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                         .map { it[Users.companyId] }
                         .single()
                 }
-                // If already linked to this company, short-circuit and just issue a fresh token
+                // If already linked to this company, short-circuit and just issue a fresh token + refresh
                 if (currentCompanyId != null && currentCompanyId == companyId) {
-                    val jwtConfig = call.application.environment.config.config("ktor.jwt")
-                    val issuer    = jwtConfig.property("issuer").getString()
-                    val audience  = jwtConfig.property("audience").getString()
-                    val secret    = jwtConfig.property("secret").getString()
-                    val expiresIn = jwtConfig.property("validityMs").getString().toLong()
-
                     val row = transaction { Users.select { Users.id eq userId }.single() }
-                    val tokenSame = JWT.create()
-                        .withIssuer(issuer)
-                        .withAudience(audience)
-                        .withClaim("id", row[Users.id].value.toString())
-                        .withClaim("companyId", row[Users.companyId]?.value ?: 0)
-                        .withClaim("isCompanyAdmin", row[Users.isCompanyAdmin])
-                        .withClaim("isGlobalAdmin", row[Users.isGlobalAdmin])
-                        .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
-                        .sign(Algorithm.HMAC256(secret))
+                    val (tokenSame, jwtExpiresInMs) = issueJwt(
+                        call = call,
+                        userId = row[Users.id].value,
+                        companyId = row[Users.companyId]?.value ?: 0,
+                        isCompanyAdmin = row[Users.isCompanyAdmin],
+                        isGlobalAdmin = row[Users.isGlobalAdmin]
+                    )
 
-                    call.application.environment.log.info("link-company: user=$userId already linked to company=${companyId.value}, returning fresh token")
+                    val rCfg = refreshCfg(call)
+                    val refreshToken = generateRefreshToken()
+                    val refreshHash = hashRefreshToken(refreshToken, rCfg.pepper)
+                    val now = System.currentTimeMillis()
+                    val deviceId = call.request.headers["X-Device-Id"]
+
+                    transaction {
+                        RefreshSessions.insert {
+                            it[RefreshSessions.userId] = row[Users.id]
+                            it[tokenHash] = refreshHash
+                            it[createdAtMs] = now
+                            it[expiresAtMs] = now + rCfg.validityMs
+                            it[revokedAtMs] = null
+                            it[replacedByHash] = null
+                            it[RefreshSessions.deviceId] = deviceId
+                        }
+                    }
+
+                    call.application.environment.log.info("link-company: user=$userId already linked to company=${companyId.value}, returning fresh token + refresh")
                     return@post call.respond(
                         HttpStatusCode.OK,
                         LinkCompanyResponse(
@@ -837,7 +882,9 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                             companyId = companyId.value,
                             companyName = companyName,
                             isCompanyAdmin = row[Users.isCompanyAdmin],
-                            alreadyLinked = true
+                            alreadyLinked = true,
+                            refreshToken = refreshToken,
+                            expiresInMs = jwtExpiresInMs
                         )
                     )
                 }
@@ -867,23 +914,33 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     call.application.environment.log.info("link-company: user=$userId -> company=${companyId.value}, first_admin=${!hasAdmin}")
                 }
 
-                // 3) Issue updated JWT with fresh claims
-                val jwtConfig = call.application.environment.config.config("ktor.jwt")
-                val issuer = jwtConfig.property("issuer").getString()
-                val audience = jwtConfig.property("audience").getString()
-                val secret = jwtConfig.property("secret").getString()
-                val expiresIn = jwtConfig.property("validityMs").getString().toLong()
-
+                // 3) Issue updated JWT + refresh token with fresh claims
                 val row = transaction { Users.select { Users.id eq userId }.single() }
-                val newToken = JWT.create()
-                    .withIssuer(issuer)
-                    .withAudience(audience)
-                    .withClaim("id", row[Users.id].value.toString())
-                    .withClaim("companyId", row[Users.companyId]?.value ?: 0)
-                    .withClaim("isCompanyAdmin", row[Users.isCompanyAdmin])
-                    .withClaim("isGlobalAdmin", row[Users.isGlobalAdmin])
-                    .withExpiresAt(Date(System.currentTimeMillis() + expiresIn))
-                    .sign(Algorithm.HMAC256(secret))
+                val (newToken, jwtExpiresInMs) = issueJwt(
+                    call = call,
+                    userId = row[Users.id].value,
+                    companyId = row[Users.companyId]?.value ?: 0,
+                    isCompanyAdmin = row[Users.isCompanyAdmin],
+                    isGlobalAdmin = row[Users.isGlobalAdmin]
+                )
+
+                val rCfg = refreshCfg(call)
+                val refreshToken = generateRefreshToken()
+                val refreshHash = hashRefreshToken(refreshToken, rCfg.pepper)
+                val now = System.currentTimeMillis()
+                val deviceId = call.request.headers["X-Device-Id"]
+
+                transaction {
+                    RefreshSessions.insert {
+                        it[RefreshSessions.userId] = row[Users.id]
+                        it[tokenHash] = refreshHash
+                        it[createdAtMs] = now
+                        it[expiresAtMs] = now + rCfg.validityMs
+                        it[revokedAtMs] = null
+                        it[replacedByHash] = null
+                        it[RefreshSessions.deviceId] = deviceId
+                    }
+                }
 
                 val isAdminNow = row[Users.isCompanyAdmin]
                 call.respond(
@@ -893,7 +950,9 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                         companyId = companyId.value,
                         companyName = companyName,
                         isCompanyAdmin = isAdminNow,
-                        alreadyLinked = false
+                        alreadyLinked = false,
+                        refreshToken = refreshToken,
+                        expiresInMs = jwtExpiresInMs
                     )
                 )
             }
