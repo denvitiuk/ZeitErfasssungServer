@@ -758,6 +758,7 @@ fun Route.trackingRoutes() {
                       AND s.is_active = TRUE
                       AND s.user_id = ll.user_id
                       AND ll.last_action = 'out'
+                      AND COALESCE(o.last_out_ts, now()) >= s.started_at
                     """.trimIndent(),
                     listOf(ctx.companyId)
                 )
