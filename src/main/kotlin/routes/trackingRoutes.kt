@@ -87,6 +87,40 @@ private fun forbidden(msg: String = "Forbidden"): Nothing = throw HttpStatusExce
 private fun notFound(msg: String = "Not found"): Nothing = throw HttpStatusException(HttpStatusCode.NotFound, msg)
 private fun conflict(msg: String = "Conflict"): Nothing = throw HttpStatusException(HttpStatusCode.Conflict, msg)
 
+private fun parseUuid(value: String?, field: String = "id"): UUID {
+    if (value.isNullOrBlank()) {
+        throw BadRequestException("Missing $field")
+    }
+
+    return try {
+        UUID.fromString(value)
+    } catch (_: IllegalArgumentException) {
+        throw BadRequestException("Invalid $field")
+    }
+}
+
+private fun validateTrackPoint(req: TrackPointReq) {
+    if (req.lat !in -90.0..90.0) {
+        throw BadRequestException("Invalid lat")
+    }
+
+    if (req.lon !in -180.0..180.0) {
+        throw BadRequestException("Invalid lon")
+    }
+
+    if (req.speedMps != null && req.speedMps < 0f) {
+        throw BadRequestException("Invalid speedMps")
+    }
+
+    if (req.headingDeg != null && req.headingDeg !in 0f..360f) {
+        throw BadRequestException("Invalid headingDeg")
+    }
+
+    if (req.tsEpochSeconds != null && req.tsEpochSeconds <= 0L) {
+        throw BadRequestException("Invalid tsEpochSeconds")
+    }
+}
+
 private val NULL_TYPE = TextColumnType()
 
 // --- Minimal JDBC helpers inside Exposed transaction ------------------------
@@ -515,7 +549,7 @@ fun Route.trackingRoutes() {
         // USER: stop tracking
         post("/sessions/{id}/stop") {
             val userId = call.requireUserId()
-            val sessionId = UUID.fromString(call.parameters["id"] ?: throw BadRequestException("Missing id"))
+            val sessionId = parseUuid(call.parameters["id"])
 
             requireOwnedActiveSession(sessionId, userId)
 
@@ -546,7 +580,8 @@ fun Route.trackingRoutes() {
         post("/points") {
             val userId = call.requireUserId()
             val req = call.receive<TrackPointReq>()
-            val sessionId = UUID.fromString(req.sessionId)
+            validateTrackPoint(req)
+            val sessionId = parseUuid(req.sessionId, "sessionId")
 
             requireOwnedActiveSession(sessionId, userId)
 
@@ -658,7 +693,7 @@ fun Route.trackingRoutes() {
         // USER: fetch stored points for OWN session (history / recovery)
         get("/me/sessions/{id}/points") {
             val userId = call.requireUserId()
-            val sessionId = UUID.fromString(call.parameters["id"] ?: throw BadRequestException("Missing id"))
+            val sessionId = parseUuid(call.parameters["id"])
 
             // Ownership check (no company/admin required)
             transaction {
@@ -671,7 +706,8 @@ fun Route.trackingRoutes() {
             }
 
             val limit = (call.request.queryParameters["limit"]?.toIntOrNull() ?: 1000).coerceIn(1, 5000)
-            val afterPointId = call.request.queryParameters["afterPointId"]?.toLongOrNull() ?: 0L
+            val afterPointId = (call.request.queryParameters["afterPointId"]?.toLongOrNull() ?: 0L)
+                .coerceAtLeast(0L)
 
             val rows = transaction {
                 val stmt = connection.prepareStatement(
@@ -780,8 +816,9 @@ fun Route.trackingRoutes() {
                     FROM tracking_sessions s
                     JOIN users u ON u.id = s.user_id
                     WHERE s.company_id = ?
-                      AND s.started_at >= (?::date)
+                      -- Overlap filter: session intersects [dayStart, dayEnd)
                       AND s.started_at < ((?::date) + interval '1 day')
+                      AND COALESCE(s.ended_at, now()) >= (?::date)
                     ORDER BY s.started_at DESC
                     """.trimIndent(),
                     false
@@ -1119,11 +1156,12 @@ fun Route.trackingRoutes() {
             val ctx = loadUserContext(adminId)
             requireAdmin(ctx)
 
-            val sessionId = UUID.fromString(call.parameters["id"] ?: throw BadRequestException("Missing id"))
+            val sessionId = parseUuid(call.parameters["id"])
             requireSameCompany(sessionId, ctx.companyId)
 
             val limit = (call.request.queryParameters["limit"]?.toIntOrNull() ?: 1000).coerceIn(1, 5000)
-            val afterPointId = call.request.queryParameters["afterPointId"]?.toLongOrNull() ?: 0L
+            val afterPointId = (call.request.queryParameters["afterPointId"]?.toLongOrNull() ?: 0L)
+                .coerceAtLeast(0L)
 
             val rows = transaction {
                 val stmt = connection.prepareStatement(
@@ -1169,9 +1207,7 @@ fun Route.trackingRoutes() {
 
     // ADMIN: WebSocket stream for a specific sessionId
     webSocket("/ws/admin-tracking") {
-        val sessionIdStr = call.request.queryParameters["sessionId"]
-            ?: throw BadRequestException("Missing sessionId")
-        val sessionId = UUID.fromString(sessionIdStr)
+        val sessionId = parseUuid(call.request.queryParameters["sessionId"], "sessionId")
 
         val adminId = call.requireUserId()
         val ctx = loadUserContext(adminId)
@@ -1220,9 +1256,7 @@ fun Route.trackingRoutes() {
 
     // USER: WebSocket for live commands (e.g., admin requests immediate location refresh)
     webSocket("/ws/user-tracking") {
-        val sessionIdStr = call.request.queryParameters["sessionId"]
-            ?: throw BadRequestException("Missing sessionId")
-        val sessionId = UUID.fromString(sessionIdStr)
+        val sessionId = parseUuid(call.request.queryParameters["sessionId"], "sessionId")
 
         val userId = call.requireUserId()
         requireOwnedActiveSession(sessionId, userId)

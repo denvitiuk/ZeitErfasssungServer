@@ -44,6 +44,32 @@ private fun distanceMeters(
     return R * c
 }
 
+private fun isValidLatitude(value: Double): Boolean = value in -90.0..90.0
+
+private fun isValidLongitude(value: Double): Boolean = value in -180.0..180.0
+
+private fun parsePositiveInt(value: String?): Int? =
+    value?.toIntOrNull()?.takeIf { it > 0 }
+
+private fun principalUserId(principal: JWTPrincipal): Int? =
+    parsePositiveInt(principal.payload.getClaim("id").asString())
+        ?: principal.payload.getClaim("id").asInt()?.takeIf { it > 0 }
+
+private fun isProofTestRoutesEnabled(call: ApplicationCall): Boolean =
+    call.application.environment.config.propertyOrNull("proofs.test.enabled")?.getString()?.equals("true", ignoreCase = true) == true ||
+        System.getenv("PROOFS_TEST_ENABLED")?.equals("true", ignoreCase = true) == true
+
+private fun validateRespondLocation(req: RespondProofRequest): ErrorSimple? {
+    if (!isValidLatitude(req.latitude)) return ErrorSimple("invalid_latitude")
+    if (!isValidLongitude(req.longitude)) return ErrorSimple("invalid_longitude")
+    return null
+}
+
+private fun Transaction.setLocalTimeZone(zone: ZoneId) {
+    val safeZoneId = zone.id.replace("'", "''")
+    exec("SET LOCAL TIME ZONE '$safeZoneId';")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers: timezone, project id, random time in window
 // ─────────────────────────────────────────────────────────────────────────────
@@ -64,7 +90,7 @@ private fun resolveZone(call: ApplicationCall): ZoneId {
 private fun parseProjectId(call: ApplicationCall): Int? {
     val q = call.request.queryParameters["projectId"]?.trim()
     val h = call.request.headers["X-Project-Id"]?.trim()
-    return (q ?: h)?.toIntOrNull()
+    return parsePositiveInt(q ?: h)
 }
 
 private data class ProjectResolution(val id: Int?, val reason: String, val choices: List<Int> = emptyList())
@@ -194,7 +220,7 @@ fun Route.proofsRoutes() {
             // 📅 GET /api/proofs/today
             get("/today") {
                 val principal = call.principal<JWTPrincipal>() ?: return@get call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
-                val userId = principal.payload.getClaim("id").asString().toInt()
+                val userId = principalUserId(principal) ?: return@get call.respond(HttpStatusCode.BadRequest, ErrorSimple("bad_token"))
                 val zone = resolveZone(call)
                 val pr = autoResolveProject(call, userId, zone)
                 if (pr.id == null) {
@@ -329,7 +355,7 @@ fun Route.proofsRoutes() {
             post {
                 try {
                   val principal = call.principal<JWTPrincipal>() ?: return@post call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
-                  val userId = principal.payload.getClaim("id").asString().toInt()
+                  val userId = principalUserId(principal) ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorSimple("bad_token"))
                   val zone = resolveZone(call)
                   val pr = autoResolveProject(call, userId, zone)
                   if (pr.id == null) {
@@ -369,7 +395,7 @@ fun Route.proofsRoutes() {
                   }
 
                   val newId = transaction {
-                    exec("SET LOCAL TIME ZONE '${zone.id}';")
+                    setLocalTimeZone(zone)
                     Proofs.insert {
                       it[Proofs.userId] = userId
                       it[Proofs.projectId] = projectId
@@ -401,8 +427,12 @@ fun Route.proofsRoutes() {
 
             // 📩 POST /api/proofs/{id}/respond
             post("/{proofId}/respond") {
-                val userId = call.principal<JWTPrincipal>()!!.payload.getClaim("id").asString().toInt()
-                val proofId = call.parameters["proofId"]!!.toInt()
+                val principal = call.principal<JWTPrincipal>()
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
+                val userId = principalUserId(principal)
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorSimple("bad_token"))
+                val proofId = parsePositiveInt(call.parameters["proofId"])
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorSimple("invalid_proof_id"))
                 val req: RespondProofRequest? = when (call.request.contentType().withoutParameters()) {
                     ContentType.Application.Json -> runCatching { call.receive<RespondProofRequest>() }.getOrNull()
                     ContentType.Application.FormUrlEncoded -> {
@@ -424,6 +454,9 @@ fun Route.proofsRoutes() {
                         ErrorSimple("expected json body or latitude/longitude params")
                     )
                 }
+                validateRespondLocation(req)?.let { error ->
+                    return@post call.respond(HttpStatusCode.BadRequest, error)
+                }
                 val now = Instant.now()
                 val zone = resolveZone(call)
 
@@ -432,7 +465,7 @@ fun Route.proofsRoutes() {
                 // Collect validation errors
                 val details = mutableMapOf<String, MutableList<String>>()
                 val success = transaction {
-                    exec("SET LOCAL TIME ZONE '${zone.id}';")
+                    setLocalTimeZone(zone)
                     // 1) Check ownership and existence
                     val row = Proofs.select {
                         (Proofs.id eq proofId) and
@@ -530,9 +563,12 @@ fun Route.proofsRoutes() {
             // it only prepares a proof and returns its id/schedule. Your push worker
             // (or a later step) may pick it up and deliver a real alert.
             post("/test") {
+                if (!isProofTestRoutesEnabled(call)) {
+                    return@post call.respond(HttpStatusCode.NotFound, ErrorSimple("not_found"))
+                }
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
-                val userId = principal.payload.getClaim("id").asString().toInt()
+                val userId = principalUserId(principal) ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorSimple("bad_token"))
                 val zone = resolveZone(call)
                 val pr = autoResolveProject(call, userId, zone)
                 if (pr.id == null) {
@@ -553,7 +589,7 @@ fun Route.proofsRoutes() {
                 }
 
                 val requestedMode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
-                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
+                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()?.takeIf { it == 1 || it == 2 }
                 val fallback = call.request.queryParameters["fallback"]?.lowercase()
                 var effectiveMode = requestedMode
 
@@ -604,7 +640,7 @@ fun Route.proofsRoutes() {
                 }.toShort()
 
                 val result: TestCreatedDto = transaction {
-                    exec("SET LOCAL TIME ZONE '${zone.id}';")
+                    setLocalTimeZone(zone)
                     when (effectiveMode) {
                         "replace" -> {
                             val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
@@ -684,9 +720,12 @@ fun Route.proofsRoutes() {
             }
             // 🧪 POST /api/proofs/create-test — shorthand for adhoc test (defaults to debug mode)
             post("/create-test") {
+                if (!isProofTestRoutesEnabled(call)) {
+                    return@post call.respond(HttpStatusCode.NotFound, ErrorSimple("not_found"))
+                }
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
-                val userId = principal.payload.getClaim("id").asString().toInt()
+                val userId = principalUserId(principal) ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorSimple("bad_token"))
                 val zone = resolveZone(call)
                 val pr = autoResolveProject(call, userId, zone)
                 if (pr.id == null) {
@@ -726,10 +765,10 @@ fun Route.proofsRoutes() {
                     else -> 1
                 }.toShort()
 
-                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
+                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()?.takeIf { it == 1 || it == 2 }
                 val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
                 val result: TestCreatedDto = transaction {
-                    exec("SET LOCAL TIME ZONE '${zone.id}';")
+                    setLocalTimeZone(zone)
                     val today = nowZdt.toLocalDate()
                     val existing = Proofs.select {
                         (Proofs.userId eq userId) and
@@ -769,9 +808,12 @@ fun Route.proofsRoutes() {
         route("/proofs") {
             // POST /proofs/test — same logic as /api/proofs/test
             post("/test") {
+                if (!isProofTestRoutesEnabled(call)) {
+                    return@post call.respond(HttpStatusCode.NotFound, ErrorSimple("not_found"))
+                }
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
-                val userId = principal.payload.getClaim("id").asString().toInt()
+                val userId = principalUserId(principal) ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorSimple("bad_token"))
                 val zone = resolveZone(call)
                 val pr = autoResolveProject(call, userId, zone)
                 if (pr.id == null) {
@@ -791,7 +833,7 @@ fun Route.proofsRoutes() {
                 }
 
                 val requestedMode = call.request.queryParameters["mode"]?.lowercase() ?: "adhoc"
-                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
+                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()?.takeIf { it == 1 || it == 2 }
                 val fallback = call.request.queryParameters["fallback"]?.lowercase()
                 var effectiveMode = requestedMode
 
@@ -841,7 +883,7 @@ fun Route.proofsRoutes() {
                 }.toShort()
 
                 val result: TestCreatedDto = transaction {
-                    exec("SET LOCAL TIME ZONE '${zone.id}';")
+                    setLocalTimeZone(zone)
                     when (effectiveMode) {
                         "replace" -> {
                             val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
@@ -922,9 +964,12 @@ fun Route.proofsRoutes() {
 
             // POST /proofs/create-test — shorthand alias (defaults to adhoc)
             post("/create-test") {
+                if (!isProofTestRoutesEnabled(call)) {
+                    return@post call.respond(HttpStatusCode.NotFound, ErrorSimple("not_found"))
+                }
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized, ErrorSimple("unauthorized"))
-                val userId = principal.payload.getClaim("id").asString().toInt()
+                val userId = principalUserId(principal) ?: return@post call.respond(HttpStatusCode.BadRequest, ErrorSimple("bad_token"))
                 val zone = resolveZone(call)
                 val pr = autoResolveProject(call, userId, zone)
                 if (pr.id == null) {
@@ -963,10 +1008,10 @@ fun Route.proofsRoutes() {
                     else -> 1
                 }.toShort()
 
-                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()
+                val slotParam = call.request.queryParameters["slot"]?.toIntOrNull()?.takeIf { it == 1 || it == 2 }
                 val chosenSlot: Short = (slotParam ?: chooseSlotByTime(nowZdt.hour)).toShort()
                 val result: TestCreatedDto = transaction {
-                    exec("SET LOCAL TIME ZONE '${zone.id}';")
+                    setLocalTimeZone(zone)
                     val today = nowZdt.toLocalDate()
                     val existing = Proofs.select {
                         (Proofs.userId eq userId) and

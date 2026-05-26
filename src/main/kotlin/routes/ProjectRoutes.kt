@@ -61,6 +61,28 @@ private val lenientJson = Json {
 private fun principalCompanyId(principal: JWTPrincipal): Int =
     principal.payload.getClaim("companyId").asInt() ?: 0
 
+private fun parsePositiveIntParam(value: String?, field: String = "id"): Int? =
+    value?.toIntOrNull()?.takeIf { it > 0 }
+
+private fun parseListLimit(value: String?, default: Int = 100, max: Int = 200): Int =
+    value?.toIntOrNull()?.coerceIn(1, max) ?: default
+
+private fun isValidLatitude(value: Double): Boolean = value in -90.0..90.0
+
+private fun isValidLongitude(value: Double): Boolean = value in -180.0..180.0
+
+private fun validateCoordinates(lat: Double?, lng: Double?): ApiErrorProject? {
+    if (lat != null && !isValidLatitude(lat)) {
+        return ApiErrorProject("invalid_lat", "lat must be between -90 and 90")
+    }
+
+    if (lng != null && !isValidLongitude(lng)) {
+        return ApiErrorProject("invalid_lng", "lng must be between -180 and 180")
+    }
+
+    return null
+}
+
 private fun isAdminForCompany(principal: JWTPrincipal, companyId: Int): Boolean {
     val isCompanyAdmin = principal.payload.getClaim("isCompanyAdmin").asBoolean() ?: false
     val isGlobalAdmin  = principal.payload.getClaim("isGlobalAdmin").asBoolean() ?: false
@@ -189,6 +211,7 @@ fun Route.projectsRoutes() {
                     return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("no_company", "Token has no companyId"))
 
                 val q = call.request.queryParameters["q"]?.trim()?.lowercase()
+                val limit = parseListLimit(call.request.queryParameters["limit"])
 
                 val items = transaction {
                     val base = Projects
@@ -198,6 +221,7 @@ fun Route.projectsRoutes() {
                             if (!q.isNullOrBlank()) query.andWhere { Projects.title.lowerCase() like "%${q}%" } else query
                         }
                         .orderBy(Projects.createdAt, SortOrder.DESC)
+                        .limit(limit)
                         .toList()
 
                     val baseIds = base.map { it[Projects.id] }
@@ -245,6 +269,10 @@ fun Route.projectsRoutes() {
                 if (body.title.isBlank())
                     return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("title_required"))
 
+                validateCoordinates(body.lat, body.lng)?.let { error ->
+                    return@post call.respond(HttpStatusCode.BadRequest, error)
+                }
+
                 try {
                     val created = transaction {
                         val newId = Projects.insertAndGetId {
@@ -278,7 +306,7 @@ fun Route.projectsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@get call.respond(HttpStatusCode.Unauthorized, ApiErrorProject("unauthorized", "Missing token"))
                 val idParam = call.parameters["id"] ?: return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing id"))
-                val projectId = idParam.toIntOrNull() ?: return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
+                val projectId = parsePositiveIntParam(idParam) ?: return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
 
                 val companyId = principalCompanyId(principal)
                 if (companyId <= 0)
@@ -306,7 +334,7 @@ fun Route.projectsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@patch call.respond(HttpStatusCode.Unauthorized, ApiErrorProject("unauthorized", "Missing token"))
                 val idParam = call.parameters["id"] ?: return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing id"))
-                val projectId = idParam.toIntOrNull() ?: return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
+                val projectId = parsePositiveIntParam(idParam) ?: return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
 
                 val companyId = principalCompanyId(principal)
                 if (companyId <= 0)
@@ -328,6 +356,10 @@ fun Route.projectsRoutes() {
                     } catch (e: Exception) {
                         return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", e.message ?: "Body must be JSON"))
                     }
+                }
+
+                validateCoordinates(body.lat, body.lng)?.let { error ->
+                    return@patch call.respond(HttpStatusCode.BadRequest, error)
                 }
 
                 if (body.lat == null && body.lng == null && body.location == null && body.radius == null) {
@@ -374,7 +406,7 @@ fun Route.projectsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@get call.respond(HttpStatusCode.Unauthorized, ApiErrorProject("unauthorized", "Missing token"))
                 val idParam = call.parameters["id"] ?: return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing id"))
-                val projectId = idParam.toIntOrNull() ?: return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
+                val projectId = parsePositiveIntParam(idParam) ?: return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
 
                 val includeMembers = call.request.queryParameters["include"]?.contains("members") == true
                 val companyId = principalCompanyId(principal)
@@ -414,7 +446,7 @@ fun Route.projectsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@patch call.respond(HttpStatusCode.Unauthorized, ApiErrorProject("unauthorized", "Missing token"))
                 val idParam = call.parameters["id"] ?: return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing id"))
-                val projectId = idParam.toIntOrNull() ?: return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
+                val projectId = parsePositiveIntParam(idParam) ?: return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
 
                 val companyId = principalCompanyId(principal)
                 if (companyId <= 0)
@@ -447,6 +479,14 @@ fun Route.projectsRoutes() {
                     return@patch call.respond(HttpStatusCode.OK, current.toProjectDTO(membersCount))
                 }
 
+                validateCoordinates(body.lat, body.lng)?.let { error ->
+                    return@patch call.respond(HttpStatusCode.BadRequest, error)
+                }
+
+                if (body.title != null && body.title.isBlank()) {
+                    return@patch call.respond(HttpStatusCode.BadRequest, ApiErrorProject("title_required"))
+                }
+
                 try {
                     transaction {
                         Projects.update({ Projects.id eq row[Projects.id] }) {
@@ -477,7 +517,7 @@ fun Route.projectsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@delete call.respond(HttpStatusCode.Unauthorized, ApiErrorProject("unauthorized", "Missing token"))
                 val idParam = call.parameters["id"] ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing id"))
-                val projectId = idParam.toIntOrNull() ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
+                val projectId = parsePositiveIntParam(idParam) ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
 
                 val companyId = principalCompanyId(principal)
                 if (companyId <= 0)
@@ -503,7 +543,7 @@ fun Route.projectsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@get call.respond(HttpStatusCode.Unauthorized, ApiErrorProject("unauthorized", "Missing token"))
                 val idParam = call.parameters["id"] ?: return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing id"))
-                val projectId = idParam.toIntOrNull() ?: return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
+                val projectId = parsePositiveIntParam(idParam) ?: return@get call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
 
                 val companyId = principalCompanyId(principal)
                 if (companyId <= 0)
@@ -521,7 +561,7 @@ fun Route.projectsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized, ApiErrorProject("unauthorized", "Missing token"))
                 val idParam = call.parameters["id"] ?: return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing id"))
-                val projectId = idParam.toIntOrNull() ?: return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
+                val projectId = parsePositiveIntParam(idParam) ?: return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
 
                 val companyId = principalCompanyId(principal)
                 if (companyId <= 0)
@@ -535,6 +575,14 @@ fun Route.projectsRoutes() {
 
                 val body = try { call.receive<ProjectMemberAddRequest>() } catch (e: Exception) {
                     return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Body must be JSON"))
+                }
+
+                if (body.userId <= 0) {
+                    return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_user_id"))
+                }
+
+                if (body.role != null && body.role !in 0..10) {
+                    return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_role"))
                 }
 
                 try {
@@ -573,9 +621,9 @@ fun Route.projectsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@delete call.respond(HttpStatusCode.Unauthorized, ApiErrorProject("unauthorized", "Missing token"))
                 val idParam = call.parameters["id"] ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing id"))
-                val projectId = idParam.toIntOrNull() ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
+                val projectId = parsePositiveIntParam(idParam) ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
                 val userIdParam = call.parameters["userId"] ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing userId"))
-                val userId = userIdParam.toIntOrNull() ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_user_id"))
+                val userId = parsePositiveIntParam(userIdParam, "userId") ?: return@delete call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_user_id"))
 
                 val companyId = principalCompanyId(principal)
                 if (companyId <= 0)
@@ -602,7 +650,7 @@ fun Route.projectsRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized, ApiErrorProject("unauthorized", "Missing token"))
                 val idParam = call.parameters["id"] ?: return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Missing id"))
-                val projectId = idParam.toIntOrNull() ?: return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
+                val projectId = parsePositiveIntParam(idParam) ?: return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_id"))
                 val companyId = principalCompanyId(principal)
                 if (companyId <= 0)
                     return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("no_company", "Token has no companyId"))
@@ -615,6 +663,10 @@ fun Route.projectsRoutes() {
 
                 val body = try { call.receive<ProjectMembersBulkSetRequest>() } catch (e: Exception) {
                     return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_request", "Body must be JSON"))
+                }
+
+                if (body.userIds.any { it <= 0 }) {
+                    return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_user_id"))
                 }
 
                 try {

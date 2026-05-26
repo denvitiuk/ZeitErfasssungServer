@@ -130,6 +130,21 @@ private fun normalizeCode(raw: String): String = raw.trim().uppercase()
 
 private fun normalizeCompanyName(raw: String): String = raw.trim().replace(Regex("\\s+"), " ")
 
+private fun parseOptionalProjectId(value: String?): Int? =
+    value?.toIntOrNull()?.takeIf { it > 0 }
+
+private fun parseListLimit(value: String?, default: Int = 50, max: Int = 100): Int =
+    value?.toIntOrNull()?.coerceIn(1, max) ?: default
+
+private fun parseTimeZoneOrDefault(value: String?, default: String = "Europe/Berlin"): ZoneId {
+    val raw = value?.takeIf { it.isNotBlank() } ?: default
+    return try {
+        ZoneId.of(raw)
+    } catch (_: DateTimeException) {
+        ZoneId.of(default)
+    }
+}
+
 private fun isValidCompanyName(name: String): Boolean {
     if (name.length !in 2..80) return false
     // Allow Unicode letters/digits/space and a small set of punctuation used in company names
@@ -179,15 +194,16 @@ fun Route.companiesRoutes() {
         get {
             try {
                 val inviteFilterRaw = call.request.queryParameters["invite_code"]
-                val nameFilter = call.request.queryParameters["name"]
+                val nameFilter = call.request.queryParameters["name"]?.trim()?.takeIf { it.isNotBlank() }
                 val inviteFilter = inviteFilterRaw?.let { normalizeCode(it) }
+                val limit = parseListLimit(call.request.queryParameters["limit"])
                 val companies = transaction {
                     val base = Companies.slice(Companies.id, Companies.name, Companies.inviteCode, Companies.createdAt)
                     val query = when {
                         !inviteFilter.isNullOrBlank() -> base.select { Companies.inviteCode eq inviteFilter }
                         !nameFilter.isNullOrBlank() -> base.select { Companies.name like "%${nameFilter}%" }
                         else -> base.selectAll()
-                    }
+                    }.limit(limit)
                     query.map {
                         Company(
                             it[Companies.id].value,
@@ -367,7 +383,7 @@ fun Route.companiesRoutes() {
                     }
 
                     // optional project filter: ?projectId=8 ; 0 or missing = all
-                    val projectId = call.request.queryParameters["projectId"]?.toIntOrNull()
+                    val projectId = parseOptionalProjectId(call.request.queryParameters["projectId"])
 
                     val employeesCount = transaction {
                         Users.select { Users.companyId eq EntityID(companyId, Companies) }.count()
@@ -448,12 +464,10 @@ fun Route.companiesRoutes() {
                         return@get call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Admin rights required for this company"))
                     }
 
-                    val tz = try {
-                        ZoneId.of(call.request.queryParameters["tz"] ?: "Europe/Berlin")
-                    } catch (_: Exception) { ZoneId.of("Europe/Berlin") }
+                    val tz = parseTimeZoneOrDefault(call.request.queryParameters["tz"])
 
                     // optional project filter: ?projectId=8 ; 0 or missing = all
-                    val projectIdParam = call.request.queryParameters["projectId"]?.toIntOrNull()
+                    val projectIdParam = parseOptionalProjectId(call.request.queryParameters["projectId"])
                     val projectCond = if (projectIdParam != null && projectIdParam > 0) {
                         " AND l.project_id = $projectIdParam "
                     } else {
@@ -534,9 +548,7 @@ fun Route.companiesRoutes() {
                         return@get call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Admin rights required for this company"))
                     }
 
-                    val tz = try {
-                        ZoneId.of(call.request.queryParameters["tz"] ?: "Europe/Berlin")
-                    } catch (_: Exception) { ZoneId.of("Europe/Berlin") }
+                    val tz = parseTimeZoneOrDefault(call.request.queryParameters["tz"])
 
                     data class Row(
                         val id: Int,
@@ -837,8 +849,8 @@ fun Route.companiesRoutes() {
                         HttpStatusCode.BadRequest,
                         ApiError("invalid_request", "Missing company id")
                     )
-                val companyId = idParam.toIntOrNull()
-                    ?: return@get call.respond(HttpStatusCode.NotFound, ApiError("not_found", "Company not found"))
+                val companyId = idParam.toIntOrNull()?.takeIf { it > 0 }
+                    ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("bad_id", "Company id must be a positive integer"))
 
                 if (!(isMemberOfCompany(principal, companyId) || isAdminForCompany(principal, companyId))) {
                     return@get call.respond(
@@ -871,8 +883,8 @@ fun Route.companiesRoutes() {
                         HttpStatusCode.BadRequest,
                         ApiError("invalid_request", "Missing company id")
                     )
-                val companyId = idParam.toIntOrNull()
-                    ?: return@post call.respond(HttpStatusCode.NotFound, ApiError("not_found", "Company not found"))
+                val companyId = idParam.toIntOrNull()?.takeIf { it > 0 }
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, ApiError("bad_id", "Company id must be a positive integer"))
 
                 if (!isAdminForCompany(principal, companyId)) {
                     return@post call.respond(
@@ -903,8 +915,8 @@ fun Route.companiesRoutes() {
                         HttpStatusCode.BadRequest,
                         ApiError("invalid_request", "Missing company id")
                     )
-                val companyId = idParam.toIntOrNull()
-                    ?: return@put call.respond(HttpStatusCode.NotFound, ApiError("not_found", "Company not found"))
+                val companyId = idParam.toIntOrNull()?.takeIf { it > 0 }
+                    ?: return@put call.respond(HttpStatusCode.BadRequest, ApiError("bad_id", "Company id must be a positive integer"))
 
                 if (!isAdminForCompany(principal, companyId)) {
                     return@put call.respond(
@@ -966,9 +978,9 @@ fun Route.companiesRoutes() {
                     HttpStatusCode.BadRequest,
                     ApiError("id_required")
                 )
-                val id = idParam.toIntOrNull() ?: return@get call.respond(
+                val id = idParam.toIntOrNull()?.takeIf { it > 0 } ?: return@get call.respond(
                     HttpStatusCode.BadRequest,
-                    ApiError("id_must_be_int")
+                    ApiError("id_must_be_positive_int")
                 )
                 val company = transaction {
                     Companies

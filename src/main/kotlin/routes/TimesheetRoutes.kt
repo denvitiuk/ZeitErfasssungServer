@@ -16,6 +16,7 @@ import org.jetbrains.exposed.dao.id.EntityID
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.time.*
+import java.time.format.DateTimeParseException
 
 @Serializable
 private data class ApiErrorTimeSheet(val error: String, val detail: String? = null)
@@ -59,6 +60,31 @@ private fun isAdminForCompany(pr: JWTPrincipal, companyId: Int): Boolean {
 private fun principalUserId(pr: JWTPrincipal): Int? =
     pr.payload.getClaim("id").asInt()
         ?: pr.payload.getClaim("id").asString()?.toIntOrNull()
+
+private fun parseMonthParam(month: String?): YearMonth? {
+    if (month.isNullOrBlank()) return null
+
+    return try {
+        YearMonth.parse(month)
+    } catch (_: DateTimeParseException) {
+        null
+    }
+}
+
+private fun parseTimeZoneParam(tz: String?): ZoneId? {
+    val value = tz?.takeIf { it.isNotBlank() } ?: "Europe/Berlin"
+
+    if (!value.isSafeForSqlLiteral()) return null
+
+    return try {
+        ZoneId.of(value)
+    } catch (_: DateTimeException) {
+        null
+    }
+}
+
+private fun parseOptionalProjectId(value: String?): Int? =
+    value?.toIntOrNull()?.takeIf { it > 0 }
 
 private fun fetchAvailableMonths(userId: Int, projectId: Int?): List<String> = transaction {
     val out = mutableListOf<String>()
@@ -110,8 +136,7 @@ fun Route.timesheetRoutes() {
 
                 val userId = principalUserId(principal)
                     ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("bad_token", "No id in token"))
-
-                val projectId = call.request.queryParameters["projectId"]?.toIntOrNull()
+                val projectId = parseOptionalProjectId(call.request.queryParameters["projectId"])
 
                 val months = fetchAvailableMonths(userId, projectId)
                 call.respond(HttpStatusCode.OK, TimesheetMonthsDTO(months))
@@ -126,8 +151,7 @@ fun Route.timesheetRoutes() {
                     ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("id_required"))
                 val targetUserId = userIdParam.toIntOrNull()
                     ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("bad_id"))
-
-                val projectId = call.request.queryParameters["projectId"]?.toIntOrNull()
+                val projectId = parseOptionalProjectId(call.request.queryParameters["projectId"])
 
                 val companyId = principalCompanyId(principal)
                 if (companyId <= 0) return@get call.respond(HttpStatusCode.BadRequest, ApiError("no_company"))
@@ -155,9 +179,14 @@ fun Route.timesheetRoutes() {
                 val monthParam = call.request.queryParameters["month"]
                     ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("month_required", "Use ?month=YYYY-MM"))
 
-                val tz = ZoneId.of(call.request.queryParameters["tz"] ?: "Europe/Berlin")
+                if (parseMonthParam(monthParam) == null) {
+                    return@get call.respond(HttpStatusCode.BadRequest, ApiError("bad_month", "Use ?month=YYYY-MM"))
+                }
 
-                val projectId = call.request.queryParameters["projectId"]?.toIntOrNull()
+                val tz = parseTimeZoneParam(call.request.queryParameters["tz"])
+                    ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("bad_timezone"))
+
+                val projectId = parseOptionalProjectId(call.request.queryParameters["projectId"])
 
                 val dto = call.buildTimesheet(userId = userId, month = monthParam, tz = tz, projectId = projectId)
                     ?: return@get call.respond(HttpStatusCode.NotFound, ApiError("no_logs", "No data for month"))
@@ -177,9 +206,14 @@ fun Route.timesheetRoutes() {
 
                 val monthParam = call.request.queryParameters["month"]
                     ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("month_required", "Use ?month=YYYY-MM"))
-                val tz = ZoneId.of(call.request.queryParameters["tz"] ?: "Europe/Berlin")
+                if (parseMonthParam(monthParam) == null) {
+                    return@get call.respond(HttpStatusCode.BadRequest, ApiError("bad_month", "Use ?month=YYYY-MM"))
+                }
 
-                val projectId = call.request.queryParameters["projectId"]?.toIntOrNull()
+                val tz = parseTimeZoneParam(call.request.queryParameters["tz"])
+                    ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("bad_timezone"))
+
+                val projectId = parseOptionalProjectId(call.request.queryParameters["projectId"])
 
                 // проверка: этот юзер из той же компании и caller — админ
                 val companyId = principalCompanyId(principal)
@@ -215,8 +249,7 @@ fun Route.companyMonthsRoutes() {
             val companyId = principalCompanyId(principal)
             if (companyId <= 0) return@get call.respond(HttpStatusCode.BadRequest, ApiError("no_company"))
             if (!isAdminForCompany(principal, companyId)) return@get call.respond(HttpStatusCode.Forbidden, ApiError("forbidden"))
-
-            val projectId = call.request.queryParameters["projectId"]?.toIntOrNull()
+            val projectId = parseOptionalProjectId(call.request.queryParameters["projectId"])
             val months = fetchCompanyMonths(companyId, projectId)
             call.respond(HttpStatusCode.OK, CompanyMonthsDTO(months))
         }
@@ -239,8 +272,14 @@ fun Route.companyTimesheetRoutes() {
 
             val month = call.request.queryParameters["month"]
                 ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("month_required", "Use ?month=YYYY-MM"))
-            val tz = ZoneId.of(call.request.queryParameters["tz"] ?: "Europe/Berlin")
-            val projectId = call.request.queryParameters["projectId"]?.toIntOrNull()
+            if (parseMonthParam(month) == null) {
+                return@get call.respond(HttpStatusCode.BadRequest, ApiError("bad_month", "Use ?month=YYYY-MM"))
+            }
+
+            val tz = parseTimeZoneParam(call.request.queryParameters["tz"])
+                ?: return@get call.respond(HttpStatusCode.BadRequest, ApiError("bad_timezone"))
+
+            val projectId = parseOptionalProjectId(call.request.queryParameters["projectId"])
             val includeEmpty = call.request.queryParameters["includeEmpty"]?.toBooleanStrictOrNull() ?: false
 
             // Fetch users of this company
@@ -282,13 +321,10 @@ fun Route.companyTimesheetRoutes() {
 
 /** Основная сборка табеля за месяц. Работает с Logs.timestamp как LocalDateTime. */
 private fun ApplicationCall.buildTimesheet(userId: Int, month: String, tz: ZoneId, projectId: Int? = null): TimesheetMonthDTO? {
-    // month = "YYYY-MM"
-    val parts = month.split("-")
-    if (parts.size != 2) return null
-    val y = parts[0].toIntOrNull() ?: return null
-    val m = parts[1].toIntOrNull() ?: return null
+    val yearMonth = parseMonthParam(month) ?: return null
+    val daysInMonth = yearMonth.lengthOfMonth()
 
-    val startZdt = LocalDate.of(y, m, 1).atStartOfDay(tz)
+    val startZdt = yearMonth.atDay(1).atStartOfDay(tz)
     val endZdt   = startZdt.plusMonths(1)
 
     val startLocal = startZdt.toLocalDateTime()
@@ -318,8 +354,7 @@ private fun ApplicationCall.buildTimesheet(userId: Int, month: String, tz: ZoneI
     }
 
     if (rows.isEmpty()) {
-        // сформируем «пустой» табель на 31 день
-        val empty = (1..31).map { TimesheetDayDTO(day = it) }
+        val empty = (1..daysInMonth).map { TimesheetDayDTO(day = it) }
         return TimesheetMonthDTO(userId = userId, month = month, tz = tz.id, days = empty, totalMinutes = 0)
     }
 
@@ -347,12 +382,13 @@ private fun ApplicationCall.buildTimesheet(userId: Int, month: String, tz: ZoneI
     }
 
     // Режем интервалы по границам суток и суммируем по дню
-    val perDayMinutes = IntArray(31) { 0 }
-    val firstStartPerDay = arrayOfNulls<LocalTime>(31)
-    val lastEndPerDay    = arrayOfNulls<LocalTime>(31)
+    val perDayMinutes = IntArray(daysInMonth) { 0 }
+    val firstStartPerDay = arrayOfNulls<LocalTime>(daysInMonth)
+    val lastEndPerDay    = arrayOfNulls<LocalTime>(daysInMonth)
 
     fun addDayChunk(day: Int, start: LocalTime, end: LocalTime) {
         val idx = day - 1
+        if (idx !in 0 until daysInMonth) return
         val mins = Duration.between(start, end).toMinutes().toInt().coerceAtLeast(0)
         perDayMinutes[idx] += mins
         if (firstStartPerDay[idx] == null || start.isBefore(firstStartPerDay[idx])) firstStartPerDay[idx] = start
@@ -373,7 +409,7 @@ private fun ApplicationCall.buildTimesheet(userId: Int, month: String, tz: ZoneI
     }
 
     val df = java.time.format.DateTimeFormatter.ofPattern("HH:mm")
-    val days = (1..31).map { d ->
+    val days = (1..daysInMonth).map { d ->
         val mins = perDayMinutes[d - 1]
         val s = firstStartPerDay[d - 1]?.let { df.format(it) }
         val e = lastEndPerDay[d - 1]?.let { df.format(it) }
