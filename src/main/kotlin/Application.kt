@@ -389,6 +389,7 @@ fun Application.module() {
             registerEntitlementsRoutes()
             accountDeletionRoutes(deletionService)
             trackingRoutes()
+            workerJoinRoutes()
             // Document Flow
             registerDocumentFlowRoutes(
                 templateStorage = templateStorageImpl,
