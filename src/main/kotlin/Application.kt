@@ -390,6 +390,9 @@ fun Application.module() {
             accountDeletionRoutes(deletionService)
             trackingRoutes()
             workerJoinRoutes()
+            companyInviteRoutes()
+            companySearchRoutes()
+            expectedEmployeeImportRoutes()
             // Document Flow
             registerDocumentFlowRoutes(
                 templateStorage = templateStorageImpl,
