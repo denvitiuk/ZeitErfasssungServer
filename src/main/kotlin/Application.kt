@@ -393,6 +393,7 @@ fun Application.module() {
             companyInviteRoutes()
             companySearchRoutes()
             expectedEmployeeImportRoutes()
+            expectedEmployeeInviteRoutes(env)
             // Document Flow
             registerDocumentFlowRoutes(
                 templateStorage = templateStorageImpl,
