@@ -111,6 +111,7 @@ data class ProfileResponse(
     val role: String? = null,
     val avatar_url: String? = null,
     val company: String? = null,
+    val simplifiedWorkerFlowEnabled: Boolean = false,
     val created_at: String
 )
 
@@ -705,6 +706,23 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     }
                 }
 
+                // Feature flag: company-level simplified worker flow.
+                // Defaults to false when the user has no company or no settings row yet.
+                val simplifiedWorkerFlowEnabled = transaction {
+                    row[Users.companyId]?.value?.let { companyId ->
+                        exec(
+                            """
+                            SELECT COALESCE(simplified_worker_flow_enabled, false)
+                            FROM company_join_settings
+                            WHERE company_id = $companyId
+                            LIMIT 1
+                            """.trimIndent()
+                        ) { rs ->
+                            if (rs.next()) rs.getBoolean(1) else false
+                        } ?: false
+                    } ?: false
+                }
+
                 // Determine role string
                 val role = when {
                     row[Users.isGlobalAdmin] -> "globalAdmin"
@@ -727,7 +745,8 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     avatar_url = row.getOrNull(Users.avatarUrl),
                     created_at = createdAt,
                     role = role,
-                    company = companyName
+                    company = companyName,
+                    simplifiedWorkerFlowEnabled = simplifiedWorkerFlowEnabled
                 )
                 call.respond(HttpStatusCode.OK, profile)
             }
