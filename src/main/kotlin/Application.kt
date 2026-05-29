@@ -303,17 +303,18 @@ fun Application.module() {
     val storageProvider = (env["STORAGE_PROVIDER"] ?: "pg").lowercase()
     environment.log.info("Storage provider: $storageProvider")
 
+    val appDataSource = try {
+        buildHikariFromEnv(env)
+    } catch (t: Throwable) {
+        environment.log.error("Failed to init Hikari DataSource, DB-backed routes may be unavailable", t)
+        null
+    }
+
     val triple: Triple<DocumentTemplateStorage, DocumentRequestService, DocumentUploadService> =
         if (storageProvider == "pg") {
-            val ds = try {
-                buildHikariFromEnv(env)
-            } catch (t: Throwable) {
-                environment.log.error("Failed to init Hikari DataSource for Document Flow, falling back to stubs", t)
-                null
-            }
-            if (ds != null) {
-                val tpl = TemplateService(TemplateStoragePg(ds))
-                val req = RequestService(DocumentRequestServicePg(ds))
+            if (appDataSource != null) {
+                val tpl = TemplateService(TemplateStoragePg(appDataSource))
+                val req = RequestService(DocumentRequestServicePg(appDataSource))
                 val upl = DocumentUploadServicePg()
                 Triple(tpl, req, upl)
             } else {
@@ -394,6 +395,9 @@ fun Application.module() {
             companySearchRoutes()
             expectedEmployeeImportRoutes()
             expectedEmployeeInviteRoutes(env)
+            if (appDataSource != null) {
+                companySettingsRoutes(appDataSource)
+            }
             // Document Flow
             registerDocumentFlowRoutes(
                 templateStorage = templateStorageImpl,
@@ -416,12 +420,16 @@ class ExactProofJob : Job {
 }
 
 private fun buildHikariFromEnv(env: io.github.cdimascio.dotenv.Dotenv): DataSource {
-    val jdbcUrl = env["JDBC_DATABASE_URL"]
-        ?: env["JDBC_DATABASE_URL_NEON"]
-        ?: error("JDBC_DATABASE_URL or JDBC_DATABASE_URL_NEON must be set")
-    val user = env["DB_USER"] ?: env["DB_USER_NEON"] ?: error("DB_USER/DB_USER_NEON must be set")
-    val pass = env["DB_PASSWORD"] ?: env["DB_PASSWORD_NEON"] ?: error("DB_PASSWORD/DB_PASSWORD_NEON must be set")
-    val maxPool = (env["DB_MAX_POOL"] ?: env["DB_MAX_POOL_NEON"] ?: "10").toInt()
+    val jdbcUrl = env["JDBC_DATABASE_URL_NEON"]
+        ?: env["JDBC_DATABASE_URL"]
+        ?: error("JDBC_DATABASE_URL_NEON or JDBC_DATABASE_URL must be set")
+    val user = env["DB_USER_NEON"]
+        ?: env["DB_USER"]
+        ?: error("DB_USER_NEON or DB_USER must be set")
+    val pass = env["DB_PASSWORD_NEON"]
+        ?: env["DB_PASSWORD"]
+        ?: error("DB_PASSWORD_NEON or DB_PASSWORD must be set")
+    val maxPool = (env["DB_MAX_POOL_NEON"] ?: env["DB_MAX_POOL"] ?: "10").toInt()
 
     val cfg = HikariConfig().apply {
         this.jdbcUrl = jdbcUrl
