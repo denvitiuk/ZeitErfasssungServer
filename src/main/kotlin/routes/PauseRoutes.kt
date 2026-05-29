@@ -22,11 +22,13 @@ import java.time.ZoneOffset
 private const val DEFAULT_BREAK_START_TIME = "12:00"
 private const val DEFAULT_BREAK_END_TIME = "13:00"
 private const val DEFAULT_BREAK_DURATION_MINUTES = 60
+private const val DEFAULT_BREAK_TIMEZONE = "Europe/Berlin"
 
 private data class CompanyPauseSettings(
     val startTime: LocalTime = LocalTime.parse(DEFAULT_BREAK_START_TIME),
     val endTime: LocalTime = LocalTime.parse(DEFAULT_BREAK_END_TIME),
-    val durationMinutes: Int = DEFAULT_BREAK_DURATION_MINUTES
+    val durationMinutes: Int = DEFAULT_BREAK_DURATION_MINUTES,
+    val timezone: String = DEFAULT_BREAK_TIMEZONE
 )
 
 fun Route.pauseRoutes() {
@@ -36,14 +38,15 @@ fun Route.pauseRoutes() {
             post("/start") {
                 val userId = call.principal<JWTPrincipal>()!!.payload.getClaim("id").asString().toInt()
                 val nowInstant = Instant.now()
-                val nowBerlin = LocalDateTime.ofInstant(nowInstant, ZoneId.of("Europe/Berlin"))
                 val nowUtc = LocalDateTime.ofInstant(nowInstant, ZoneOffset.UTC)
 
                 val pauseSettings = loadCompanyPauseSettingsForUser(userId)
+                val companyZoneId = parseZoneIdOrDefault(pauseSettings.timezone)
+                val nowCompanyLocal = LocalDateTime.ofInstant(nowInstant, companyZoneId)
 
                 // Allow pause only inside the company-configured pause window.
                 // Defaults to 12:00-13:00 while the admin pause settings table is not configured yet.
-                val nowTime = nowBerlin.toLocalTime()
+                val nowTime = nowCompanyLocal.toLocalTime()
                 if (nowTime.isBefore(pauseSettings.startTime) || nowTime.isAfter(pauseSettings.endTime)) {
                     call.respond(
                         HttpStatusCode.Forbidden,
@@ -51,7 +54,8 @@ fun Route.pauseRoutes() {
                             "error" to "pause_not_allowed_now",
                             "breakStartTime" to pauseSettings.startTime.toString(),
                             "breakEndTime" to pauseSettings.endTime.toString(),
-                            "breakDurationMinutes" to pauseSettings.durationMinutes.toString()
+                            "breakDurationMinutes" to pauseSettings.durationMinutes.toString(),
+                            "timezone" to pauseSettings.timezone
                         )
                     )
                     return@post
@@ -125,7 +129,8 @@ private fun loadCompanyPauseSettingsForUser(userId: Int): CompanyPauseSettings {
             SELECT
                 COALESCE(pause_start_time, '$DEFAULT_BREAK_START_TIME') AS pause_start_time,
                 COALESCE(pause_end_time, '$DEFAULT_BREAK_END_TIME') AS pause_end_time,
-                COALESCE(pause_duration_minutes, $DEFAULT_BREAK_DURATION_MINUTES) AS pause_duration_minutes
+                COALESCE(pause_duration_minutes, $DEFAULT_BREAK_DURATION_MINUTES) AS pause_duration_minutes,
+                COALESCE(timezone, '$DEFAULT_BREAK_TIMEZONE') AS timezone
             FROM company_pause_settings
             WHERE company_id = $companyId
             LIMIT 1
@@ -142,7 +147,8 @@ private fun loadCompanyPauseSettingsForUser(userId: Int): CompanyPauseSettings {
                         fallback = DEFAULT_BREAK_END_TIME
                     ),
                     durationMinutes = rs.getInt("pause_duration_minutes").takeIf { !rs.wasNull() }
-                        ?: DEFAULT_BREAK_DURATION_MINUTES
+                        ?: DEFAULT_BREAK_DURATION_MINUTES,
+                    timezone = rs.getString("timezone") ?: DEFAULT_BREAK_TIMEZONE
                 )
             } else {
                 CompanyPauseSettings()
@@ -156,3 +162,7 @@ private fun parseBreakTimeOrDefault(value: String?, fallback: String): LocalTime
         .getOrElse { LocalTime.parse(fallback) }
 }
 
+private fun parseZoneIdOrDefault(value: String): ZoneId {
+    return runCatching { ZoneId.of(value) }
+        .getOrElse { ZoneId.of(DEFAULT_BREAK_TIMEZONE) }
+}

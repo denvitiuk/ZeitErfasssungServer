@@ -115,6 +115,7 @@ data class ProfileResponse(
     val pauseStartTime: String = DEFAULT_PAUSE_START_TIME,
     val pauseEndTime: String = DEFAULT_PAUSE_END_TIME,
     val pauseDurationMinutes: Int = DEFAULT_PAUSE_DURATION_MINUTES,
+    val pauseTimezone: String = DEFAULT_PAUSE_TIMEZONE,
     val created_at: String
 )
 
@@ -135,6 +136,7 @@ data class LinkCompanyResponse(
 private const val DEFAULT_PAUSE_START_TIME = "12:00"
 private const val DEFAULT_PAUSE_END_TIME = "13:00"
 private const val DEFAULT_PAUSE_DURATION_MINUTES = 60
+private const val DEFAULT_PAUSE_TIMEZONE = "Europe/Berlin"
 
 // --- Refresh sessions (server-side) ---
 // NOTE: The physical table must exist in Postgres (create it via Neon SQL Editor).
@@ -263,7 +265,8 @@ private data class ProfileWorkerFlowSettings(
     val simplifiedWorkerFlowEnabled: Boolean = false,
     val pauseStartTime: String = DEFAULT_PAUSE_START_TIME,
     val pauseEndTime: String = DEFAULT_PAUSE_END_TIME,
-    val pauseDurationMinutes: Int = DEFAULT_PAUSE_DURATION_MINUTES
+    val pauseDurationMinutes: Int = DEFAULT_PAUSE_DURATION_MINUTES,
+    val pauseTimezone: String = DEFAULT_PAUSE_TIMEZONE
 )
 
 private fun normalizeProfilePauseTime(value: String?, fallback: String): String {
@@ -738,7 +741,8 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                                 COALESCE(cjs.simplified_worker_flow_enabled, false) AS simplified_worker_flow_enabled,
                                 COALESCE(cps.pause_start_time::text, '$DEFAULT_PAUSE_START_TIME') AS pause_start_time,
                                 COALESCE(cps.pause_end_time::text, '$DEFAULT_PAUSE_END_TIME') AS pause_end_time,
-                                COALESCE(cps.pause_duration_minutes, $DEFAULT_PAUSE_DURATION_MINUTES) AS pause_duration_minutes
+                                COALESCE(cps.pause_duration_minutes, $DEFAULT_PAUSE_DURATION_MINUTES) AS pause_duration_minutes,
+                                COALESCE(cps.timezone, '$DEFAULT_PAUSE_TIMEZONE') AS pause_timezone
                             FROM companies c
                             LEFT JOIN company_join_settings cjs ON cjs.company_id = c.id
                             LEFT JOIN company_pause_settings cps ON cps.company_id = c.id
@@ -758,7 +762,8 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                                         fallback = DEFAULT_PAUSE_END_TIME
                                     ),
                                     pauseDurationMinutes = rs.getInt("pause_duration_minutes").takeIf { !rs.wasNull() }
-                                        ?: DEFAULT_PAUSE_DURATION_MINUTES
+                                        ?: DEFAULT_PAUSE_DURATION_MINUTES,
+                                    pauseTimezone = rs.getString("pause_timezone") ?: DEFAULT_PAUSE_TIMEZONE
                                 )
                             } else {
                                 ProfileWorkerFlowSettings()
@@ -793,7 +798,8 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     simplifiedWorkerFlowEnabled = workerFlowSettings.simplifiedWorkerFlowEnabled,
                     pauseStartTime = workerFlowSettings.pauseStartTime,
                     pauseEndTime = workerFlowSettings.pauseEndTime,
-                    pauseDurationMinutes = workerFlowSettings.pauseDurationMinutes
+                    pauseDurationMinutes = workerFlowSettings.pauseDurationMinutes,
+                    pauseTimezone = workerFlowSettings.pauseTimezone
                 )
                 call.respond(HttpStatusCode.OK, profile)
             }

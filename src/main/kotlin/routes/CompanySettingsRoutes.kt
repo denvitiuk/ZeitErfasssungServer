@@ -12,6 +12,7 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.patch
 import io.ktor.server.routing.route
 import kotlinx.serialization.Serializable
+import java.time.ZoneId
 import javax.sql.DataSource
 
 @Serializable
@@ -30,14 +31,16 @@ data class CompanyPauseSettingsResponse(
     val companyId: Int,
     val pauseStartTime: String,
     val pauseEndTime: String,
-    val pauseDurationMinutes: Int
+    val pauseDurationMinutes: Int,
+    val timezone: String = DEFAULT_PAUSE_TIMEZONE
 )
 
 @Serializable
 data class UpdateCompanyPauseSettingsRequest(
     val pauseStartTime: String? = null,
     val pauseEndTime: String? = null,
-    val pauseDurationMinutes: Int? = null
+    val pauseDurationMinutes: Int? = null,
+    val timezone: String? = null
 )
 
 @Serializable
@@ -49,6 +52,7 @@ private const val DEFAULT_PAUSE_START_TIME = "12:00"
 private const val DEFAULT_PAUSE_END_TIME = "13:00"
 private const val DEFAULT_PAUSE_DURATION_MINUTES = 60
 private const val MAX_PAUSE_DURATION_MINUTES = 240
+private const val DEFAULT_PAUSE_TIMEZONE = "Europe/Berlin"
 
 fun Route.companySettingsRoutes(dataSource: DataSource) {
     route("/admin/company/easy-worker-flow") {
@@ -218,7 +222,8 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                     SELECT
                         COALESCE(pause_start_time::text, ?) AS pause_start_time,
                         COALESCE(pause_end_time::text, ?) AS pause_end_time,
-                        COALESCE(pause_duration_minutes, ?) AS pause_duration_minutes
+                        COALESCE(pause_duration_minutes, ?) AS pause_duration_minutes,
+                        COALESCE(timezone, ?) AS timezone
                     FROM company_pause_settings
                     WHERE company_id = ?
                     LIMIT 1
@@ -227,7 +232,8 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                     statement.setString(1, DEFAULT_PAUSE_START_TIME)
                     statement.setString(2, DEFAULT_PAUSE_END_TIME)
                     statement.setInt(3, DEFAULT_PAUSE_DURATION_MINUTES)
-                    statement.setInt(4, admin.companyId)
+                    statement.setString(4, DEFAULT_PAUSE_TIMEZONE)
+                    statement.setInt(5, admin.companyId)
                     statement.executeQuery().use { rs ->
                         if (rs.next()) {
                             CompanyPauseSettingsResponse(
@@ -241,14 +247,16 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                                     fallback = DEFAULT_PAUSE_END_TIME
                                 ),
                                 pauseDurationMinutes = rs.getInt("pause_duration_minutes").takeIf { !rs.wasNull() }
-                                    ?: DEFAULT_PAUSE_DURATION_MINUTES
+                                    ?: DEFAULT_PAUSE_DURATION_MINUTES,
+                                timezone = rs.getString("timezone") ?: DEFAULT_PAUSE_TIMEZONE
                             )
                         } else {
                             CompanyPauseSettingsResponse(
                                 companyId = admin.companyId,
                                 pauseStartTime = DEFAULT_PAUSE_START_TIME,
                                 pauseEndTime = DEFAULT_PAUSE_END_TIME,
-                                pauseDurationMinutes = DEFAULT_PAUSE_DURATION_MINUTES
+                                pauseDurationMinutes = DEFAULT_PAUSE_DURATION_MINUTES,
+                                timezone = DEFAULT_PAUSE_TIMEZONE
                             )
                         }
                     }
@@ -286,7 +294,8 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                     SELECT
                         COALESCE(pause_start_time::text, ?) AS pause_start_time,
                         COALESCE(pause_end_time::text, ?) AS pause_end_time,
-                        COALESCE(pause_duration_minutes, ?) AS pause_duration_minutes
+                        COALESCE(pause_duration_minutes, ?) AS pause_duration_minutes,
+                        COALESCE(timezone, ?) AS timezone
                     FROM company_pause_settings
                     WHERE company_id = ?
                     LIMIT 1
@@ -295,7 +304,8 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                     statement.setString(1, DEFAULT_PAUSE_START_TIME)
                     statement.setString(2, DEFAULT_PAUSE_END_TIME)
                     statement.setInt(3, DEFAULT_PAUSE_DURATION_MINUTES)
-                    statement.setInt(4, admin.companyId)
+                    statement.setString(4, DEFAULT_PAUSE_TIMEZONE)
+                    statement.setInt(5, admin.companyId)
                     statement.executeQuery().use { rs ->
                         if (rs.next()) {
                             CompanyPauseSettingsResponse(
@@ -309,14 +319,16 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                                     fallback = DEFAULT_PAUSE_END_TIME
                                 ),
                                 pauseDurationMinutes = rs.getInt("pause_duration_minutes").takeIf { !rs.wasNull() }
-                                    ?: DEFAULT_PAUSE_DURATION_MINUTES
+                                    ?: DEFAULT_PAUSE_DURATION_MINUTES,
+                                timezone = rs.getString("timezone") ?: DEFAULT_PAUSE_TIMEZONE
                             )
                         } else {
                             CompanyPauseSettingsResponse(
                                 companyId = admin.companyId,
                                 pauseStartTime = DEFAULT_PAUSE_START_TIME,
                                 pauseEndTime = DEFAULT_PAUSE_END_TIME,
-                                pauseDurationMinutes = DEFAULT_PAUSE_DURATION_MINUTES
+                                pauseDurationMinutes = DEFAULT_PAUSE_DURATION_MINUTES,
+                                timezone = DEFAULT_PAUSE_TIMEZONE
                             )
                         }
                     }
@@ -328,6 +340,9 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                     ?: current.pauseEndTime
                 val normalizedPauseDurationMinutes = request.pauseDurationMinutes
                     ?: current.pauseDurationMinutes
+
+                val normalizedTimezone = request.timezone?.trim()?.takeIf { it.isNotBlank() }
+                    ?: current.timezone
 
                 if (!isValidPauseTime(normalizedPauseStartTime)) {
                     return@patch call.respond(
@@ -350,6 +365,13 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                     )
                 }
 
+                if (!isValidTimezone(normalizedTimezone)) {
+                    return@patch call.respond(
+                        HttpStatusCode.BadRequest,
+                        CompanySettingsError("invalid_pause_timezone")
+                    )
+                }
+
                 if (normalizedPauseStartTime >= normalizedPauseEndTime) {
                     return@patch call.respond(
                         HttpStatusCode.BadRequest,
@@ -364,15 +386,17 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                         pause_start_time,
                         pause_end_time,
                         pause_duration_minutes,
+                        timezone,
                         created_at,
                         updated_at
                     )
-                    VALUES (?, ?::time, ?::time, ?, now(), now())
+                    VALUES (?, ?::time, ?::time, ?, ?, now(), now())
                     ON CONFLICT (company_id)
                     DO UPDATE SET
                         pause_start_time = EXCLUDED.pause_start_time,
                         pause_end_time = EXCLUDED.pause_end_time,
                         pause_duration_minutes = EXCLUDED.pause_duration_minutes,
+                        timezone = EXCLUDED.timezone,
                         updated_at = now()
                     """.trimIndent()
                 ).use { statement ->
@@ -380,6 +404,7 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                     statement.setString(2, normalizedPauseStartTime)
                     statement.setString(3, normalizedPauseEndTime)
                     statement.setInt(4, normalizedPauseDurationMinutes)
+                    statement.setString(5, normalizedTimezone)
                     statement.executeUpdate()
                 }
 
@@ -388,7 +413,8 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                         companyId = admin.companyId,
                         pauseStartTime = normalizedPauseStartTime,
                         pauseEndTime = normalizedPauseEndTime,
-                        pauseDurationMinutes = normalizedPauseDurationMinutes
+                        pauseDurationMinutes = normalizedPauseDurationMinutes,
+                        timezone = normalizedTimezone
                     )
                 )
             }
@@ -432,6 +458,10 @@ private fun normalizePauseTimeForResponse(value: String?, fallback: String): Str
 
 private fun isValidPauseTime(value: String): Boolean {
     return Regex("^([01]\\d|2[0-3]):[0-5]\\d$").matches(value)
+}
+
+private fun isValidTimezone(value: String): Boolean {
+    return runCatching { ZoneId.of(value) }.isSuccess
 }
 
 private data class AdminCompanyAccess(
