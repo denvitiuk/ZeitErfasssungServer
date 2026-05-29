@@ -112,6 +112,9 @@ data class ProfileResponse(
     val avatar_url: String? = null,
     val company: String? = null,
     val simplifiedWorkerFlowEnabled: Boolean = false,
+    val pauseStartTime: String = DEFAULT_PAUSE_START_TIME,
+    val pauseEndTime: String = DEFAULT_PAUSE_END_TIME,
+    val pauseDurationMinutes: Int = DEFAULT_PAUSE_DURATION_MINUTES,
     val created_at: String
 )
 
@@ -128,6 +131,10 @@ data class LinkCompanyResponse(
     val refreshToken: String? = null,
     val expiresInMs: Long? = null
 )
+
+private const val DEFAULT_PAUSE_START_TIME = "12:00"
+private const val DEFAULT_PAUSE_END_TIME = "13:00"
+private const val DEFAULT_PAUSE_DURATION_MINUTES = 60
 
 // --- Refresh sessions (server-side) ---
 // NOTE: The physical table must exist in Postgres (create it via Neon SQL Editor).
@@ -252,6 +259,21 @@ private fun issueJwt(
 
     return token to expiresIn
 }
+private data class ProfileWorkerFlowSettings(
+    val simplifiedWorkerFlowEnabled: Boolean = false,
+    val pauseStartTime: String = DEFAULT_PAUSE_START_TIME,
+    val pauseEndTime: String = DEFAULT_PAUSE_END_TIME,
+    val pauseDurationMinutes: Int = DEFAULT_PAUSE_DURATION_MINUTES
+)
+
+private fun normalizeProfilePauseTime(value: String?, fallback: String): String {
+    return value
+        ?.trim()
+        ?.takeIf { it.isNotBlank() }
+        ?.take(5)
+        ?: fallback
+}
+
 fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
 
     // Logout: revoke the current refresh token/session.
@@ -706,21 +728,43 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     }
                 }
 
-                // Feature flag: company-level simplified worker flow.
-                // Defaults to false when the user has no company or no settings row yet.
-                val simplifiedWorkerFlowEnabled = transaction {
+                // Company-level worker flow and pause settings.
+                // Defaults are used when the user has no company or no settings row yet.
+                val workerFlowSettings = transaction {
                     row[Users.companyId]?.value?.let { companyId ->
                         exec(
                             """
-                            SELECT COALESCE(simplified_worker_flow_enabled, false)
-                            FROM company_join_settings
-                            WHERE company_id = $companyId
+                            SELECT
+                                COALESCE(cjs.simplified_worker_flow_enabled, false) AS simplified_worker_flow_enabled,
+                                COALESCE(cps.pause_start_time::text, '$DEFAULT_PAUSE_START_TIME') AS pause_start_time,
+                                COALESCE(cps.pause_end_time::text, '$DEFAULT_PAUSE_END_TIME') AS pause_end_time,
+                                COALESCE(cps.pause_duration_minutes, $DEFAULT_PAUSE_DURATION_MINUTES) AS pause_duration_minutes
+                            FROM companies c
+                            LEFT JOIN company_join_settings cjs ON cjs.company_id = c.id
+                            LEFT JOIN company_pause_settings cps ON cps.company_id = c.id
+                            WHERE c.id = $companyId
                             LIMIT 1
                             """.trimIndent()
                         ) { rs ->
-                            if (rs.next()) rs.getBoolean(1) else false
-                        } ?: false
-                    } ?: false
+                            if (rs.next()) {
+                                ProfileWorkerFlowSettings(
+                                    simplifiedWorkerFlowEnabled = rs.getBoolean("simplified_worker_flow_enabled"),
+                                    pauseStartTime = normalizeProfilePauseTime(
+                                        value = rs.getString("pause_start_time"),
+                                        fallback = DEFAULT_PAUSE_START_TIME
+                                    ),
+                                    pauseEndTime = normalizeProfilePauseTime(
+                                        value = rs.getString("pause_end_time"),
+                                        fallback = DEFAULT_PAUSE_END_TIME
+                                    ),
+                                    pauseDurationMinutes = rs.getInt("pause_duration_minutes").takeIf { !rs.wasNull() }
+                                        ?: DEFAULT_PAUSE_DURATION_MINUTES
+                                )
+                            } else {
+                                ProfileWorkerFlowSettings()
+                            }
+                        } ?: ProfileWorkerFlowSettings()
+                    } ?: ProfileWorkerFlowSettings()
                 }
 
                 // Determine role string
@@ -746,7 +790,10 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     created_at = createdAt,
                     role = role,
                     company = companyName,
-                    simplifiedWorkerFlowEnabled = simplifiedWorkerFlowEnabled
+                    simplifiedWorkerFlowEnabled = workerFlowSettings.simplifiedWorkerFlowEnabled,
+                    pauseStartTime = workerFlowSettings.pauseStartTime,
+                    pauseEndTime = workerFlowSettings.pauseEndTime,
+                    pauseDurationMinutes = workerFlowSettings.pauseDurationMinutes
                 )
                 call.respond(HttpStatusCode.OK, profile)
             }
