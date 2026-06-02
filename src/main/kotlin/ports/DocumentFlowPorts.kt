@@ -4,7 +4,7 @@ import java.time.Instant
 import java.time.LocalDate
 
 /**
- * Domain enums shared by routes and services.
+ * Domain enums shared by routes and sчervices.
  * Keep values in sync with DB CHECK constraints.
  */
 enum class DocumentType {
@@ -13,6 +13,18 @@ enum class DocumentType {
 
 enum class RequestStatus {
     EINGEREICHT, ANGENOMMEN, ABGELEHNT
+}
+
+enum class DocumentSignatureRole {
+    WORKER,
+    ADMIN
+}
+
+enum class DocumentRequestEventType {
+    REQUEST_CREATED,
+    WORKER_SIGNED,
+    ADMIN_SIGNED,
+    STATUS_CHANGED
 }
 
 /* ===================== Templates ===================== */
@@ -127,12 +139,64 @@ data class SetStatus(
     val reason: String? = null
 )
 
+data class SubmitDocumentSignature(
+    val signerRole: DocumentSignatureRole,
+    val signatureImageBase64: String,
+    val deviceInfo: String? = null
+)
+
+data class DocumentRequestSignature(
+    val id: Long,
+    val requestId: Int,
+    val companyId: Int,
+    val signerUserId: Int,
+    val signerRole: DocumentSignatureRole,
+    val signatureImageBlobId: Long?,
+    val documentSnapshotHash: String?,
+    val ipAddress: String?,
+    val userAgent: String?,
+    val deviceInfo: String?,
+    val signedAt: Instant,
+    val createdAt: Instant
+)
+
+data class DocumentRequestEvent(
+    val id: Long,
+    val requestId: Int,
+    val companyId: Int,
+    val actorUserId: Int?,
+    val eventType: DocumentRequestEventType,
+    val metadata: String?,
+    val createdAt: Instant
+)
+
+data class DocumentSignatureSettings(
+    val companyId: Int,
+    val signaturesEnabled: Boolean = true,
+    val signaturesRequired: Boolean = false,
+    val workerSignatureRequired: Boolean = false,
+    val adminSignatureRequired: Boolean = false,
+    val createdAt: Instant,
+    val updatedAt: Instant
+)
+
+data class UpdateDocumentSignatureSettings(
+    val signaturesEnabled: Boolean? = null,
+    val signaturesRequired: Boolean? = null,
+    val workerSignatureRequired: Boolean? = null,
+    val adminSignatureRequired: Boolean? = null
+)
+
 // === Compatibility aliases for PG service ===
 // These aliases make PG implementation compile while ports use newer names.
 // Safe to keep long-term; they are transparent at compile time.
  typealias AttachmentRef = IncomingAttachment
  typealias CreateDocumentRequestPayload = CreateDocumentRequest
  typealias SetRequestStatusPayload = SetStatus
+ typealias SubmitDocumentSignaturePayload = SubmitDocumentSignature
+ typealias DocumentRequestEventDTO = DocumentRequestEvent
+ typealias DocumentSignatureSettingsDTO = DocumentSignatureSettings
+ typealias UpdateDocumentSignatureSettingsPayload = UpdateDocumentSignatureSettings
 
 data class LeaveBalance(
     val year: Int,
@@ -164,6 +228,43 @@ interface DocumentRequestService {
      * Should also write a row to document_request_status_history.
      */
     suspend fun setStatus(adminId: Int, companyId: Int, requestId: Int, payload: SetStatus): DocumentRequestFull
+
+    /**
+     * Optional SES signature for an existing document request.
+     * Does not change the request status; status remains EINGEREICHT / ANGENOMMEN / ABGELEHNT.
+     */
+    suspend fun signRequest(
+        signerUserId: Int,
+        companyId: Int,
+        requestId: Int,
+        payload: SubmitDocumentSignature,
+        ipAddress: String?,
+        userAgent: String?
+    ): DocumentRequestSignature
+
+    /** Optional signatures attached to a request, ordered by signedAt. */
+    suspend fun listSignatures(
+        userId: Int,
+        companyId: Int,
+        requestId: Int
+    ): List<DocumentRequestSignature>
+
+    /** Audit events attached to a request, newest first. */
+    suspend fun listEvents(
+        userId: Int,
+        companyId: Int,
+        requestId: Int
+    ): List<DocumentRequestEvent>
+
+    /** Company-level SES signature settings. Defaults are created lazily when missing. */
+    suspend fun getSignatureSettings(companyId: Int): DocumentSignatureSettings
+
+    /** Admin-only update of company-level SES signature settings. */
+    suspend fun updateSignatureSettings(
+        adminId: Int,
+        companyId: Int,
+        payload: UpdateDocumentSignatureSettings
+    ): DocumentSignatureSettings
 
     /**
      * Return current (or given year) vacation balance.

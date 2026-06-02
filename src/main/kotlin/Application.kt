@@ -49,6 +49,13 @@ import com.yourcompany.zeiterfassung.routes.PresignRequest
 import com.yourcompany.zeiterfassung.routes.PresignResponse
 import com.yourcompany.zeiterfassung.routes.RequestStatus
 import com.yourcompany.zeiterfassung.routes.DownloadedObject
+import com.yourcompany.zeiterfassung.routes.SubmitDocumentSignaturePayload
+import com.yourcompany.zeiterfassung.routes.DocumentRequestSignatureDTO
+import com.yourcompany.zeiterfassung.routes.DocumentSignatureRole
+import com.yourcompany.zeiterfassung.routes.DocumentRequestEventDTO
+import com.yourcompany.zeiterfassung.routes.DocumentRequestEventType
+import com.yourcompany.zeiterfassung.routes.DocumentSignatureSettingsDTO
+import com.yourcompany.zeiterfassung.routes.UpdateDocumentSignatureSettingsPayload
 
 import com.yourcompany.zeiterfassung.service.TemplateService
 import com.yourcompany.zeiterfassung.service.pg.TemplateStoragePg
@@ -266,11 +273,67 @@ fun Application.module() {
             throw UnsupportedOperationException("setStatus: not wired yet (stub)")
         }
 
+        override suspend fun signRequest(
+            signerUserId: Long,
+            companyId: Long,
+            requestId: Long,
+            payload: SubmitDocumentSignaturePayload,
+            ipAddress: String?,
+            userAgent: String?
+        ): DocumentRequestSignatureDTO {
+            throw UnsupportedOperationException("signRequest: not wired yet (stub)")
+        }
+
+        override suspend fun listSignatures(
+            userId: Long,
+            companyId: Long,
+            requestId: Long
+        ): List<DocumentRequestSignatureDTO> {
+            return emptyList()
+        }
+
+        override suspend fun listEvents(
+            userId: Long,
+            companyId: Long,
+            requestId: Long
+        ): List<DocumentRequestEventDTO> {
+            return emptyList()
+        }
+
+        override suspend fun getSignatureSettings(companyId: Long): DocumentSignatureSettingsDTO {
+            val now = System.currentTimeMillis()
+            return DocumentSignatureSettingsDTO(
+                companyId = companyId,
+                signaturesEnabled = true,
+                signaturesRequired = false,
+                workerSignatureRequired = false,
+                adminSignatureRequired = false,
+                createdAt = now,
+                updatedAt = now
+            )
+        }
+
+        override suspend fun updateSignatureSettings(
+            adminId: Long,
+            companyId: Long,
+            payload: UpdateDocumentSignatureSettingsPayload
+        ): DocumentSignatureSettingsDTO {
+            val now = System.currentTimeMillis()
+            return DocumentSignatureSettingsDTO(
+                companyId = companyId,
+                signaturesEnabled = payload.signaturesEnabled ?: true,
+                signaturesRequired = payload.signaturesRequired ?: false,
+                workerSignatureRequired = payload.workerSignatureRequired ?: false,
+                adminSignatureRequired = payload.adminSignatureRequired ?: false,
+                createdAt = now,
+                updatedAt = now
+            )
+        }
+
         override suspend fun leaveBalance(userId: Long): LeaveBalanceDTO {
             // Return zeros in stub so UI can render without crashing
             return LeaveBalanceDTO(0.0, 0.0, 0.0, 0.0)
         }
-
 
         override suspend fun adminLeaveBalance(targetUserId: Long, year: Int): LeaveBalanceDTO {
             return LeaveBalanceDTO(0.0, 0.0, 0.0, 0.0)

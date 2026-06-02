@@ -5,6 +5,7 @@ import io.ktor.server.application.*
 import io.ktor.server.auth.*
 import io.ktor.server.auth.jwt.*
 import io.ktor.server.request.*
+import io.ktor.server.plugins.origin
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.Serializable
@@ -28,6 +29,20 @@ enum class RequestStatus {
     EINGEREICHT,  // отправлено
     ANGENOMMEN,   // одобрено
     ABGELEHNT     // отклонено
+}
+
+@Serializable
+enum class DocumentSignatureRole {
+    WORKER,
+    ADMIN
+}
+
+@Serializable
+enum class DocumentRequestEventType {
+    REQUEST_CREATED,
+    WORKER_SIGNED,
+    ADMIN_SIGNED,
+    STATUS_CHANGED
 }
 
 @Serializable
@@ -75,6 +90,7 @@ data class RequestDTO(
     val halfDayEnd: Boolean? = null,
     val note: String? = null,
     val attachments: List<AttachmentRef> = emptyList(),
+    val signatures: List<DocumentRequestSignatureDTO> = emptyList(),
     val createdAt: Long,
     val updatedAt: Long,
     val declineReason: String? = null
@@ -99,6 +115,60 @@ data class AdjustLeavePayload(
 data class SetStatusPayload(
     val status: RequestStatus,  // ANGENOMMEN или ABGELEHNT
     val reason: String? = null
+)
+
+@Serializable
+data class SubmitDocumentSignaturePayload(
+    val signerRole: DocumentSignatureRole,
+    val signatureImageBase64: String,
+    val deviceInfo: String? = null
+)
+
+@Serializable
+data class DocumentRequestSignatureDTO(
+    val id: Long,
+    val requestId: Long,
+    val companyId: Long,
+    val signerUserId: Long,
+    val signerRole: DocumentSignatureRole,
+    val signatureImageBlobId: Long? = null,
+    val signatureImageUrl: String? = null,
+    val documentSnapshotHash: String? = null,
+    val ipAddress: String? = null,
+    val userAgent: String? = null,
+    val deviceInfo: String? = null,
+    val signedAt: Long,
+    val createdAt: Long
+)
+
+@Serializable
+data class DocumentRequestEventDTO(
+    val id: Long,
+    val requestId: Long,
+    val companyId: Long,
+    val actorUserId: Long? = null,
+    val eventType: DocumentRequestEventType,
+    val metadata: String? = null,
+    val createdAt: Long
+)
+
+@Serializable
+data class DocumentSignatureSettingsDTO(
+    val companyId: Long,
+    val signaturesEnabled: Boolean,
+    val signaturesRequired: Boolean,
+    val workerSignatureRequired: Boolean,
+    val adminSignatureRequired: Boolean,
+    val createdAt: Long,
+    val updatedAt: Long
+)
+
+@Serializable
+data class UpdateDocumentSignatureSettingsPayload(
+    val signaturesEnabled: Boolean? = null,
+    val signaturesRequired: Boolean? = null,
+    val workerSignatureRequired: Boolean? = null,
+    val adminSignatureRequired: Boolean? = null
 )
 
 @Serializable
@@ -195,6 +265,35 @@ interface DocumentRequestService {
     suspend fun listOwn(userId: Long): List<RequestDTO>
     suspend fun listForCompany(companyId: Long, status: RequestStatus?): List<RequestDTO>
     suspend fun setStatus(adminId: Long, companyId: Long, requestId: Long, payload: SetStatusPayload): RequestDTO
+    suspend fun signRequest(
+        signerUserId: Long,
+        companyId: Long,
+        requestId: Long,
+        payload: SubmitDocumentSignaturePayload,
+        ipAddress: String?,
+        userAgent: String?
+    ): DocumentRequestSignatureDTO
+
+    suspend fun listSignatures(
+        userId: Long,
+        companyId: Long,
+        requestId: Long
+    ): List<DocumentRequestSignatureDTO>
+
+    suspend fun listEvents(
+        userId: Long,
+        companyId: Long,
+        requestId: Long
+    ): List<DocumentRequestEventDTO>
+
+    suspend fun getSignatureSettings(companyId: Long): DocumentSignatureSettingsDTO
+
+    suspend fun updateSignatureSettings(
+        adminId: Long,
+        companyId: Long,
+        payload: UpdateDocumentSignatureSettingsPayload
+    ): DocumentSignatureSettingsDTO
+
     suspend fun leaveBalance(userId: Long): LeaveBalanceDTO
     suspend fun adminLeaveBalance(targetUserId: Long, year: Int): LeaveBalanceDTO
     suspend fun adjustLeaveEntitlement(
@@ -288,6 +387,91 @@ fun Route.registerDocumentFlowRoutes(
                 val list = requestService.listOwn(claims.userId)
                 call.respond(list)
             }
+
+            // GET /requests/{id}/signatures — optional SES signatures for one request
+            get("/{id}/signatures") {
+                val claims = call.requireAuthOrRespond() ?: return@get
+                val companyId = claims.companyId
+                    ?: return@get call.respondError(HttpStatusCode.BadRequest, "no_company")
+                val id = call.parameters["id"]?.toLongOrNull()
+                    ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_id")
+
+                val signatures = requestService.listSignatures(
+                    userId = claims.userId,
+                    companyId = companyId,
+                    requestId = id
+                )
+                call.respond(signatures)
+            }
+
+            // GET /requests/{id}/events — audit timeline for one request
+            get("/{id}/events") {
+                val claims = call.requireAuthOrRespond() ?: return@get
+                val companyId = claims.companyId
+                    ?: return@get call.respondError(HttpStatusCode.BadRequest, "no_company")
+                val id = call.parameters["id"]?.toLongOrNull()
+                    ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_id")
+
+                val events = requestService.listEvents(
+                    userId = claims.userId,
+                    companyId = companyId,
+                    requestId = id
+                )
+                call.respond(events)
+            }
+
+            // POST /requests/{id}/signatures — optional SES signature, does not change request status
+            post("/{id}/signatures") {
+                val claims = call.requireAuthOrRespond() ?: return@post
+                val companyId = claims.companyId
+                    ?: return@post call.respondError(HttpStatusCode.BadRequest, "no_company")
+                val id = call.parameters["id"]?.toLongOrNull()
+                    ?: return@post call.respondError(HttpStatusCode.BadRequest, "invalid_id")
+                val payload = call.receive<SubmitDocumentSignaturePayload>()
+
+                if (payload.signatureImageBase64.isBlank()) {
+                    return@post call.respondError(HttpStatusCode.UnprocessableEntity, "signature_required")
+                }
+
+                if (payload.signerRole == DocumentSignatureRole.ADMIN && !(claims.isCompanyAdmin || claims.isGlobalAdmin)) {
+                    return@post call.respondError(HttpStatusCode.Forbidden, "forbidden")
+                }
+
+                val signed = try {
+                    requestService.signRequest(
+                        signerUserId = claims.userId,
+                        companyId = companyId,
+                        requestId = id,
+                        payload = payload,
+                        ipAddress = call.request.origin.remoteHost,
+                        userAgent = call.request.headers[HttpHeaders.UserAgent]
+                    )
+                } catch (e: IllegalStateException) {
+                    when {
+                        e.message?.contains("signature already exists", ignoreCase = true) == true -> {
+                            return@post call.respondError(HttpStatusCode.Conflict, "signature_already_exists")
+                        }
+                        e.message?.contains("request not found", ignoreCase = true) == true -> {
+                            return@post call.respondError(HttpStatusCode.NotFound, "request_not_found")
+                        }
+                        e.message?.contains("worker can only sign own request", ignoreCase = true) == true -> {
+                            return@post call.respondError(HttpStatusCode.Forbidden, "worker_can_only_sign_own_request")
+                        }
+                        e.message?.contains("request does not belong to company", ignoreCase = true) == true -> {
+                            return@post call.respondError(HttpStatusCode.Forbidden, "request_does_not_belong_to_company")
+                        }
+                        e.message?.contains("invalid signature image", ignoreCase = true) == true -> {
+                            return@post call.respondError(HttpStatusCode.UnprocessableEntity, "invalid_signature_image")
+                        }
+                        e.message?.contains("signature image is empty", ignoreCase = true) == true -> {
+                            return@post call.respondError(HttpStatusCode.UnprocessableEntity, "signature_required")
+                        }
+                        else -> throw e
+                    }
+                }
+
+                call.respond(HttpStatusCode.Created, signed)
+            }
         }
 
         // Admin moderation
@@ -317,6 +501,41 @@ fun Route.registerDocumentFlowRoutes(
                     adminId = claims.userId,
                     companyId = claims.companyId!!,
                     requestId = id,
+                    payload = payload
+                )
+                call.respond(updated)
+            }
+
+            // GET /admin/requests/{id}/events — admin audit timeline for one request
+            get("/{id}/events") {
+                val claims = call.requireCompanyAdminOrRespond() ?: return@get
+                val id = call.parameters["id"]?.toLongOrNull()
+                    ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_id")
+
+                val events = requestService.listEvents(
+                    userId = claims.userId,
+                    companyId = claims.companyId!!,
+                    requestId = id
+                )
+                call.respond(events)
+            }
+        }
+
+        route("/admin/document-signature-settings") {
+            // GET /admin/document-signature-settings
+            get {
+                val claims = call.requireCompanyAdminOrRespond() ?: return@get
+                val settings = requestService.getSignatureSettings(claims.companyId!!)
+                call.respond(settings)
+            }
+
+            // PUT /admin/document-signature-settings
+            put {
+                val claims = call.requireCompanyAdminOrRespond() ?: return@put
+                val payload = call.receive<UpdateDocumentSignatureSettingsPayload>()
+                val updated = requestService.updateSignatureSettings(
+                    adminId = claims.userId,
+                    companyId = claims.companyId!!,
                     payload = payload
                 )
                 call.respond(updated)
