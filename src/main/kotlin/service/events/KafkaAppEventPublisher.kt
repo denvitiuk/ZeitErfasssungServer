@@ -9,12 +9,9 @@ import org.apache.kafka.clients.producer.ProducerConfig
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.common.config.SaslConfigs
 import org.apache.kafka.common.serialization.StringSerializer
+import java.nio.file.Files
 import java.util.Base64
 import java.util.Properties
-import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManagerFactory
-import java.security.KeyStore
-import java.io.ByteArrayInputStream
 
 class KafkaAppEventPublisher(
     bootstrapServers: String,
@@ -31,59 +28,46 @@ class KafkaAppEventPublisher(
         ignoreUnknownKeys = true
     }
 
-    private val producer = KafkaProducer<String, String>(
-        Properties().apply {
-            put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers)
-            put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer::class.java.name)
-            put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer::class.java.name)
+    private val properties: Properties = Properties().apply {
+        put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers)
+        put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer::class.java.name)
+        put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer::class.java.name)
 
-            put(ProducerConfig.ACKS_CONFIG, "all")
-            put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-            put(ProducerConfig.RETRIES_CONFIG, Int.MAX_VALUE.toString())
-            put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, "5")
-            put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, "120000")
-            put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "30000")
-            put(ProducerConfig.LINGER_MS_CONFIG, "10")
+        put(ProducerConfig.ACKS_CONFIG, "all")
+        put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
+        put(ProducerConfig.RETRIES_CONFIG, Int.MAX_VALUE.toString())
+        put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, "5")
+        put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, "120000")
+        put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "30000")
+        put(ProducerConfig.LINGER_MS_CONFIG, "10")
 
-            if (!securityProtocol.isNullOrBlank()) {
-                put("security.protocol", securityProtocol)
-            }
-
-            if (!saslMechanism.isNullOrBlank()) {
-                put(SaslConfigs.SASL_MECHANISM, saslMechanism)
-            }
-
-            if (!username.isNullOrBlank() && !password.isNullOrBlank()) {
-                put(
-                    SaslConfigs.SASL_JAAS_CONFIG,
-                    "org.apache.kafka.common.security.plain.PlainLoginModule required " +
-                            "username=\"$username\" password=\"$password\";"
-                )
-            }
-
-            if (!caCertBase64.isNullOrBlank()) {
-                val caCertBytes = Base64.getDecoder().decode(caCertBase64)
-                val trustStore = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
-                    load(null, null)
-                    val certFactory = java.security.cert.CertificateFactory.getInstance("X.509")
-                    val cert = certFactory.generateCertificate(ByteArrayInputStream(caCertBytes))
-                    setCertificateEntry("caCert", cert)
-                }
-                val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply {
-                    init(trustStore)
-                }
-                val sslContext = SSLContext.getInstance("TLS").apply {
-                    init(null, tmf.trustManagers, null)
-                }
-                put("ssl.truststore.type", KeyStore.getDefaultType())
-                put("ssl.truststore.location", "")
-                put("ssl.endpoint.identification.algorithm", "")
-                put("ssl.trustmanager.algorithm", TrustManagerFactory.getDefaultAlgorithm())
-                // Note: Kafka client does not support setting SSLContext directly via properties.
-                // This is a placeholder in case of custom SSL context usage.
-            }
+        if (!securityProtocol.isNullOrBlank()) {
+            put("security.protocol", securityProtocol)
         }
-    )
+
+        val caCertPath = createTempCaCertFile(caCertBase64)
+        if (!caCertPath.isNullOrBlank()) {
+            put("ssl.truststore.type", "PEM")
+            put("ssl.truststore.location", caCertPath)
+        }
+
+        if (!saslMechanism.isNullOrBlank()) {
+            put(SaslConfigs.SASL_MECHANISM, saslMechanism)
+        }
+
+        if (!username.isNullOrBlank() && !password.isNullOrBlank()) {
+            put(
+                SaslConfigs.SASL_JAAS_CONFIG,
+                "org.apache.kafka.common.security.scram.ScramLoginModule required " +
+                        "username=\"$username\" password=\"$password\";"
+            )
+        }
+    }
+
+    private val producer: KafkaProducer<String, String> by lazy {
+        println("📡 [KafkaAppEventPublisher] initializing Kafka producer topic=$topic")
+        KafkaProducer<String, String>(properties)
+    }
 
     override suspend fun publish(event: ProcessedAppEvent) {
         withContext(Dispatchers.IO) {
@@ -97,6 +81,23 @@ class KafkaAppEventPublisher(
             println(
                 "📤 [KafkaAppEventPublisher] published " +
                         "id=${event.id} type=${event.eventType} topic=$topic"
+            )
+        }
+    }
+
+    private fun createTempCaCertFile(caCertBase64: String?): String? {
+        if (caCertBase64.isNullOrBlank()) return null
+
+        return runCatching {
+            val decoded = Base64.getDecoder().decode(caCertBase64.trim())
+            val tempFile = Files.createTempFile("kafka-aiven-ca-", ".pem")
+            Files.write(tempFile, decoded)
+            tempFile.toFile().deleteOnExit()
+            tempFile.toAbsolutePath().toString()
+        }.getOrElse { error ->
+            throw IllegalStateException(
+                "Failed to decode KAFKA_CA_CERT. Expected base64-encoded PEM certificate.",
+                error
             )
         }
     }
