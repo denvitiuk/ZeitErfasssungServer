@@ -130,4 +130,6 @@ dependencies {
     implementation("com.googlecode.libphonenumber:libphonenumber:8.13.43")
     implementation("software.amazon.awssdk:s3:2.25.64")
     implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.4.0")
+    implementation("org.apache.kafka:kafka-clients:3.7.0")
+
 }

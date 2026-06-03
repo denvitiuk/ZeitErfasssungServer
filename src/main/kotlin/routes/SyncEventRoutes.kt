@@ -13,6 +13,11 @@ import io.ktor.server.routing.route
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.sql.Timestamp
 import java.sql.Types
 import java.time.Instant
@@ -59,6 +64,10 @@ data class RejectedSyncEvent(
     val localId: String,
     val reason: String
 )
+
+private val syncPayloadJson = Json {
+    ignoreUnknownKeys = true
+}
 
 fun Route.syncEventRoutes(dataSource: DataSource) {
     authenticate("bearerAuth") {
@@ -159,7 +168,50 @@ private fun validateSyncEvent(event: SyncEventDto): String? {
         }
     }
 
+    if (event.entityType == "tracking_session" && !event.entityLocalId.isNullOrBlank()) {
+        try {
+            UUID.fromString(event.entityLocalId)
+        } catch (_: Throwable) {
+            return "ENTITY_LOCAL_ID_INVALID"
+        }
+    }
+
     return null
+}
+
+private fun parsePayloadObject(payloadJson: String?): JsonObject? {
+    val cleanPayload = payloadJson?.trim().orEmpty()
+    if (cleanPayload.isBlank()) return null
+
+    return runCatching {
+        syncPayloadJson.parseToJsonElement(cleanPayload).jsonObject
+    }.getOrNull()
+}
+
+private fun JsonObject.stringValue(key: String): String? =
+    this[key]
+        ?.jsonPrimitive
+        ?.contentOrNull
+        ?.trim()
+        ?.takeIf { it.isNotBlank() }
+
+private fun resolvedCompanyId(event: SyncEventDto, payload: JsonObject?): Int? =
+    event.companyId?.toIntOrNull()
+        ?: payload?.stringValue("companyId")?.toIntOrNull()
+
+private fun resolvedProjectId(event: SyncEventDto, payload: JsonObject?): Int? =
+    event.projectId?.toIntOrNull()
+        ?: payload?.stringValue("projectId")?.toIntOrNull()
+
+private fun resolvedSessionId(event: SyncEventDto, payload: JsonObject?): UUID? {
+    val rawSessionId = event.sessionId
+        ?: event.entityLocalId?.takeIf { event.entityType == "tracking_session" }
+        ?: payload?.stringValue("sessionId")
+
+    return rawSessionId
+        ?.trim()
+        ?.takeIf { it.isNotBlank() }
+        ?.let { raw -> runCatching { UUID.fromString(raw) }.getOrNull() }
 }
 
 private suspend fun insertAppEvent(
@@ -170,6 +222,11 @@ private suspend fun insertAppEvent(
     event: SyncEventDto
 ) = withContext(Dispatchers.IO) {
     dataSource.connection.use { connection ->
+        val payload = parsePayloadObject(event.payloadJson)
+        val companyId = resolvedCompanyId(event, payload)
+        val projectId = resolvedProjectId(event, payload)
+        val sessionId = resolvedSessionId(event, payload)
+
         connection.prepareStatement(
             """
             INSERT INTO app_events (
@@ -207,22 +264,20 @@ private suspend fun insertAppEvent(
             statement.setString(2, event.eventType)
             statement.setInt(3, userId)
 
-            val companyId = event.companyId?.toIntOrNull()
             if (companyId != null) {
                 statement.setInt(4, companyId)
             } else {
                 statement.setNull(4, Types.INTEGER)
             }
 
-            val projectId = event.projectId?.toIntOrNull()
             if (projectId != null) {
                 statement.setInt(5, projectId)
             } else {
                 statement.setNull(5, Types.INTEGER)
             }
 
-            if (event.sessionId != null) {
-                statement.setObject(6, UUID.fromString(event.sessionId))
+            if (sessionId != null) {
+                statement.setObject(6, sessionId)
             } else {
                 statement.setNull(6, Types.OTHER)
             }

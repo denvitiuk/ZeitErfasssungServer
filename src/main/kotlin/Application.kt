@@ -32,6 +32,7 @@ import com.auth0.jwt.algorithms.Algorithm
 import com.yourcompany.zeiterfassung.db.configureDatabases
 import com.yourcompany.zeiterfassung.routes.*
 import com.yourcompany.zeiterfassung.service.AccountDeletionService
+import com.yourcompany.zeiterfassung.service.AppEventProcessorService
 import com.yourcompany.zeiterfassung.routes.HttpStatusException
 
 // --- Document Flow imports ---
@@ -373,6 +374,12 @@ fun Application.module() {
         null
     }
 
+    val appEventProcessorService = appDataSource?.let { dataSource ->
+        AppEventProcessorService(dataSource).also { service ->
+            service.start()
+        }
+    }
+
     val triple: Triple<DocumentTemplateStorage, DocumentRequestService, DocumentUploadService> =
         if (storageProvider == "pg") {
             if (appDataSource != null) {
@@ -413,8 +420,9 @@ fun Application.module() {
             .build()
     )
 
-    // Graceful shutdown for Quartz
+    // Graceful shutdown for Quartz and background services
     environment.monitor.subscribe(ApplicationStopped) {
+        appEventProcessorService?.stop()
         scheduler.shutdown(true)
     }
 
@@ -440,6 +448,7 @@ fun Application.module() {
         // Protected inside SyncEventRoutes.kt via bearerAuth.
         if (appDataSource != null) {
             syncEventRoutes(appDataSource)
+            appEventProcessorRoutes(appDataSource)
         }
 
         authenticate("bearerAuth") {

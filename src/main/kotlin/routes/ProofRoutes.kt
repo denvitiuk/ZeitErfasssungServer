@@ -26,6 +26,7 @@ import com.yourcompany.zeiterfassung.db.ProjectMembers
 import org.jetbrains.exposed.dao.id.EntityID
 import java.time.LocalTime
 import java.security.SecureRandom
+import java.util.UUID
 import kotlinx.serialization.Serializable
 
 // 🌍 Haversine formula
@@ -68,6 +69,65 @@ private fun validateRespondLocation(req: RespondProofRequest): ErrorSimple? {
 private fun Transaction.setLocalTimeZone(zone: ZoneId) {
     val safeZoneId = zone.id.replace("'", "''")
     exec("SET LOCAL TIME ZONE '$safeZoneId';")
+}
+
+private fun Transaction.insertAppEvent(
+    eventType: String,
+    userId: Int,
+    projectId: Int?,
+    payload: String
+) {
+    val safeEventType = eventType.replace("'", "''")
+    val safePayload = payload.replace("'", "''")
+    val projectSql = projectId?.toString() ?: "NULL"
+
+    exec(
+        """
+        INSERT INTO app_events
+            (event_id, event_type, user_id, project_id, source, status,
+             payload, occurred_at, received_at)
+        VALUES (
+            '${UUID.randomUUID()}',
+            '$safeEventType',
+            $userId,
+            $projectSql,
+            'backend',
+            'received',
+            '$safePayload'::jsonb,
+            now(),
+            now()
+        )
+        """.trimIndent()
+    )
+}
+
+private fun proofCreatedPayload(
+    proofId: Int,
+    projectId: Int,
+    slot: Int,
+    source: String
+): String =
+    """
+    {
+      "proofId": "$proofId",
+      "projectId": "$projectId",
+      "slot": "$slot",
+      "source": "$source"
+    }
+    """.trimIndent()
+
+private fun proofRespondedPayload(
+    proofId: Int,
+    projectId: Int,
+    source: String
+): String =
+    """
+    {
+      "proofId": "$proofId",
+      "projectId": "$projectId",
+      "source": "$source"
+    }
+    """.trimIndent()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -396,7 +456,7 @@ fun Route.proofsRoutes() {
 
                   val newId = transaction {
                     setLocalTimeZone(zone)
-                    Proofs.insert {
+                    val proofId = Proofs.insert {
                       it[Proofs.userId] = userId
                       it[Proofs.projectId] = projectId
                       it[Proofs.latitude] = projLat
@@ -407,6 +467,20 @@ fun Route.proofsRoutes() {
                       it[Proofs.sentAt] = nowZdt.toLocalDateTime()
                       it[Proofs.responded] = false
                     } get Proofs.id
+
+                    insertAppEvent(
+                        eventType = "PROOF_CREATED",
+                        userId = userId,
+                        projectId = projectId,
+                        payload = proofCreatedPayload(
+                            proofId = proofId,
+                            projectId = projectId,
+                            slot = slotVal.toInt(),
+                            source = "proof_routes"
+                        )
+                    )
+
+                    proofId
                   }
 
                   val created = ProofDto(
@@ -539,6 +613,18 @@ fun Route.proofsRoutes() {
                         it[responded] = true
                         it[respondedAt] = LocalDateTime.ofInstant(now, zone)
                     }
+
+                    insertAppEvent(
+                        eventType = "PROOF_RESPONDED",
+                        userId = userId,
+                        projectId = projectId.value,
+                        payload = proofRespondedPayload(
+                            proofId = proofId,
+                            projectId = projectId.value,
+                            source = "proof_routes"
+                        )
+                    )
+
                     true
                 }
 

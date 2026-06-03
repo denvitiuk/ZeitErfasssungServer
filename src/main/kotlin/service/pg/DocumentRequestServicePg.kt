@@ -25,6 +25,7 @@ import java.sql.ResultSet
 import java.sql.Types
 import java.time.LocalDate
 import java.util.Base64
+import java.util.UUID
 import javax.sql.DataSource
 
 /**
@@ -61,7 +62,7 @@ class DocumentRequestServicePg(
                 if (payload.attachments.isNotEmpty()) {
                     batchInsertAttachments(conn, requestId, payload.attachments)
                 }
-                insertDocumentRequestEvent(
+                val documentEventId = insertDocumentRequestEvent(
                     conn = conn,
                     requestId = requestId,
                     companyId = companyId,
@@ -73,6 +74,22 @@ class DocumentRequestServicePg(
                         "dateTo" to payload.dateTo.toString()
                     )
                 )
+
+                insertAppEvent(
+                    conn = conn,
+                    eventType = "DOCUMENT_REQUEST_CREATED",
+                    userId = userId,
+                    companyId = companyId,
+                    payload = jsonObject(
+                        "documentRequestId" to requestId.toString(),
+                        "documentRequestEventId" to documentEventId.toString(),
+                        "documentType" to payload.type.name,
+                        "dateFrom" to payload.dateFrom.toString(),
+                        "dateTo" to payload.dateTo.toString(),
+                        "source" to "document_request_service_pg"
+                    )
+                )
+
                 conn.commit()
                 fetchFullRequest(conn, requestId) ?: error("created request not found")
             } catch (t: Throwable) {
@@ -193,7 +210,7 @@ class DocumentRequestServicePg(
                     ps.executeUpdate()
                 }
 
-                insertDocumentRequestEvent(
+                val documentEventId = insertDocumentRequestEvent(
                     conn = conn,
                     requestId = requestId,
                     companyId = companyId,
@@ -203,6 +220,21 @@ class DocumentRequestServicePg(
                         "oldStatus" to currentStatus.name,
                         "newStatus" to payload.status.name,
                         "reason" to payload.reason
+                    )
+                )
+
+                insertAppEvent(
+                    conn = conn,
+                    eventType = "DOCUMENT_STATUS_CHANGED",
+                    userId = adminId,
+                    companyId = companyId,
+                    payload = jsonObject(
+                        "documentRequestId" to requestId.toString(),
+                        "documentRequestEventId" to documentEventId.toString(),
+                        "oldStatus" to currentStatus.name,
+                        "newStatus" to payload.status.name,
+                        "reason" to payload.reason,
+                        "source" to "document_request_service_pg"
                     )
                 )
 
@@ -274,7 +306,7 @@ class DocumentRequestServicePg(
                     deviceInfo = payload.deviceInfo
                 )
 
-                insertDocumentRequestEvent(
+                val documentEventId = insertDocumentRequestEvent(
                     conn = conn,
                     requestId = requestId,
                     companyId = companyId,
@@ -287,6 +319,22 @@ class DocumentRequestServicePg(
                         "signatureId" to signatureId.toString(),
                         "signatureImageBlobId" to blobId.toString(),
                         "documentSnapshotHash" to snapshotHash
+                    )
+                )
+
+                insertAppEvent(
+                    conn = conn,
+                    eventType = "SIGNATURE_SUBMITTED",
+                    userId = signerUserId,
+                    companyId = companyId,
+                    payload = jsonObject(
+                        "documentRequestId" to requestId.toString(),
+                        "documentRequestEventId" to documentEventId.toString(),
+                        "signatureId" to signatureId.toString(),
+                        "signatureImageBlobId" to blobId.toString(),
+                        "signerRole" to payload.signerRole.name,
+                        "documentSnapshotHash" to snapshotHash,
+                        "source" to "document_request_service_pg"
                     )
                 )
 
@@ -953,6 +1001,34 @@ class DocumentRequestServicePg(
                 }
             }
         }
+
+    private fun insertAppEvent(
+        conn: Connection,
+        eventType: String,
+        userId: Int,
+        companyId: Int,
+        payload: String
+    ): Long {
+        conn.prepareStatement(
+            """
+            INSERT INTO app_events
+                (event_id, event_type, user_id, company_id, source, status,
+                 payload, occurred_at, received_at)
+            VALUES (?, ?, ?, ?, 'backend', 'received', ?::jsonb, now(), now())
+            RETURNING id
+            """.trimIndent()
+        ).use { ps ->
+            ps.setObject(1, UUID.randomUUID())
+            ps.setString(2, eventType)
+            ps.setInt(3, userId)
+            ps.setInt(4, companyId)
+            ps.setString(5, payload)
+            ps.executeQuery().use { rs ->
+                if (!rs.next()) error("failed to insert app event")
+                return rs.getLong("id")
+            }
+        }
+    }
 
     //endregion -----------------------------------------------------------------------------------
 }
