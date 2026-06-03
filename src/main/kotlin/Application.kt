@@ -436,6 +436,12 @@ fun Application.module() {
         // Billing routes: webhook must be public (no JWT), other endpoints are fine here
         registerBillingRoutes()
 
+        // Offline Outbox sync endpoint.
+        // Protected inside SyncEventRoutes.kt via bearerAuth.
+        if (appDataSource != null) {
+            syncEventRoutes(appDataSource)
+        }
+
         authenticate("bearerAuth") {
             qrRoutes()
             scanRoutes()
