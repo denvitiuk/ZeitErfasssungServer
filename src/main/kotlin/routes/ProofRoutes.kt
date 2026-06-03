@@ -23,7 +23,6 @@ import java.time.ZonedDateTime
 import kotlin.math.*
 import com.yourcompany.zeiterfassung.db.Projects
 import com.yourcompany.zeiterfassung.db.ProjectMembers
-import org.jetbrains.exposed.dao.id.EntityID
 import java.time.LocalTime
 import java.security.SecureRandom
 import java.util.UUID
@@ -128,7 +127,7 @@ private fun proofRespondedPayload(
       "source": "$source"
     }
     """.trimIndent()
-}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers: timezone, project id, random time in window
@@ -617,10 +616,10 @@ fun Route.proofsRoutes() {
                     insertAppEvent(
                         eventType = "PROOF_RESPONDED",
                         userId = userId,
-                        projectId = projectId.value,
+                        projectId = projectId,
                         payload = proofRespondedPayload(
                             proofId = proofId,
-                            projectId = projectId.value,
+                            projectId = projectId,
                             source = "proof_routes"
                         )
                     )
