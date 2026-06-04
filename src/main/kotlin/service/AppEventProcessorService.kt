@@ -119,11 +119,18 @@ class AppEventProcessorService(
                 eventsToPublish.forEach { event ->
                     runCatching {
                         publisher.publish(event)
+                        markKafkaPublished(event.id)
                     }.onFailure { error ->
+                        val message = error.message ?: error::class.simpleName ?: "UNKNOWN_KAFKA_ERROR"
+                        markKafkaPublishFailed(
+                            id = event.id,
+                            errorMessage = message
+                        )
+
                         println(
                             "⚠️ [AppEventProcessorService] Kafka publish failed " +
                                     "id=${event.id} eventType=${event.eventType}: " +
-                                    (error.message ?: error::class.simpleName)
+                                    message
                         )
                     }
                 }
@@ -183,6 +190,7 @@ class AppEventProcessorService(
               AND event_type IN (
                 'CLOCK_IN',
                 'CLOCK_OUT',
+                'LOCATION_PING',
                 'BREAK_STARTED',
                 'BREAK_ENDED',
                 'DOCUMENT_REQUEST_CREATED',
@@ -238,6 +246,11 @@ class AppEventProcessorService(
                 connection = connection,
                 candidate = candidate,
                 expectedActive = null
+            )
+
+            "LOCATION_PING" -> validateLocationPing(
+                connection = connection,
+                candidate = candidate
             )
 
             "BREAK_STARTED" -> validatePauseSessionExists(
@@ -315,6 +328,26 @@ class AppEventProcessorService(
                 return null
             }
         }
+    }
+
+    private fun validateLocationPing(
+        connection: Connection,
+        candidate: AppEventCandidate
+    ): String? {
+        val sessionError = validateTrackingSessionExists(
+            connection = connection,
+            candidate = candidate,
+            expectedActive = null
+        )
+        if (sessionError != null) return sessionError
+
+        val payload = candidate.payload ?: return "LOCATION_PAYLOAD_REQUIRED"
+        payload.stringValue("lat")?.toDoubleOrNull()
+            ?: return "LOCATION_LAT_REQUIRED"
+        payload.stringValue("lon")?.toDoubleOrNull()
+            ?: return "LOCATION_LON_REQUIRED"
+
+        return null
     }
 
     private fun validatePauseSessionExists(
@@ -540,10 +573,50 @@ class AppEventProcessorService(
         }
     }
 
+    private fun markKafkaPublished(id: Long) {
+        dataSource.connection.use { connection ->
+            connection.prepareStatement(
+                """
+                UPDATE app_events
+                SET
+                  kafka_published_at = now(),
+                  kafka_publish_error = NULL,
+                  kafka_publish_attempts = kafka_publish_attempts + 1
+                WHERE id = ?
+                """.trimIndent()
+            ).use { statement ->
+                statement.setLong(1, id)
+                statement.executeUpdate()
+            }
+        }
+    }
+
+    private fun markKafkaPublishFailed(
+        id: Long,
+        errorMessage: String
+    ) {
+        dataSource.connection.use { connection ->
+            connection.prepareStatement(
+                """
+                UPDATE app_events
+                SET
+                  kafka_publish_error = ?,
+                  kafka_publish_attempts = kafka_publish_attempts + 1
+                WHERE id = ?
+                """.trimIndent()
+            ).use { statement ->
+                statement.setString(1, errorMessage.take(2000))
+                statement.setLong(2, id)
+                statement.executeUpdate()
+            }
+        }
+    }
+
     private companion object {
         val processableEventTypes = setOf(
             "CLOCK_IN",
             "CLOCK_OUT",
+            "LOCATION_PING",
             "BREAK_STARTED",
             "BREAK_ENDED",
             "DOCUMENT_REQUEST_CREATED",
