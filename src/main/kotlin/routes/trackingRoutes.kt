@@ -219,6 +219,7 @@ private fun requireOwnedActiveSession(sessionId: UUID, userId: Long): Unit = tra
     if (!active) conflict("Session is not active")
 }
 
+
 private fun insertAdminWatchLog(companyId: Int, adminId: Long, sessionId: UUID): Long = transaction {
     queryOne(
         """
@@ -228,6 +229,28 @@ private fun insertAdminWatchLog(companyId: Int, adminId: Long, sessionId: UUID):
         """.trimIndent(),
         listOf(companyId, adminId, sessionId)
     ) { rs -> rs.getLong("id") }!!
+}
+
+private fun insertAttendanceLogForSession(
+    userId: Long,
+    action: String,
+    timestampSql: String,
+    source: String
+) {
+    try {
+        transaction {
+            execUpdate(
+                """
+                INSERT INTO logs (user_id, action, "timestamp")
+                VALUES (?, ?, $timestampSql)
+                """.trimIndent(),
+                listOf(userId, action)
+            )
+        }
+        println("🧾 [logs/$source] userId=$userId action=$action timestamp=$timestampSql")
+    } catch (t: Throwable) {
+        println("⚠️ [logs/$source] failed userId=$userId action=$action: ${t.message}")
+    }
 }
 
 private fun closeAdminWatchLog(logId: Long) = transaction {
@@ -542,7 +565,7 @@ fun Route.trackingRoutes() {
                     Pair(rs.getObject("id", UUID::class.java), rs.getString("started_at"))
                 }!!
             }
-
+            insertAttendanceLogForSession(userId, "in", "now()", "tracking-start")
             call.respond(StartSessionResp(created.first.toString(), created.second))
         }
 
@@ -564,7 +587,21 @@ fun Route.trackingRoutes() {
                     listOf(sessionId, userId)
                 ) { rs -> rs.getString("ended_at") } ?: conflict("Session already stopped")
             }
-
+            try {
+                transaction {
+                    execUpdate(
+                        """
+                        INSERT INTO logs (user_id, action, "timestamp")
+                        VALUES (?, ?, ?::timestamptz)
+                        """.trimIndent(),
+                        listOf(userId, "out", endedAt)
+                    )
+                }
+                println("🧾 [logs/tracking-stop] userId=$userId action=out timestamp=$endedAt")
+            } catch (t: Throwable) {
+                println("⚠️ [logs/tracking-stop] failed userId=$userId action=out: ${t.message}")
+            }
+            // Keep legacy logs in sync so existing timesheet/PDF flows that read from logs keep working.
             val evt = StoppedEvent(
                 sessionId = sessionId.toString(),
                 userId = userId,

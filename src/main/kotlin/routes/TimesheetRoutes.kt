@@ -88,16 +88,33 @@ private fun parseOptionalProjectId(value: String?): Int? =
 
 private fun fetchAvailableMonths(userId: Int, projectId: Int?): List<String> = transaction {
     val out = mutableListOf<String>()
-    val sql = buildString {
-        append(
-            """
-            SELECT to_char(date_trunc('month', "timestamp"), 'YYYY-MM') AS ym
-            FROM logs
-            WHERE user_id = $userId
-            """.trimIndent()
-        )
-        if (projectId != null) append(" AND project_id = $projectId ")
-        append(" GROUP BY ym ORDER BY ym DESC")
+    val sql = if (projectId != null) {
+        """
+        SELECT to_char(date_trunc('month', "timestamp"), 'YYYY-MM') AS ym
+          FROM logs
+         WHERE user_id = $userId
+           AND project_id = $projectId
+         GROUP BY ym
+         ORDER BY ym DESC
+        """.trimIndent()
+    } else {
+        """
+        SELECT ym
+          FROM (
+                SELECT to_char(date_trunc('month', "timestamp"), 'YYYY-MM') AS ym
+                  FROM logs
+                 WHERE user_id = $userId
+
+                UNION
+
+                SELECT to_char(date_trunc('month', started_at), 'YYYY-MM') AS ym
+                  FROM tracking_sessions
+                 WHERE user_id = $userId
+                   AND started_at IS NOT NULL
+          ) months
+         GROUP BY ym
+         ORDER BY ym DESC
+        """.trimIndent()
     }
     exec(sql) { rs ->
         while (rs.next()) out += rs.getString("ym")
@@ -107,17 +124,35 @@ private fun fetchAvailableMonths(userId: Int, projectId: Int?): List<String> = t
 
 private fun fetchCompanyMonths(companyId: Int, projectId: Int?): List<String> = transaction {
     val out = mutableListOf<String>()
-    val sql = buildString {
-        append(
-            """
-            SELECT to_char(date_trunc('month', l."timestamp"), 'YYYY-MM') AS ym
-            FROM logs l
-            JOIN users u ON u.id = l.user_id
-            WHERE u.company_id = $companyId
-            """.trimIndent()
-        )
-        if (projectId != null) append(" AND l.project_id = $projectId ")
-        append(" GROUP BY ym ORDER BY ym DESC")
+    val sql = if (projectId != null) {
+        """
+        SELECT to_char(date_trunc('month', l."timestamp"), 'YYYY-MM') AS ym
+          FROM logs l
+          JOIN users u ON u.id = l.user_id
+         WHERE u.company_id = $companyId
+           AND l.project_id = $projectId
+         GROUP BY ym
+         ORDER BY ym DESC
+        """.trimIndent()
+    } else {
+        """
+        SELECT ym
+          FROM (
+                SELECT to_char(date_trunc('month', l."timestamp"), 'YYYY-MM') AS ym
+                  FROM logs l
+                  JOIN users u ON u.id = l.user_id
+                 WHERE u.company_id = $companyId
+
+                UNION
+
+                SELECT to_char(date_trunc('month', s.started_at), 'YYYY-MM') AS ym
+                  FROM tracking_sessions s
+                 WHERE s.company_id = $companyId
+                   AND s.started_at IS NOT NULL
+          ) months
+         GROUP BY ym
+         ORDER BY ym DESC
+        """.trimIndent()
     }
     exec(sql) { rs ->
         while (rs.next()) out += rs.getString("ym")

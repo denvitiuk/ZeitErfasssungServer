@@ -147,9 +147,14 @@ fun Route.qrRoutes() {
                     """.trimIndent()
                     exec(sqlCloseStale)
 
+                    // Keep tracking_sessions compatible with company-wide timesheet/month endpoints.
+                    // Older QR flow inserted sessions without company_id, so company month aggregation missed them.
                     val sql = """
-                        INSERT INTO tracking_sessions (id, user_id, is_active, started_at)
-                        VALUES ('$newId'::uuid, $userId, TRUE, '$nowIso')
+                        INSERT INTO tracking_sessions (id, company_id, user_id, is_active, started_at)
+                        SELECT '$newId'::uuid, u.company_id, u.id, TRUE, '$nowIso'
+                          FROM users u
+                         WHERE u.id = $userId
+                           AND u.company_id IS NOT NULL
                     """.trimIndent()
 
                     exec(sql)

@@ -33,6 +33,60 @@ private fun resolveZone(call: io.ktor.server.application.ApplicationCall): ZoneI
     return try { ZoneId.of(id) } catch (_: Exception) { ZoneId.of("Europe/Berlin") }
 }
 
+private fun syncTrackingSessionFromScanLog(
+    userId: Int,
+    action: String,
+    timestampUtc: LocalDateTime
+) {
+    try {
+        when (action.lowercase()) {
+            "in" -> {
+                transaction {
+                    exec(
+                        """
+                        INSERT INTO tracking_sessions (company_id, user_id, started_at, is_active)
+                        SELECT u.company_id, u.id, '${timestampUtc}'::timestamp, TRUE
+                          FROM users u
+                         WHERE u.id = $userId
+                           AND u.company_id IS NOT NULL
+                           AND NOT EXISTS (
+                                SELECT 1
+                                  FROM tracking_sessions s
+                                 WHERE s.user_id = u.id
+                                   AND s.is_active = TRUE
+                           )
+                        """.trimIndent()
+                    )
+                }
+                println("🧾 [scan→tracking] userId=$userId action=in startedAt=$timestampUtc")
+            }
+
+            "out" -> {
+                transaction {
+                    exec(
+                        """
+                        UPDATE tracking_sessions
+                           SET is_active = FALSE,
+                               ended_at = '${timestampUtc}'::timestamp
+                         WHERE id = (
+                                SELECT id
+                                  FROM tracking_sessions
+                                 WHERE user_id = $userId
+                                   AND is_active = TRUE
+                                 ORDER BY started_at DESC
+                                 LIMIT 1
+                         )
+                        """.trimIndent()
+                    )
+                }
+                println("🧾 [scan→tracking] userId=$userId action=out endedAt=$timestampUtc")
+            }
+        }
+    } catch (t: Throwable) {
+        println("⚠️ [scan→tracking] failed userId=$userId action=$action: ${t.message}")
+    }
+}
+
 /**
  * Handles scanning of QR codes (in/out actions).
  */
@@ -49,6 +103,7 @@ fun Route.scanRoutes() {
             // 2. Читаем тело запроса
             val req = call.receive<ScanRequest>()
             val now = Instant.now()
+            val timestampUtc = LocalDateTime.ofInstant(now, ZoneOffset.UTC)
             val zone = resolveZone(call)
             call.response.headers.append("X-Timezone-Used", zone.id)
 
@@ -92,7 +147,7 @@ fun Route.scanRoutes() {
                     it[Logs.terminalNonce] = req.nonce
                     it[Logs.action]        = action
                     // IMPORTANT: store UTC in DB to avoid timezone shifts (Berlin/Kyiv/etc.)
-                    it[Logs.timestamp]     = LocalDateTime.ofInstant(now, ZoneOffset.UTC)
+                    it[Logs.timestamp]     = timestampUtc
                     it[Logs.latitude]      = req.latitude
                     it[Logs.longitude]     = req.longitude
                     it[Logs.locationDesc]  = req.locationDescription
@@ -100,6 +155,8 @@ fun Route.scanRoutes() {
                         it[Logs.projectId] = EntityID(resolvedProjectId, Projects)
                     }
                 }
+
+                syncTrackingSessionFromScanLog(userId, action, timestampUtc)
 
                 Nonces.update({ Nonces.nonce eq req.nonce }) {
                     it[Nonces.used] = true
