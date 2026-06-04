@@ -195,6 +195,34 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
         }
     }
 
+    route("/companies/self/pause/settings") {
+        get {
+            val userId = call.currentUserIdOrNull()
+                ?: return@get call.respond(
+                    HttpStatusCode.Unauthorized,
+                    CompanySettingsError("unauthorized")
+                )
+
+            dataSource.connection.use { connection ->
+                val user = loadAdminCompanyAccess(connection, userId)
+                    ?: return@get call.respond(
+                        HttpStatusCode.Unauthorized,
+                        CompanySettingsError("unauthorized")
+                    )
+
+                if (user.companyId <= 0) {
+                    return@get call.respond(
+                        HttpStatusCode.BadRequest,
+                        CompanySettingsError("no_company")
+                    )
+                }
+
+                val settings = loadCompanyPauseSettings(connection, user.companyId)
+                call.respond(settings)
+            }
+        }
+    }
+
     route("/admin/pause/settings") {
         get {
             val adminUserId = call.currentUserIdOrNull()
@@ -416,6 +444,56 @@ fun Route.companySettingsRoutes(dataSource: DataSource) {
                         pauseDurationMinutes = normalizedPauseDurationMinutes,
                         timezone = normalizedTimezone
                     )
+                )
+            }
+        }
+    }
+}
+
+private fun loadCompanyPauseSettings(
+    connection: java.sql.Connection,
+    companyId: Int
+): CompanyPauseSettingsResponse {
+    return connection.prepareStatement(
+        """
+        SELECT
+            COALESCE(pause_start_time::text, ?) AS pause_start_time,
+            COALESCE(pause_end_time::text, ?) AS pause_end_time,
+            COALESCE(pause_duration_minutes, ?) AS pause_duration_minutes,
+            COALESCE(timezone, ?) AS timezone
+        FROM company_pause_settings
+        WHERE company_id = ?
+        LIMIT 1
+        """.trimIndent()
+    ).use { statement ->
+        statement.setString(1, DEFAULT_PAUSE_START_TIME)
+        statement.setString(2, DEFAULT_PAUSE_END_TIME)
+        statement.setInt(3, DEFAULT_PAUSE_DURATION_MINUTES)
+        statement.setString(4, DEFAULT_PAUSE_TIMEZONE)
+        statement.setInt(5, companyId)
+        statement.executeQuery().use { rs ->
+            if (rs.next()) {
+                CompanyPauseSettingsResponse(
+                    companyId = companyId,
+                    pauseStartTime = normalizePauseTimeForResponse(
+                        value = rs.getString("pause_start_time"),
+                        fallback = DEFAULT_PAUSE_START_TIME
+                    ),
+                    pauseEndTime = normalizePauseTimeForResponse(
+                        value = rs.getString("pause_end_time"),
+                        fallback = DEFAULT_PAUSE_END_TIME
+                    ),
+                    pauseDurationMinutes = rs.getInt("pause_duration_minutes").takeIf { !rs.wasNull() }
+                        ?: DEFAULT_PAUSE_DURATION_MINUTES,
+                    timezone = rs.getString("timezone") ?: DEFAULT_PAUSE_TIMEZONE
+                )
+            } else {
+                CompanyPauseSettingsResponse(
+                    companyId = companyId,
+                    pauseStartTime = DEFAULT_PAUSE_START_TIME,
+                    pauseEndTime = DEFAULT_PAUSE_END_TIME,
+                    pauseDurationMinutes = DEFAULT_PAUSE_DURATION_MINUTES,
+                    timezone = DEFAULT_PAUSE_TIMEZONE
                 )
             }
         }
