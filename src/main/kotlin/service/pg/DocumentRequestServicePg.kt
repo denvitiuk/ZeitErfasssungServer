@@ -436,6 +436,7 @@ class DocumentRequestServicePg(
         withContext(Dispatchers.IO) {
             dataSource.connection.use { conn ->
                 val y = year ?: LocalDate.now().year
+                ensureLeaveEntitlement(conn, userId, y)
 
                 // Base from view (used + total + remaining); view's pending_days is 0 — we'll compute it below
                 val base: LeaveBalance = conn.prepareStatement(
@@ -457,12 +458,13 @@ class DocumentRequestServicePg(
                                 remainingDays = rs.getBigDecimal("remaining_days").toDouble()
                             )
                         } else {
+                            val total = fetchLeaveEntitlementDays(conn, userId, y)
                             LeaveBalance(
                                 year = y,
-                                totalDaysPerYear = 0.0,
+                                totalDaysPerYear = total,
                                 usedDays = 0.0,
                                 pendingDays = 0.0,
-                                remainingDays = 0.0
+                                remainingDays = total
                             )
                         }
                     }
@@ -472,6 +474,58 @@ class DocumentRequestServicePg(
                 base.copy(pendingDays = pending)
             }
         }
+
+    private fun ensureLeaveEntitlement(
+        conn: Connection,
+        userId: Int,
+        year: Int
+    ) {
+        conn.prepareStatement(
+            """
+            INSERT INTO leave_entitlements (user_id, year, days_total)
+            VALUES (
+                ?,
+                ?,
+                COALESCE(
+                    (
+                        SELECT days_total
+                          FROM leave_entitlements
+                         WHERE user_id = ?
+                         ORDER BY year DESC
+                         LIMIT 1
+                    ),
+                    24
+                )
+            )
+            ON CONFLICT (user_id, year) DO NOTHING
+            """.trimIndent()
+        ).use { ps ->
+            ps.setInt(1, userId)
+            ps.setInt(2, year)
+            ps.setInt(3, userId)
+            ps.executeUpdate()
+        }
+    }
+
+    private fun fetchLeaveEntitlementDays(
+        conn: Connection,
+        userId: Int,
+        year: Int
+    ): Double {
+        conn.prepareStatement(
+            """
+            SELECT days_total
+              FROM leave_entitlements
+             WHERE user_id = ? AND year = ?
+            """.trimIndent()
+        ).use { ps ->
+            ps.setInt(1, userId)
+            ps.setInt(2, year)
+            ps.executeQuery().use { rs ->
+                return if (rs.next()) rs.getBigDecimal("days_total").toDouble() else 24.0
+            }
+        }
+    }
 
     //endregion ------------------------------------------------------------------------------------
 
