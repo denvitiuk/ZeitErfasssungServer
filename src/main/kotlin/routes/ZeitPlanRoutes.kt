@@ -1,5 +1,8 @@
 package com.yourcompany.zeiterfassung.routes
 
+import com.yourcompany.zeiterfassung.service.EmailService
+import io.github.cdimascio.dotenv.Dotenv
+
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.plugins.BadRequestException
@@ -166,6 +169,218 @@ data class ZeitPlanActionResponseDto(
     val notificationLogsCreated: Int = 0,
     val missedAssignments: Int = 0
 )
+
+private data class ZeitPlanEmailTarget(
+    val assignmentId: UUID,
+    val email: String,
+    val workerName: String,
+    val planTitle: String,
+    val groupTitle: String,
+    val shiftDate: String,
+    val startTime: String,
+    val endTime: String,
+    val timezone: String
+)
+
+private fun loadZeitPlanEmailTargetsForPlan(planId: UUID, companyId: Int): List<ZeitPlanEmailTarget> = transaction {
+    val stmt = connection.prepareStatement(
+        """
+        SELECT
+          a.id AS assignment_id,
+          u.email,
+          COALESCE(NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''), 'Mitarbeiter') AS worker_name,
+          p.title AS plan_title,
+          g.title AS group_title,
+          s.shift_date::text AS shift_date,
+          s.start_time::text AS start_time,
+          s.end_time::text AS end_time,
+          s.timezone AS timezone
+        FROM zeitplan_shift_assignments a
+        JOIN zeitplan_shifts s ON s.id = a.shift_id
+        JOIN zeitplan_shift_groups g ON g.id = a.shift_group_id
+        JOIN zeitplan_plans p ON p.id = a.plan_id
+        JOIN users u ON u.id = a.user_id
+        WHERE p.id = ?
+          AND p.company_id = ?
+          AND p.status = 'ACTIVE'
+          AND s.status IN ('PLANNED', 'ACTIVE')
+          AND a.status IN ('PLANNED', 'NOTIFIED', 'SEEN')
+          AND s.notify_email_enabled = TRUE
+          AND u.email IS NOT NULL
+          AND TRIM(u.email) <> ''
+        ORDER BY s.shift_date ASC, s.start_time ASC, g.title ASC
+        """.trimIndent(),
+        false
+    )
+
+    stmt.set(1, planId)
+    stmt.set(2, companyId)
+
+    stmt.executeQuery().use { rs ->
+        val out = mutableListOf<ZeitPlanEmailTarget>()
+        while (rs.next()) {
+            out.add(
+                ZeitPlanEmailTarget(
+                    assignmentId = rs.getObject("assignment_id", UUID::class.java),
+                    email = rs.getString("email"),
+                    workerName = rs.getString("worker_name"),
+                    planTitle = rs.getString("plan_title"),
+                    groupTitle = rs.getString("group_title"),
+                    shiftDate = rs.getString("shift_date"),
+                    startTime = rs.getString("start_time"),
+                    endTime = rs.getString("end_time"),
+                    timezone = rs.getString("timezone")
+                )
+            )
+        }
+        out
+    }
+}
+
+private fun loadZeitPlanEmailTargetsForShift(shiftId: UUID, companyId: Int): List<ZeitPlanEmailTarget> = transaction {
+    val stmt = connection.prepareStatement(
+        """
+        SELECT
+          a.id AS assignment_id,
+          u.email,
+          COALESCE(NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''), 'Mitarbeiter') AS worker_name,
+          p.title AS plan_title,
+          g.title AS group_title,
+          s.shift_date::text AS shift_date,
+          s.start_time::text AS start_time,
+          s.end_time::text AS end_time,
+          s.timezone AS timezone
+        FROM zeitplan_shift_assignments a
+        JOIN zeitplan_shifts s ON s.id = a.shift_id
+        JOIN zeitplan_shift_groups g ON g.id = a.shift_group_id
+        JOIN zeitplan_plans p ON p.id = a.plan_id
+        JOIN users u ON u.id = a.user_id
+        WHERE s.id = ?
+          AND s.company_id = ?
+          AND p.status = 'ACTIVE'
+          AND s.status IN ('PLANNED', 'ACTIVE')
+          AND a.status IN ('PLANNED', 'NOTIFIED', 'SEEN')
+          AND s.notify_email_enabled = TRUE
+          AND u.email IS NOT NULL
+          AND TRIM(u.email) <> ''
+        ORDER BY s.shift_date ASC, s.start_time ASC, g.title ASC
+        """.trimIndent(),
+        false
+    )
+
+    stmt.set(1, shiftId)
+    stmt.set(2, companyId)
+
+    stmt.executeQuery().use { rs ->
+        val out = mutableListOf<ZeitPlanEmailTarget>()
+        while (rs.next()) {
+            out.add(
+                ZeitPlanEmailTarget(
+                    assignmentId = rs.getObject("assignment_id", UUID::class.java),
+                    email = rs.getString("email"),
+                    workerName = rs.getString("worker_name"),
+                    planTitle = rs.getString("plan_title"),
+                    groupTitle = rs.getString("group_title"),
+                    shiftDate = rs.getString("shift_date"),
+                    startTime = rs.getString("start_time"),
+                    endTime = rs.getString("end_time"),
+                    timezone = rs.getString("timezone")
+                )
+            )
+        }
+        out
+    }
+}
+
+private fun buildZeitPlanShiftEmailHtml(target: ZeitPlanEmailTarget): String {
+    val workerName = target.workerName.escapeHtml()
+    val planTitle = target.planTitle.escapeHtml()
+    val groupTitle = target.groupTitle.escapeHtml()
+    val shiftDate = target.shiftDate.escapeHtml()
+    val startTime = target.startTime.escapeHtml()
+    val endTime = target.endTime.escapeHtml()
+    val timezone = target.timezone.escapeHtml()
+
+    return """
+        <div style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#111827;">
+          <div style="max-width:640px;margin:0 auto;padding:28px 16px;">
+            <div style="background:#ffffff;border-radius:22px;overflow:hidden;border:1px solid #e5e7eb;box-shadow:0 18px 45px rgba(15,23,42,0.10);">
+              <div style="background:linear-gradient(135deg,#111827,#1f2937);padding:26px 28px;color:#ffffff;">
+                <div style="font-size:13px;letter-spacing:0.12em;text-transform:uppercase;opacity:0.72;font-weight:700;">ZeitErfassung</div>
+                <h1 style="margin:10px 0 0;font-size:25px;line-height:1.25;font-weight:800;">Erinnerung an deine geplante Schicht</h1>
+                <p style="margin:10px 0 0;font-size:15px;line-height:1.5;color:#d1d5db;">Bitte prüfe deine Schichtdetails und starte deine Arbeitszeit pünktlich in der App.</p>
+              </div>
+
+              <div style="padding:28px;">
+                <p style="margin:0 0 14px;font-size:16px;line-height:1.6;">Hallo <strong>$workerName</strong>,</p>
+                <p style="margin:0 0 22px;font-size:15px;line-height:1.6;color:#374151;">für dich wurde eine neue Schicht geplant.</p>
+
+                <div style="border:1px solid #e5e7eb;border-radius:18px;overflow:hidden;background:#f9fafb;margin:0 0 24px;">
+                  <div style="padding:16px 18px;background:#ffffff;border-bottom:1px solid #e5e7eb;">
+                    <div style="font-size:12px;text-transform:uppercase;letter-spacing:0.08em;color:#6b7280;font-weight:800;">Schichtdetails</div>
+                  </div>
+                  <table style="border-collapse:collapse;width:100%;font-size:15px;">
+                    <tr>
+                      <td style="padding:13px 18px;color:#6b7280;font-weight:700;width:34%;border-bottom:1px solid #e5e7eb;">Plan</td>
+                      <td style="padding:13px 18px;color:#111827;border-bottom:1px solid #e5e7eb;">$planTitle</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:13px 18px;color:#6b7280;font-weight:700;width:34%;border-bottom:1px solid #e5e7eb;">Gruppe</td>
+                      <td style="padding:13px 18px;color:#111827;border-bottom:1px solid #e5e7eb;">$groupTitle</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:13px 18px;color:#6b7280;font-weight:700;width:34%;border-bottom:1px solid #e5e7eb;">Datum</td>
+                      <td style="padding:13px 18px;color:#111827;border-bottom:1px solid #e5e7eb;">$shiftDate</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:13px 18px;color:#6b7280;font-weight:700;width:34%;border-bottom:1px solid #e5e7eb;">Zeit</td>
+                      <td style="padding:13px 18px;color:#111827;border-bottom:1px solid #e5e7eb;"><strong>$startTime – $endTime</strong></td>
+                    </tr>
+                    <tr>
+                      <td style="padding:13px 18px;color:#6b7280;font-weight:700;width:34%;">Zeitzone</td>
+                      <td style="padding:13px 18px;color:#111827;">$timezone</td>
+                    </tr>
+                  </table>
+                </div>
+
+                <div style="background:#ecfdf5;border:1px solid #bbf7d0;border-radius:16px;padding:16px 18px;margin:0 0 24px;">
+                  <p style="margin:0;font-size:15px;line-height:1.6;color:#065f46;">Öffne bitte die App und starte deine Arbeitszeit zum Beginn der Schicht.</p>
+                </div>
+
+                <p style="margin:0;font-size:15px;line-height:1.6;color:#374151;">Viele Grüße<br/><strong>Dein ZeitErfassung Team</strong></p>
+              </div>
+            </div>
+
+            <p style="margin:18px 6px 0;font-size:12px;line-height:1.5;color:#6b7280;text-align:center;">Diese Nachricht wurde automatisch erstellt.</p>
+          </div>
+        </div>
+    """.trimIndent()
+}
+
+private fun String.escapeHtml(): String =
+    replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&#39;")
+
+private fun sendZeitPlanShiftEmails(targets: List<ZeitPlanEmailTarget>) {
+    if (targets.isEmpty()) return
+
+    val env = Dotenv.load()
+    targets.distinctBy { it.assignmentId }.forEach { target ->
+        runCatching {
+            EmailService.send(
+                to = target.email,
+                subject = "Erinnerung an deine geplante Schicht",
+                body = buildZeitPlanShiftEmailHtml(target),
+                env = env
+            )
+        }.onFailure { error ->
+            println("[ZeitPlanEmail] failed assignmentId=${target.assignmentId} to=${target.email}: ${error.message}")
+        }
+    }
+}
 
 fun Route.zeitPlanRoutes() {
     route("/admin/zeitplan") {
@@ -682,6 +897,7 @@ fun Route.zeitPlanRoutes() {
             val adminUserId = call.routeRequireUserId()
             val ctx = routeLoadUserContext(adminUserId)
             val planId = routeParseUuid(call.parameters["planId"], "planId")
+            val emailTargets = loadZeitPlanEmailTargetsForPlan(planId, ctx.companyId)
 
             val result = transaction {
                 routeQueryOne(
@@ -786,6 +1002,7 @@ fun Route.zeitPlanRoutes() {
                 }
             } ?: throw BadRequestException("Failed to notify ZeitPlan")
 
+            sendZeitPlanShiftEmails(emailTargets)
             call.respond(result)
         }
 
@@ -793,6 +1010,7 @@ fun Route.zeitPlanRoutes() {
             val adminUserId = call.routeRequireUserId()
             val ctx = routeLoadUserContext(adminUserId)
             val shiftId = routeParseUuid(call.parameters["shiftId"], "shiftId")
+            val emailTargets = loadZeitPlanEmailTargetsForShift(shiftId, ctx.companyId)
 
             val result = transaction {
                 routeQueryOne(
@@ -897,6 +1115,7 @@ fun Route.zeitPlanRoutes() {
                 }
             } ?: throw BadRequestException("Failed to notify ZeitPlan shift")
 
+            sendZeitPlanShiftEmails(emailTargets)
             call.respond(result)
         }
 
