@@ -17,10 +17,10 @@ import java.util.UUID
 @Serializable
 data class ZeitPlanPauseRuleDto(
     val mode: String,
+    val startTime: String? = null,
+    val endTime: String? = null,
     val durationMinutes: Int? = null,
-    val pauseStartTime: String? = null,
-    val pauseEndTime: String? = null,
-    val pauseAvailableAfterMinutes: Int? = null
+    val availableAfterMinutes: Int? = null
 )
 
 @Serializable
@@ -331,10 +331,10 @@ fun Route.zeitPlanRoutes() {
                                     projectId = it.getObject("project_id")?.let { value -> (value as Number).toInt() },
                                     pauseRule = ZeitPlanPauseRuleDto(
                                         mode = it.getString("pause_mode"),
+                                        startTime = it.getString("pause_start_time"),
+                                        endTime = it.getString("pause_end_time"),
                                         durationMinutes = it.getObject("pause_duration_minutes")?.let { _ -> it.getInt("pause_duration_minutes") },
-                                        pauseStartTime = it.getString("pause_start_time"),
-                                        pauseEndTime = it.getString("pause_end_time"),
-                                        pauseAvailableAfterMinutes = it.getObject("pause_available_after_minutes")?.let { _ -> it.getInt("pause_available_after_minutes") }
+                                        availableAfterMinutes = it.getObject("pause_available_after_minutes")?.let { _ -> it.getInt("pause_available_after_minutes") }
                                     ),
                                     notifyEmailEnabled = it.getBoolean("notify_email_enabled"),
                                     notifyPushEnabled = it.getBoolean("notify_push_enabled"),
@@ -370,7 +370,7 @@ fun Route.zeitPlanRoutes() {
             val title = body.title.trim()
             if (title.isBlank()) throw BadRequestException("title is required")
 
-            val allowedPlanTypes = setOf("DAY", "WEEK", "MONTH", "DATE_RANGE")
+            val allowedPlanTypes = setOf("DAY", "WEEK", "MONTH", "DATE_RANGE", "CUSTOM")
             if (body.planType !in allowedPlanTypes) {
                 throw BadRequestException("Invalid planType")
             }
@@ -1056,10 +1056,10 @@ fun Route.zeitPlanRoutes() {
                                     timezone = it.getString("timezone"),
                                     pauseRule = ZeitPlanPauseRuleDto(
                                         mode = it.getString("pause_mode"),
+                                        startTime = it.getString("pause_start_time"),
+                                        endTime = it.getString("pause_end_time"),
                                         durationMinutes = it.getObject("pause_duration_minutes")?.let { _ -> it.getInt("pause_duration_minutes") },
-                                        pauseStartTime = it.getString("pause_start_time"),
-                                        pauseEndTime = it.getString("pause_end_time"),
-                                        pauseAvailableAfterMinutes = it.getObject("pause_available_after_minutes")?.let { _ -> it.getInt("pause_available_after_minutes") }
+                                        availableAfterMinutes = it.getObject("pause_available_after_minutes")?.let { _ -> it.getInt("pause_available_after_minutes") }
                                     ),
                                     status = it.getString("assignment_status"),
                                     notifyEmailEnabled = it.getBoolean("notify_email_enabled"),
@@ -1125,3 +1125,4 @@ fun Route.zeitPlanRoutes() {
         }
     }
 }
+

@@ -165,16 +165,22 @@ fun Application.module() {
         status(HttpStatusCode.Unauthorized) { call, _ ->
             val path = call.request.path()
 
-            // IMPORTANT:
-            // Do not override route-specific 401 responses (e.g. `/refresh` returning `invalid_refresh_token`).
-            // Only customize the 401 body for login/registration endpoints.
-            val isAuthUiEndpoint = path.startsWith("/login") || path.startsWith("/complete-registration")
-            if (!isAuthUiEndpoint) return@status
+            if (call.response.isCommitted) return@status
 
-            if (!call.response.isCommitted) {
+            val isAuthUiEndpoint = path.startsWith("/login") || path.startsWith("/complete-registration")
+            if (isAuthUiEndpoint) {
                 call.respond(
                     HttpStatusCode.Unauthorized,
                     mapOf("error" to "Bitte geben Sie das richtige Passwort oder die richtige E-Mail-Adresse ein.")
+                )
+            } else {
+                call.respond(
+                    HttpStatusCode.Unauthorized,
+                    mapOf(
+                        "error" to "unauthorized",
+                        "detail" to "Bearer token is missing, expired, invalid, or does not contain a supported user id claim.",
+                        "path" to path
+                    )
                 )
             }
         }
@@ -228,9 +234,18 @@ fun Application.module() {
                     .build()
             )
             validate { credential ->
-                if (credential.payload.getClaim("id").asString() != null)
-                    JWTPrincipal(credential.payload)
-                else null
+                val payload = credential.payload
+
+                val hasUserId =
+                    payload.getClaim("id").asString() != null ||
+                    payload.getClaim("id").asInt() != null ||
+                    payload.getClaim("id").asLong() != null ||
+                    payload.getClaim("userId").asString() != null ||
+                    payload.getClaim("userId").asInt() != null ||
+                    payload.getClaim("userId").asLong() != null ||
+                    !payload.subject.isNullOrBlank()
+
+                if (hasUserId) JWTPrincipal(payload) else null
             }
         }
     }
