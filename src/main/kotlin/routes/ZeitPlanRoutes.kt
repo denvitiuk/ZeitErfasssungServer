@@ -61,8 +61,8 @@ fun Route.zeitPlanRoutes() {
         // WORKER: today's planned shifts for the authenticated user.
         // Returns items because a worker can theoretically have more than one shift per day.
         get("/me/today") {
-            val userId = call.requireUserId()
-            val ctx = loadUserContext(userId)
+            val userId = call.routeRequireUserId()
+            val ctx = routeLoadUserContext(userId)
             val dateStr = call.request.queryParameters["date"] ?: LocalDate.now().toString()
 
             try {
@@ -148,7 +148,7 @@ fun Route.zeitPlanRoutes() {
                         out
                     }
                 } finally {
-                    stmt.closeIfPossible()
+                    // Exposed manages this statement resource inside the transaction.
                 }
             }
 
@@ -157,12 +157,12 @@ fun Route.zeitPlanRoutes() {
 
         // WORKER: mark an assignment as seen after the worker app displays it.
         post("/me/assignments/{assignmentId}/seen") {
-            val userId = call.requireUserId()
-            val ctx = loadUserContext(userId)
-            val assignmentId = parseUuid(call.parameters["assignmentId"], "assignmentId")
+            val userId = call.routeRequireUserId()
+            val ctx = routeLoadUserContext(userId)
+            val assignmentId = routeParseUuid(call.parameters["assignmentId"], "assignmentId")
 
             val updated = transaction {
-                queryOne(
+                routeQueryOne(
                     """
                     UPDATE zeitplan_shift_assignments
                     SET
