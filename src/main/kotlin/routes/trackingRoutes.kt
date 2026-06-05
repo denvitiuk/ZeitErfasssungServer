@@ -162,6 +162,11 @@ data class UserContext(
     val isAdmin: Boolean
 )
 
+private data class MatchingZeitPlanAssignment(
+    val assignmentId: UUID,
+    val shiftId: UUID
+)
+
 private fun ApplicationCall.requireUserId(): Long {
     val p = principal<JWTPrincipal>() ?: throw IllegalStateException("Missing JWT principal")
     val idStr = p.payload.getClaim("id").asString() ?: throw IllegalStateException("Missing claim: id")
@@ -190,6 +195,38 @@ private fun loadUserContext(userId: Long): UserContext = transaction {
 
 private fun requireAdmin(ctx: UserContext) {
     if (!ctx.isAdmin) forbidden("Admin only")
+}
+
+private fun Transaction.findMatchingZeitPlanAssignment(
+    userId: Long,
+    companyId: Int
+): MatchingZeitPlanAssignment? {
+    return queryOne(
+        """
+        SELECT
+          a.id AS assignment_id,
+          a.shift_id AS shift_id
+        FROM zeitplan_shift_assignments a
+        JOIN zeitplan_shifts s ON s.id = a.shift_id
+        JOIN zeitplan_plans p ON p.id = a.plan_id
+        WHERE a.user_id = ?
+          AND a.company_id = ?
+          AND a.status IN ('PLANNED', 'NOTIFIED', 'SEEN')
+          AND s.status IN ('PLANNED', 'ACTIVE')
+          AND p.status = 'ACTIVE'
+          AND s.shift_date = (now() AT TIME ZONE s.timezone)::date
+          AND (now() AT TIME ZONE s.timezone)::time BETWEEN (s.start_time - INTERVAL '2 hours')
+                                                       AND (s.end_time + INTERVAL '2 hours')
+        ORDER BY ABS(EXTRACT(EPOCH FROM (((now() AT TIME ZONE s.timezone)::time - s.start_time)))) ASC
+        LIMIT 1
+        """.trimIndent(),
+        listOf(userId, companyId)
+    ) { rs ->
+        MatchingZeitPlanAssignment(
+            assignmentId = rs.getObject("assignment_id", UUID::class.java),
+            shiftId = rs.getObject("shift_id", UUID::class.java)
+        )
+    }
 }
 
 private fun requireSameCompany(sessionId: UUID, companyId: Int) = transaction {
@@ -554,16 +591,53 @@ fun Route.trackingRoutes() {
             }
 
             val created = transaction {
-                queryOne(
+                val matchingAssignment = findMatchingZeitPlanAssignment(
+                    userId = userId,
+                    companyId = ctx.companyId
+                )
+
+                val createdSession = queryOne(
                     """
-                    INSERT INTO tracking_sessions (company_id, user_id, started_at, is_active)
-                    VALUES (?, ?, now(), TRUE)
+                    INSERT INTO tracking_sessions (
+                      company_id,
+                      user_id,
+                      started_at,
+                      is_active,
+                      zeitplan_shift_id,
+                      zeitplan_assignment_id
+                    )
+                    VALUES (?, ?, now(), TRUE, ?, ?)
                     RETURNING id, started_at
                     """.trimIndent(),
-                    listOf(ctx.companyId, userId)
+                    listOf(
+                        ctx.companyId,
+                        userId,
+                        matchingAssignment?.shiftId,
+                        matchingAssignment?.assignmentId
+                    )
                 ) { rs ->
                     Pair(rs.getObject("id", UUID::class.java), rs.getString("started_at"))
                 }!!
+
+                if (matchingAssignment != null) {
+                    execUpdate(
+                        """
+                        UPDATE zeitplan_shift_assignments
+                        SET
+                          status = 'STARTED',
+                          started_at = now(),
+                          updated_at = now()
+                        WHERE id = ?
+                          AND user_id = ?
+                          AND company_id = ?
+                          AND status IN ('PLANNED', 'NOTIFIED', 'SEEN')
+                        """.trimIndent(),
+                        listOf(matchingAssignment.assignmentId, userId, ctx.companyId)
+                    )
+                    println("🧩 [zeitplan/start] userId=$userId assignmentId=${matchingAssignment.assignmentId} shiftId=${matchingAssignment.shiftId}")
+                }
+
+                createdSession
             }
             insertAttendanceLogForSession(userId, "in", "now()", "tracking-start")
             call.respond(StartSessionResp(created.first.toString(), created.second))
@@ -576,16 +650,43 @@ fun Route.trackingRoutes() {
 
             requireOwnedActiveSession(sessionId, userId)
 
-            val endedAt = transaction {
+            val stopped = transaction {
                 queryOne(
                     """
                     UPDATE tracking_sessions
                     SET is_active = FALSE, ended_at = now()
                     WHERE id = ? AND user_id = ? AND is_active = TRUE
-                    RETURNING ended_at
+                    RETURNING ended_at, zeitplan_assignment_id
                     """.trimIndent(),
                     listOf(sessionId, userId)
-                ) { rs -> rs.getString("ended_at") } ?: conflict("Session already stopped")
+                ) { rs ->
+                    Pair(
+                        rs.getString("ended_at"),
+                        rs.getObject("zeitplan_assignment_id", UUID::class.java)
+                    )
+                } ?: conflict("Session already stopped")
+            }
+
+            val endedAt = stopped.first
+            val zeitPlanAssignmentId = stopped.second
+
+            if (zeitPlanAssignmentId != null) {
+                transaction {
+                    execUpdate(
+                        """
+                        UPDATE zeitplan_shift_assignments
+                        SET
+                          status = 'COMPLETED',
+                          completed_at = ?::timestamptz,
+                          updated_at = now()
+                        WHERE id = ?
+                          AND user_id = ?
+                          AND status = 'STARTED'
+                        """.trimIndent(),
+                        listOf(endedAt, zeitPlanAssignmentId, userId)
+                    )
+                }
+                println("🧩 [zeitplan/stop] userId=$userId assignmentId=$zeitPlanAssignmentId completedAt=$endedAt")
             }
             try {
                 transaction {

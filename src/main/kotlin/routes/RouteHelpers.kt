@@ -20,7 +20,9 @@ fun ApplicationCall.routeRequireUserId(): Long {
     val principal = principal<JWTPrincipal>()
         ?: throw BadRequestException("Missing auth principal")
 
-    return principal.payload.getClaim("userId").asLong()
+    return principal.payload.getClaim("id").asString()?.toLongOrNull()
+        ?: principal.payload.getClaim("id").asLong()
+        ?: principal.payload.getClaim("userId").asLong()
         ?: principal.payload.getClaim("user_id").asLong()
         ?: principal.payload.subject?.toLongOrNull()
         ?: throw BadRequestException("Missing user id in token")
