@@ -468,6 +468,7 @@ fun Application.module() {
             registerEntitlementsRoutes()
             accountDeletionRoutes(deletionService)
             trackingRoutes()
+            zeitPlanRoutes()
             workerJoinRoutes()
             companyInviteRoutes()
             companySearchRoutes()
