@@ -1,4 +1,3 @@
-
 package com.yourcompany.zeiterfassung.push
 
 import com.eatthepath.pushy.apns.ApnsClient
@@ -10,9 +9,7 @@ import com.eatthepath.pushy.apns.util.SimpleApnsPushNotification
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
-import java.io.ByteArrayInputStream
 import java.time.Instant
-import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -26,7 +23,7 @@ import java.util.concurrent.TimeoutException
  * Required env variables:
  * APNS_TEAM_ID        - Apple Team ID (Обязательно, не хватает в вашем .env!)
  * APNS_KEY_ID         - Key ID for your .p8 key
- * APNS_P8_KEY         - Base64-encoded contents of the .p8 key (Используется вместо APNS_P8_BASE64)
+ * APNS_P8_KEY         - .p8 private key content. Accepts full PEM, escaped \n PEM, or clean base64 body.
  * Optional:
  * APNS_DEFAULT_TTL    - default TTL in seconds (default 600)
  */
@@ -235,25 +232,11 @@ object ApnsSender {
             val teamId = envOrThrow("APNS_TEAM_ID")
             val keyId = envOrThrow("APNS_KEY_ID")
 
-            // Используем APNS_P8_KEY из .env и очищаем его от заголовков и символов новой строки
-            val p8KeyContentWithHeaders = envOrThrow("APNS_P8_KEY")
-
-            val p8KeyContent = p8KeyContentWithHeaders
-                .replace("-----BEGIN PRIVATE KEY-----", "")
-                .replace("-----END PRIVATE KEY-----", "")
-                // Удаляем все варианты новых строк, включая экранированные (\n) и фактические
-                .replace("\\n", "")
-                .replace("\n", "")
-                .trim()
-
-            val p8bytes = try {
-                Base64.getDecoder().decode(p8KeyContent)
-            } catch (e: IllegalArgumentException) {
-                // Измененное сообщение об ошибке для более точного указания на проблему с форматом
-                throw IllegalStateException("APNS_P8_KEY content is not valid Base64 after cleaning (check key format in .env)", e)
-            }
-
-            val signingKey = ApnsSigningKey.loadFromInputStream(ByteArrayInputStream(p8bytes), teamId, keyId)
+            val signingKey = ApnsSigningKey.loadFromInputStream(
+                normalizedP8KeyPem().byteInputStream(),
+                teamId,
+                keyId
+            )
             val host = when (env) {
                 Env.SANDBOX -> ApnsClientBuilder.DEVELOPMENT_APNS_HOST
                 Env.PROD -> ApnsClientBuilder.PRODUCTION_APNS_HOST
@@ -280,6 +263,28 @@ object ApnsSender {
 
         private fun envOrThrow(name: String): String =
             System.getenv(name) ?: error("Missing required env var: $name")
+
+        private fun normalizedP8KeyPem(): String {
+            val raw = envOrThrow("APNS_P8_KEY")
+                .trim()
+                .removeSurrounding("\"")
+                .removeSurrounding("'")
+                .replace("\\n", "\n")
+
+            val body = raw
+                .replace("-----BEGIN PRIVATE KEY-----", "")
+                .replace("-----END PRIVATE KEY-----", "")
+                .replace("\\s".toRegex(), "")
+
+            require(body.isNotBlank()) {
+                "APNS_P8_KEY is empty after cleaning"
+            }
+
+            return buildString {
+                appendLine("-----BEGIN PRIVATE KEY-----")
+                body.chunked(64).forEach { appendLine(it) }
+                appendLine("-----END PRIVATE KEY-----")
+            }
+        }
     }
 }
-
