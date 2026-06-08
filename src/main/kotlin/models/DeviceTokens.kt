@@ -22,6 +22,9 @@ object DeviceTokens : Table("device_tokens") {
     // Сам токен устройства
     val token = text("token")
 
+    // Язык устройства/приложения: "de", "en", "ru", "bg", "tr", "uk"
+    val locale = varchar("locale", length = 8).nullable()
+
     // Время создания записи
     val createdAt = timestamp("created_at")
 }

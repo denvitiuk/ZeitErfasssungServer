@@ -20,8 +20,23 @@ import io.ktor.http.HttpStatusCode
 @Serializable
 data class RegisterDeviceTokenRequest(
     val platform: String,  // "ios" or "android"
-    val token: String
+    val token: String,
+    val locale: String? = null
 )
+
+private fun normalizeDeviceLocale(raw: String?): String {
+    val language = raw
+        ?.trim()
+        ?.replace('_', '-')
+        ?.substringBefore('-')
+        ?.lowercase()
+        ?: "de"
+
+    return when (language) {
+        "de", "en", "ru", "bg", "tr", "uk" -> language
+        else -> "de"
+    }
+}
 
 
 fun Route.deviceTokenRoutes() {
@@ -34,6 +49,7 @@ fun Route.deviceTokenRoutes() {
                 val req = call.receive<RegisterDeviceTokenRequest>()
                 val platform = req.platform.trim().lowercase()
                 val token = req.token.trim()
+                val locale = normalizeDeviceLocale(req.locale)
 
                 if (platform !in listOf("ios", "android")) {
                     call.respond(
@@ -62,6 +78,7 @@ fun Route.deviceTokenRoutes() {
                                 (DeviceTokens.platform eq platform)
                     }) {
                         it[DeviceTokens.token] = token
+                        it[DeviceTokens.locale] = locale
                         it[DeviceTokens.createdAt] = now
                     }
 
@@ -70,12 +87,13 @@ fun Route.deviceTokenRoutes() {
                             it[DeviceTokens.userId] = userId
                             it[DeviceTokens.platform] = platform
                             it[DeviceTokens.token] = token
+                            it[DeviceTokens.locale] = locale
                             it[DeviceTokens.createdAt] = now
                         }
                     }
                 }
 
-                call.application.environment.log.info("📲 Device token saved userId=$userId platform=$platform tokenSuffix=${token.takeLast(8)}")
+                call.application.environment.log.info("📲 Device token saved userId=$userId platform=$platform locale=$locale tokenSuffix=${token.takeLast(8)}")
                 call.respond(mapOf("status" to "ok"))
             }
 
@@ -88,6 +106,7 @@ fun Route.deviceTokenRoutes() {
                         .map {
                             mapOf(
                                 "platform" to it[DeviceTokens.platform],
+                                "locale" to it[DeviceTokens.locale],
                                 "tokenSuffix" to it[DeviceTokens.token].takeLast(8),
                                 "createdAt" to it[DeviceTokens.createdAt].toString()
                             )
@@ -99,4 +118,3 @@ fun Route.deviceTokenRoutes() {
         }
     }
 }
-
