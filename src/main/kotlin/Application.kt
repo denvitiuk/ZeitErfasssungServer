@@ -483,7 +483,7 @@ fun Application.module() {
             registerEntitlementsRoutes()
             accountDeletionRoutes(deletionService)
             trackingRoutes()
-            zeitPlanRoutes()
+            zeitPlanRoutes(env)
             workerJoinRoutes()
             companyInviteRoutes()
             companySearchRoutes()

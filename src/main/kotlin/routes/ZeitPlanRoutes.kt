@@ -364,10 +364,9 @@ private fun String.escapeHtml(): String =
         .replace("\"", "&quot;")
         .replace("'", "&#39;")
 
-private fun sendZeitPlanShiftEmails(targets: List<ZeitPlanEmailTarget>) {
+private fun sendZeitPlanShiftEmails(targets: List<ZeitPlanEmailTarget>, env: Dotenv) {
     if (targets.isEmpty()) return
 
-    val env = Dotenv.load()
     targets.distinctBy { it.assignmentId }.forEach { target ->
         runCatching {
             EmailService.send(
@@ -382,7 +381,7 @@ private fun sendZeitPlanShiftEmails(targets: List<ZeitPlanEmailTarget>) {
     }
 }
 
-fun Route.zeitPlanRoutes() {
+fun Route.zeitPlanRoutes(env: Dotenv) {
     route("/admin/zeitplan") {
         get("/plans") {
             val adminUserId = call.routeRequireUserId()
@@ -1002,7 +1001,7 @@ fun Route.zeitPlanRoutes() {
                 }
             } ?: throw BadRequestException("Failed to notify ZeitPlan")
 
-            sendZeitPlanShiftEmails(emailTargets)
+            sendZeitPlanShiftEmails(emailTargets, env)
             call.respond(result)
         }
 
@@ -1115,7 +1114,7 @@ fun Route.zeitPlanRoutes() {
                 }
             } ?: throw BadRequestException("Failed to notify ZeitPlan shift")
 
-            sendZeitPlanShiftEmails(emailTargets)
+            sendZeitPlanShiftEmails(emailTargets, env)
             call.respond(result)
         }
 
