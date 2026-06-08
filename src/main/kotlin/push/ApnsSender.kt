@@ -1,5 +1,3 @@
-/*
-
 
 package com.yourcompany.zeiterfassung.push
 
@@ -8,7 +6,6 @@ import com.eatthepath.pushy.apns.ApnsClientBuilder
 import com.eatthepath.pushy.apns.DeliveryPriority
 import com.eatthepath.pushy.apns.PushNotificationResponse
 import com.eatthepath.pushy.apns.auth.ApnsSigningKey
-import com.eatthepath.pushy.apns.util.ApnsPayloadBuilder
 import com.eatthepath.pushy.apns.util.SimpleApnsPushNotification
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -80,18 +77,7 @@ object ApnsSender {
         val ttl = (req.ttlSeconds ?: (System.getenv("APNS_DEFAULT_TTL")?.toLongOrNull() ?: 600L)).coerceAtLeast(0)
         // Retrieve the client based only on the environment (Env)
         val client = ClientFactory.clientFor(req.env)
-
-        val payloadBuilder = com.eatthepath.pushy.apns.util.ApnsPayloadBuilder()
-        applyPushTypeToPayload(req, payloadBuilder)
-
-        // Custom payload data (userInfo)
-        req.data.forEach { (k, v) ->
-            if (v != null) {
-                payloadBuilder.addCustomProperty(k, v)
-            }
-        }
-
-        val payload = payloadBuilder.build()
+        val payload = buildPayload(req)
         val expiration: Instant? = if (ttl == 0L) null else Instant.now().plusSeconds(ttl)
         val priority = if (req.pushType == PushType.ALERT) DeliveryPriority.IMMEDIATE else DeliveryPriority.CONSERVE_POWER
         val apnsUuid = req.apnsId?.let { kotlin.runCatching { UUID.fromString(it) }.getOrNull() } ?: UUID.randomUUID()
@@ -168,35 +154,66 @@ object ApnsSender {
         }
     }
 
-    /**
-     * Applies APNs push-type semantics to the payload builder.
-     * - ALERT: sets alert title/body; only then applies sound/badge/category.
-     * If both title and body are empty, falls back to background (content-available).
-     * - BACKGROUND: sets content-available and avoids any alert fields.
-     */
-    private fun applyPushTypeToPayload(
-        req: Request,
-        payloadBuilder: com.eatthepath.pushy.apns.util.ApnsPayloadBuilder
-    ) {
+    private fun buildPayload(req: Request): String {
+        val apsEntries = mutableListOf<String>()
+
         when (req.pushType) {
             PushType.ALERT -> {
                 val hasTitle = !req.title.isNullOrBlank()
                 val hasBody = !req.body.isNullOrBlank()
-                if (hasTitle) payloadBuilder.setAlertTitle(req.title)
-                if (hasBody) payloadBuilder.setAlertBody(req.body)
 
                 if (hasTitle || hasBody) {
-                    req.sound?.let { payloadBuilder.setSound(it) }
-                    req.badge?.let { payloadBuilder.setBadgeNumber(it) }
-                    req.category?.let { payloadBuilder.setCategoryName(it) }
+                    val alertEntries = mutableListOf<String>()
+                    req.title?.takeIf { it.isNotBlank() }?.let {
+                        alertEntries += "\"title\":${jsonValue(it)}"
+                    }
+                    req.body?.takeIf { it.isNotBlank() }?.let {
+                        alertEntries += "\"body\":${jsonValue(it)}"
+                    }
+                    apsEntries += "\"alert\":{${alertEntries.joinToString(",")}}"
+                    req.sound?.let { apsEntries += "\"sound\":${jsonValue(it)}" }
+                    req.badge?.let { apsEntries += "\"badge\":$it" }
+                    req.category?.let { apsEntries += "\"category\":${jsonValue(it)}" }
                 } else {
-                    // No visible text – treat as background to avoid an empty alert.
-                    payloadBuilder.setContentAvailable(true)
+                    apsEntries += "\"content-available\":1"
                 }
             }
+
             PushType.BACKGROUND -> {
-                payloadBuilder.setContentAvailable(true)
-                // Ensure no alert fields are set for background pushes.
+                apsEntries += "\"content-available\":1"
+            }
+        }
+
+        val rootEntries = mutableListOf<String>()
+        rootEntries += "\"aps\":{${apsEntries.joinToString(",")}}"
+
+        req.data.forEach { (key, value) ->
+            if (value != null && key != "aps") {
+                rootEntries += "${jsonValue(key)}:${jsonValue(value)}"
+            }
+        }
+
+        return "{${rootEntries.joinToString(",")}}"
+    }
+
+    private fun jsonValue(value: Any?): String = when (value) {
+        null -> "null"
+        is Number -> value.toString()
+        is Boolean -> value.toString()
+        else -> "\"${value.toString().jsonEscaped()}\""
+    }
+
+    private fun String.jsonEscaped(): String = buildString {
+        this@jsonEscaped.forEach { ch ->
+            when (ch) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\b' -> append("\\b")
+                '\u000C' -> append("\\f")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                else -> append(ch)
             }
         }
     }
@@ -266,4 +283,3 @@ object ApnsSender {
     }
 }
 
-*/

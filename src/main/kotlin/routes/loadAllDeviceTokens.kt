@@ -15,7 +15,6 @@ import kotlinx.serialization.Serializable
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import java.time.Instant
 import io.ktor.http.HttpStatusCode
-import kotlin.and
 
 
 @Serializable
@@ -33,11 +32,21 @@ fun Route.deviceTokenRoutes() {
                 val principal = call.principal<JWTPrincipal>()
                 val userId = principal!!.payload.getClaim("id").asString().toInt()
                 val req = call.receive<RegisterDeviceTokenRequest>()
+                val platform = req.platform.trim().lowercase()
+                val token = req.token.trim()
 
-                if (req.platform !in listOf("ios", "android")) {
+                if (platform !in listOf("ios", "android")) {
                     call.respond(
                         HttpStatusCode.BadRequest,
                         mapOf("error" to "Unsupported platform: ${req.platform}")
+                    )
+                    return@post
+                }
+
+                if (token.isBlank()) {
+                    call.respond(
+                        HttpStatusCode.BadRequest,
+                        mapOf("error" to "Device token is empty")
                     )
                     return@post
                 }
@@ -50,24 +59,23 @@ fun Route.deviceTokenRoutes() {
                 transaction {
                     val updated = DeviceTokens.update({
                         (DeviceTokens.userId eq userId) and
-                                (DeviceTokens.platform eq req.platform)
+                                (DeviceTokens.platform eq platform)
                     }) {
-                        it[DeviceTokens.token] = req.token
+                        it[DeviceTokens.token] = token
                         it[DeviceTokens.createdAt] = now
-
                     }
 
                     if (updated == 0) {
                         DeviceTokens.insert {
                             it[DeviceTokens.userId] = userId
-                            it[DeviceTokens.platform] = req.platform
-                            it[DeviceTokens.token] = req.token
+                            it[DeviceTokens.platform] = platform
+                            it[DeviceTokens.token] = token
                             it[DeviceTokens.createdAt] = now
-
                         }
                     }
                 }
 
+                call.application.environment.log.info("📲 Device token saved userId=$userId platform=$platform tokenSuffix=${token.takeLast(8)}")
                 call.respond(mapOf("status" to "ok"))
             }
 
@@ -80,7 +88,8 @@ fun Route.deviceTokenRoutes() {
                         .map {
                             mapOf(
                                 "platform" to it[DeviceTokens.platform],
-                                "token" to it[DeviceTokens.token]
+                                "tokenSuffix" to it[DeviceTokens.token].takeLast(8),
+                                "createdAt" to it[DeviceTokens.createdAt].toString()
                             )
                         }
                 }

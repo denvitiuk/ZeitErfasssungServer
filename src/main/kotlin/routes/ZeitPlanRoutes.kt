@@ -1,6 +1,7 @@
 package com.yourcompany.zeiterfassung.routes
 
 import com.yourcompany.zeiterfassung.service.EmailService
+import com.yourcompany.zeiterfassung.push.ApnsSender
 import io.github.cdimascio.dotenv.Dotenv
 
 import io.ktor.http.HttpStatusCode
@@ -182,6 +183,19 @@ private data class ZeitPlanEmailTarget(
     val timezone: String
 )
 
+private data class ZeitPlanPushTarget(
+    val assignmentId: UUID,
+    val userId: Int,
+    val deviceToken: String,
+    val workerName: String,
+    val planTitle: String,
+    val groupTitle: String,
+    val shiftDate: String,
+    val startTime: String,
+    val endTime: String,
+    val timezone: String
+)
+
 private fun loadZeitPlanEmailTargetsForPlan(planId: UUID, companyId: Int): List<ZeitPlanEmailTarget> = transaction {
     val stmt = connection.prepareStatement(
         """
@@ -292,6 +306,122 @@ private fun loadZeitPlanEmailTargetsForShift(shiftId: UUID, companyId: Int): Lis
     }
 }
 
+private fun loadZeitPlanPushTargetsForPlan(planId: UUID, companyId: Int): List<ZeitPlanPushTarget> = transaction {
+    val stmt = connection.prepareStatement(
+        """
+        SELECT
+          a.id AS assignment_id,
+          a.user_id AS user_id,
+          dt.token AS device_token,
+          COALESCE(NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''), 'Mitarbeiter') AS worker_name,
+          p.title AS plan_title,
+          g.title AS group_title,
+          s.shift_date::text AS shift_date,
+          s.start_time::text AS start_time,
+          s.end_time::text AS end_time,
+          s.timezone AS timezone
+        FROM zeitplan_shift_assignments a
+        JOIN zeitplan_shifts s ON s.id = a.shift_id
+        JOIN zeitplan_shift_groups g ON g.id = a.shift_group_id
+        JOIN zeitplan_plans p ON p.id = a.plan_id
+        JOIN users u ON u.id = a.user_id
+        JOIN device_tokens dt ON dt.user_id = a.user_id
+        WHERE p.id = ?
+          AND p.company_id = ?
+          AND p.status = 'ACTIVE'
+          AND s.status IN ('PLANNED', 'ACTIVE')
+          AND a.status IN ('PLANNED', 'NOTIFIED', 'SEEN')
+          AND s.notify_push_enabled = TRUE
+          AND LOWER(dt.platform) = 'ios'
+          AND TRIM(dt.token) <> ''
+        ORDER BY s.shift_date ASC, s.start_time ASC, g.title ASC
+        """.trimIndent(),
+        false
+    )
+
+    stmt.set(1, planId)
+    stmt.set(2, companyId)
+
+    stmt.executeQuery().use { rs ->
+        val out = mutableListOf<ZeitPlanPushTarget>()
+        while (rs.next()) {
+            out.add(
+                ZeitPlanPushTarget(
+                    assignmentId = rs.getObject("assignment_id", UUID::class.java),
+                    userId = rs.getInt("user_id"),
+                    deviceToken = rs.getString("device_token"),
+                    workerName = rs.getString("worker_name"),
+                    planTitle = rs.getString("plan_title"),
+                    groupTitle = rs.getString("group_title"),
+                    shiftDate = rs.getString("shift_date"),
+                    startTime = rs.getString("start_time"),
+                    endTime = rs.getString("end_time"),
+                    timezone = rs.getString("timezone")
+                )
+            )
+        }
+        out
+    }
+}
+
+private fun loadZeitPlanPushTargetsForShift(shiftId: UUID, companyId: Int): List<ZeitPlanPushTarget> = transaction {
+    val stmt = connection.prepareStatement(
+        """
+        SELECT
+          a.id AS assignment_id,
+          a.user_id AS user_id,
+          dt.token AS device_token,
+          COALESCE(NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''), 'Mitarbeiter') AS worker_name,
+          p.title AS plan_title,
+          g.title AS group_title,
+          s.shift_date::text AS shift_date,
+          s.start_time::text AS start_time,
+          s.end_time::text AS end_time,
+          s.timezone AS timezone
+        FROM zeitplan_shift_assignments a
+        JOIN zeitplan_shifts s ON s.id = a.shift_id
+        JOIN zeitplan_shift_groups g ON g.id = a.shift_group_id
+        JOIN zeitplan_plans p ON p.id = a.plan_id
+        JOIN users u ON u.id = a.user_id
+        JOIN device_tokens dt ON dt.user_id = a.user_id
+        WHERE s.id = ?
+          AND s.company_id = ?
+          AND p.status = 'ACTIVE'
+          AND s.status IN ('PLANNED', 'ACTIVE')
+          AND a.status IN ('PLANNED', 'NOTIFIED', 'SEEN')
+          AND s.notify_push_enabled = TRUE
+          AND LOWER(dt.platform) = 'ios'
+          AND TRIM(dt.token) <> ''
+        ORDER BY s.shift_date ASC, s.start_time ASC, g.title ASC
+        """.trimIndent(),
+        false
+    )
+
+    stmt.set(1, shiftId)
+    stmt.set(2, companyId)
+
+    stmt.executeQuery().use { rs ->
+        val out = mutableListOf<ZeitPlanPushTarget>()
+        while (rs.next()) {
+            out.add(
+                ZeitPlanPushTarget(
+                    assignmentId = rs.getObject("assignment_id", UUID::class.java),
+                    userId = rs.getInt("user_id"),
+                    deviceToken = rs.getString("device_token"),
+                    workerName = rs.getString("worker_name"),
+                    planTitle = rs.getString("plan_title"),
+                    groupTitle = rs.getString("group_title"),
+                    shiftDate = rs.getString("shift_date"),
+                    startTime = rs.getString("start_time"),
+                    endTime = rs.getString("end_time"),
+                    timezone = rs.getString("timezone")
+                )
+            )
+        }
+        out
+    }
+}
+
 private fun buildZeitPlanShiftEmailHtml(target: ZeitPlanEmailTarget): String {
     val workerName = target.workerName.escapeHtml()
     val planTitle = target.planTitle.escapeHtml()
@@ -377,6 +507,62 @@ private fun sendZeitPlanShiftEmails(targets: List<ZeitPlanEmailTarget>, env: Dot
             )
         }.onFailure { error ->
             println("[ZeitPlanEmail] failed assignmentId=${target.assignmentId} to=${target.email}: ${error.message}")
+        }
+    }
+}
+
+private suspend fun sendZeitPlanShiftPushes(targets: List<ZeitPlanPushTarget>) {
+    if (targets.isEmpty()) return
+
+    val bundleId = System.getenv("APNS_BUNDLE_ID")
+        ?: System.getenv("IOS_BUNDLE_ID")
+        ?: System.getenv("APP_BUNDLE_ID")
+
+    if (bundleId.isNullOrBlank()) {
+        println("[ZeitPlanPush] skipped: APNS_BUNDLE_ID/IOS_BUNDLE_ID/APP_BUNDLE_ID is not set")
+        return
+    }
+
+    val apnsEnv = when {
+        System.getenv("APNS_ENV")?.equals("PROD", ignoreCase = true) == true -> ApnsSender.Env.PROD
+        System.getenv("APNS_ENV")?.equals("PRODUCTION", ignoreCase = true) == true -> ApnsSender.Env.PROD
+        System.getenv("APNS_USE_PRODUCTION")?.toBooleanStrictOrNull() == true -> ApnsSender.Env.PROD
+        else -> ApnsSender.Env.SANDBOX
+    }
+
+    targets.distinctBy { it.assignmentId to it.deviceToken }.forEach { target ->
+        val title = "Neue Schicht geplant"
+        val body = "${target.shiftDate} · ${target.startTime}–${target.endTime} · ${target.groupTitle}"
+
+        runCatching {
+            ApnsSender.send(
+                ApnsSender.Request(
+                    deviceToken = target.deviceToken,
+                    bundleId = bundleId,
+                    env = apnsEnv,
+                    title = title,
+                    body = body,
+                    pushType = ApnsSender.PushType.ALERT,
+                    ttlSeconds = 3600,
+                    collapseId = "zeitplan-${target.assignmentId}",
+                    sound = "default",
+                    data = mapOf(
+                        "type" to "ZEITPLAN_SHIFT_ASSIGNED",
+                        "assignmentId" to target.assignmentId.toString(),
+                        "userId" to target.userId,
+                        "planTitle" to target.planTitle,
+                        "groupTitle" to target.groupTitle,
+                        "shiftDate" to target.shiftDate,
+                        "startTime" to target.startTime,
+                        "endTime" to target.endTime,
+                        "timezone" to target.timezone
+                    )
+                )
+            )
+        }.onSuccess { result ->
+            println("[ZeitPlanPush] assignmentId=${target.assignmentId} userId=${target.userId} status=${result.status} reason=${result.reason}")
+        }.onFailure { error ->
+            println("[ZeitPlanPush] failed assignmentId=${target.assignmentId} userId=${target.userId}: ${error.message}")
         }
     }
 }
@@ -897,6 +1083,7 @@ fun Route.zeitPlanRoutes(env: Dotenv) {
             val ctx = routeLoadUserContext(adminUserId)
             val planId = routeParseUuid(call.parameters["planId"], "planId")
             val emailTargets = loadZeitPlanEmailTargetsForPlan(planId, ctx.companyId)
+            val pushTargets = loadZeitPlanPushTargetsForPlan(planId, ctx.companyId)
 
             val result = transaction {
                 routeQueryOne(
@@ -1002,6 +1189,7 @@ fun Route.zeitPlanRoutes(env: Dotenv) {
             } ?: throw BadRequestException("Failed to notify ZeitPlan")
 
             sendZeitPlanShiftEmails(emailTargets, env)
+            sendZeitPlanShiftPushes(pushTargets)
             call.respond(result)
         }
 
@@ -1010,6 +1198,7 @@ fun Route.zeitPlanRoutes(env: Dotenv) {
             val ctx = routeLoadUserContext(adminUserId)
             val shiftId = routeParseUuid(call.parameters["shiftId"], "shiftId")
             val emailTargets = loadZeitPlanEmailTargetsForShift(shiftId, ctx.companyId)
+            val pushTargets = loadZeitPlanPushTargetsForShift(shiftId, ctx.companyId)
 
             val result = transaction {
                 routeQueryOne(
@@ -1115,6 +1304,7 @@ fun Route.zeitPlanRoutes(env: Dotenv) {
             } ?: throw BadRequestException("Failed to notify ZeitPlan shift")
 
             sendZeitPlanShiftEmails(emailTargets, env)
+            sendZeitPlanShiftPushes(pushTargets)
             call.respond(result)
         }
 
