@@ -456,6 +456,10 @@ fun Application.module() {
 
         supportAutoReplyRoutes(env)
 
+        // Public worker invite / QR join pages.
+        // Must stay outside bearerAuth so invited workers can open links before login.
+        publicWorkerJoinRoutes()
+
         // Billing routes: webhook must be public (no JWT), other endpoints are fine here
         registerBillingRoutes()
 

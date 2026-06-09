@@ -16,6 +16,11 @@ import io.ktor.server.routing.route
 import kotlinx.serialization.Serializable
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.security.SecureRandom
+import io.ktor.http.ContentType
+import io.ktor.http.encodeURLParameter
+import io.ktor.server.response.respondText
+
+
 
 // Response for company worker-join settings.
 // These flags control how employees can join a company.
@@ -1890,6 +1895,222 @@ fun Route.workerJoinRoutes() {
 
 fun Route.publicWorkerJoinRoutes() {
     // Public join-link preview endpoint.
+
+
+    get("/join/{token}") {
+
+        val token = call.parameters["token"]?.trim().orEmpty()
+
+        if (token.isBlank()) {
+
+            return@get call.respondText(
+
+                joinPageHtml(
+
+                    title = "Invalid invite link",
+
+                    headline = "Invite link is missing",
+
+                    body = "This invitation link is incomplete. Please ask your company administrator to send a new invite.",
+
+                    deepLink = null,
+
+                    active = false
+
+                ),
+
+                ContentType.Text.Html,
+
+                HttpStatusCode.BadRequest
+
+            )
+
+        }
+
+        try {
+
+            val preview = transaction {
+
+                var response: JoinLinkPreviewResponse? = null
+
+                exec(
+
+                    """
+
+                    SELECT
+
+                        jl.company_id,
+
+                        c.name AS company_name,
+
+                        jl.project_id,
+
+                        p.title AS project_title,
+
+                        jl.type,
+
+                        jl.requires_approval,
+
+                        jl.is_active,
+
+                        (jl.expires_at IS NOT NULL AND jl.expires_at < now()) AS expired,
+
+                        jl.max_uses,
+
+                        jl.used_count
+
+                    FROM join_links jl
+
+                    JOIN companies c ON c.id = jl.company_id
+
+                    LEFT JOIN projects p ON p.id = jl.project_id
+
+                    WHERE jl.token = ${sqlStringOrNull(token)}
+
+                    LIMIT 1
+
+                    """.trimIndent()
+
+                ) { rs ->
+
+                    if (rs.next()) {
+
+                        val maxUses = resultSetIntOrNull(rs.getObject("max_uses"))
+
+                        val usedCount = rs.getInt("used_count")
+
+                        val maxUsesReached = maxUses != null && usedCount >= maxUses
+
+                        val expired = rs.getBoolean("expired")
+
+                        val isActive = rs.getBoolean("is_active") && !expired && !maxUsesReached
+
+                        response = JoinLinkPreviewResponse(
+
+                            companyId = rs.getInt("company_id"),
+
+                            companyName = rs.getString("company_name"),
+
+                            projectId = resultSetIntOrNull(rs.getObject("project_id")),
+
+                            projectTitle = rs.getString("project_title"),
+
+                            type = rs.getString("type"),
+
+                            requiresApproval = rs.getBoolean("requires_approval"),
+
+                            active = isActive,
+
+                            expired = expired
+
+                        )
+
+                    }
+
+                }
+
+                response
+
+            }
+
+            if (preview == null) {
+
+                return@get call.respondText(
+
+                    joinPageHtml(
+
+                        title = "Invite not found",
+
+                        headline = "Invite link was not found",
+
+                        body = "This invite may have been deleted or copied incorrectly. Please ask your company administrator for a new link.",
+
+                        deepLink = null,
+
+                        active = false
+
+                    ),
+
+                    ContentType.Text.Html,
+
+                    HttpStatusCode.NotFound
+
+                )
+
+            }
+
+            val companyName = preview.companyName.ifBlank { "your company" }
+
+            val projectText = preview.projectTitle
+
+                ?.takeIf { it.isNotBlank() }
+
+                ?.let { " Project: $it." }
+
+                .orEmpty()
+
+            val deepLink = "zeiterfassung://join?token=${token.encodeURLParameter()}"
+
+            call.respondText(
+
+                joinPageHtml(
+
+                    title = "Join $companyName",
+
+                    headline = if (preview.active) "Join $companyName" else "Invite link is not active",
+
+                    body = if (preview.active) {
+
+                        "You were invited to join $companyName in ZeitErfassung.$projectText Open the app to continue."
+
+                    } else {
+
+                        "This invite link is expired, inactive or already fully used. Please ask your company administrator for a new invite."
+
+                    },
+
+                    deepLink = if (preview.active) deepLink else null,
+
+                    active = preview.active
+
+                ),
+
+                ContentType.Text.Html,
+
+                HttpStatusCode.OK
+
+            )
+
+        } catch (e: Exception) {
+
+            call.application.log.error("Failed to render public join page", e)
+
+            call.respondText(
+
+                joinPageHtml(
+
+                    title = "Join page error",
+
+                    headline = "Something went wrong",
+
+                    body = "The invite page could not be loaded. Please try again later or contact your company administrator.",
+
+                    deepLink = null,
+
+                    active = false
+
+                ),
+
+                ContentType.Text.Html,
+
+                HttpStatusCode.InternalServerError
+
+            )
+
+        }
+
+    }
+
     // This must stay outside authenticate("bearerAuth") so workers can open invite links before login.
     route("/join-links") {
         // Returns safe company/project preview data for a token.
@@ -1956,3 +2177,161 @@ fun Route.publicWorkerJoinRoutes() {
         }
     }
 }
+
+
+private fun joinPageHtml(
+    title: String,
+    headline: String,
+    body: String,
+    deepLink: String?,
+    active: Boolean
+): String {
+    val safeTitle = title.escapeHtml()
+    val safeHeadline = headline.escapeHtml()
+    val safeBody = body.escapeHtml()
+    val safeDeepLink = deepLink?.escapeHtml()
+
+    val openButton = if (safeDeepLink != null) {
+        """
+        <a class="primary" href="$safeDeepLink">Open ZeitErfassung app</a>
+        <p class="hint">If the app does not open automatically, install the app first and open this link again.</p>
+        """.trimIndent()
+    } else {
+        """
+        <div class="disabled">Invite unavailable</div>
+        """.trimIndent()
+    }
+
+    val badge = if (active) "Active invite" else "Unavailable"
+
+    return """
+        <!doctype html>
+        <html lang="en">
+        <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>$safeTitle</title>
+            <style>
+                :root { color-scheme: light dark; }
+                body {
+                    margin: 0;
+                    min-height: 100vh;
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                    background: radial-gradient(circle at top, #eef6ff 0%, #f7f9fc 42%, #ffffff 100%);
+                    color: #101828;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 24px;
+                    box-sizing: border-box;
+                }
+                .card {
+                    width: 100%;
+                    max-width: 460px;
+                    border-radius: 28px;
+                    background: rgba(255, 255, 255, 0.88);
+                    box-shadow: 0 24px 70px rgba(16, 24, 40, 0.14);
+                    border: 1px solid rgba(16, 24, 40, 0.08);
+                    padding: 28px;
+                    box-sizing: border-box;
+                    backdrop-filter: blur(18px);
+                }
+                .icon {
+                    width: 58px;
+                    height: 58px;
+                    border-radius: 18px;
+                    background: linear-gradient(135deg, #2563eb, #06b6d4);
+                    color: white;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 28px;
+                    font-weight: 800;
+                    margin-bottom: 18px;
+                }
+                .badge {
+                    display: inline-flex;
+                    border-radius: 999px;
+                    padding: 6px 10px;
+                    background: rgba(37, 99, 235, 0.10);
+                    color: #1d4ed8;
+                    font-size: 12px;
+                    font-weight: 700;
+                    margin-bottom: 12px;
+                }
+                h1 {
+                    margin: 0 0 10px;
+                    font-size: 28px;
+                    line-height: 1.12;
+                    letter-spacing: -0.03em;
+                }
+                p {
+                    margin: 0 0 20px;
+                    color: #475467;
+                    line-height: 1.55;
+                }
+                .primary {
+                    display: block;
+                    text-align: center;
+                    text-decoration: none;
+                    color: white;
+                    background: linear-gradient(135deg, #2563eb, #06b6d4);
+                    border-radius: 16px;
+                    padding: 15px 18px;
+                    font-weight: 800;
+                    box-shadow: 0 12px 26px rgba(37, 99, 235, 0.26);
+                }
+                .disabled {
+                    text-align: center;
+                    border-radius: 16px;
+                    padding: 15px 18px;
+                    font-weight: 800;
+                    color: #667085;
+                    background: #eef2f6;
+                }
+                .hint {
+                    font-size: 13px;
+                    margin-top: 16px;
+                    margin-bottom: 0;
+                    text-align: center;
+                }
+                @media (prefers-color-scheme: dark) {
+                    body {
+                        background: radial-gradient(circle at top, #0f172a 0%, #111827 45%, #020617 100%);
+                        color: #f8fafc;
+                    }
+                    .card {
+                        background: rgba(15, 23, 42, 0.84);
+                        border-color: rgba(255,255,255,0.10);
+                    }
+                    p { color: #cbd5e1; }
+                    .badge {
+                        background: rgba(56, 189, 248, 0.14);
+                        color: #7dd3fc;
+                    }
+                    .disabled {
+                        background: rgba(148, 163, 184, 0.16);
+                        color: #cbd5e1;
+                    }
+                }
+            </style>
+        </head>
+        <body>
+            <main class="card">
+                <div class="icon">Z</div>
+                <div class="badge">$badge</div>
+                <h1>$safeHeadline</h1>
+                <p>$safeBody</p>
+                $openButton
+            </main>
+        </body>
+        </html>
+    """.trimIndent()
+}
+
+private fun String.escapeHtml(): String =
+    replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&#39;")
