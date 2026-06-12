@@ -432,56 +432,67 @@ private fun buildZeitPlanShiftEmailHtml(target: ZeitPlanEmailTarget): String {
     val timezone = target.timezone.escapeHtml()
 
     return """
-        <div style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#111827;">
-          <div style="max-width:640px;margin:0 auto;padding:28px 16px;">
-            <div style="background:#ffffff;border-radius:22px;overflow:hidden;border:1px solid #e5e7eb;box-shadow:0 18px 45px rgba(15,23,42,0.10);">
-              <div style="background:linear-gradient(135deg,#111827,#1f2937);padding:26px 28px;color:#ffffff;">
-                <div style="font-size:13px;letter-spacing:0.12em;text-transform:uppercase;opacity:0.72;font-weight:700;">ZeitErfassung</div>
-                <h1 style="margin:10px 0 0;font-size:25px;line-height:1.25;font-weight:800;">Erinnerung an deine geplante Schicht</h1>
-                <p style="margin:10px 0 0;font-size:15px;line-height:1.5;color:#d1d5db;">Bitte prüfe deine Schichtdetails und starte deine Arbeitszeit pünktlich in der App.</p>
+        <div style="margin:0;padding:0;background:#f4f8fc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#111827;">
+          <div style="max-width:640px;margin:0 auto;padding:22px 12px;">
+            <div style="background:#ffffff;border-radius:24px;overflow:hidden;border:1px solid #e5edf5;box-shadow:0 18px 45px rgba(15,23,42,0.10);">
+              <div style="background:linear-gradient(135deg,#0a8ff0,#0677cc);padding:24px 22px;color:#ffffff;">
+                <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;">
+                  <tr>
+                    <td style="vertical-align:middle;width:52px;">
+                      <div style="width:44px;height:44px;border-radius:14px;background:#ffffff;color:#0a8ff0;font-size:17px;line-height:44px;text-align:center;font-weight:900;box-shadow:0 10px 24px rgba(15,23,42,0.16);">ZE</div>
+                    </td>
+                    <td style="vertical-align:middle;padding-left:12px;">
+                      <div style="font-size:18px;line-height:1.2;font-weight:900;color:#ffffff;">ZeitErfassung</div>
+                      <div style="margin-top:2px;font-size:12px;line-height:1.4;color:#dff2ff;font-weight:700;">Digitale Zeiterfassung</div>
+                    </td>
+                  </tr>
+                </table>
+
+                <h1 style="margin:22px 0 0;font-size:24px;line-height:1.25;font-weight:900;color:#ffffff;">Erinnerung an deine geplante Schicht</h1>
+                <p style="margin:10px 0 0;font-size:15px;line-height:1.55;color:#eef8ff;">Bitte prüfe deine Schichtdetails und starte deine Arbeitszeit pünktlich in der App.</p>
               </div>
 
-              <div style="padding:28px;">
-                <p style="margin:0 0 14px;font-size:16px;line-height:1.6;">Hallo <strong>$workerName</strong>,</p>
+              <div style="padding:24px 20px 26px;">
+                <p style="margin:0 0 14px;font-size:16px;line-height:1.6;color:#111827;">Hallo <strong>$workerName</strong>,</p>
                 <p style="margin:0 0 22px;font-size:15px;line-height:1.6;color:#374151;">für dich wurde eine neue Schicht geplant.</p>
 
-                <div style="border:1px solid #e5e7eb;border-radius:18px;overflow:hidden;background:#f9fafb;margin:0 0 24px;">
-                  <div style="padding:16px 18px;background:#ffffff;border-bottom:1px solid #e5e7eb;">
-                    <div style="font-size:12px;text-transform:uppercase;letter-spacing:0.08em;color:#6b7280;font-weight:800;">Schichtdetails</div>
+                <div style="border:1px solid #e5edf5;border-radius:20px;overflow:hidden;background:#f8fbff;margin:0 0 22px;">
+                  <div style="padding:15px 16px;background:#ffffff;border-bottom:1px solid #e5edf5;">
+                    <div style="font-size:13px;line-height:1.3;color:#0a8ff0;font-weight:900;">Schichtdetails</div>
                   </div>
-                  <table style="border-collapse:collapse;width:100%;font-size:15px;">
+                  <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;font-size:15px;line-height:1.45;">
                     <tr>
-                      <td style="padding:13px 18px;color:#6b7280;font-weight:700;width:34%;border-bottom:1px solid #e5e7eb;">Plan</td>
-                      <td style="padding:13px 18px;color:#111827;border-bottom:1px solid #e5e7eb;">$planTitle</td>
+                      <td style="padding:13px 16px;color:#64748b;font-weight:800;width:34%;border-bottom:1px solid #e5edf5;">Plan</td>
+                      <td style="padding:13px 16px;color:#111827;border-bottom:1px solid #e5edf5;">$planTitle</td>
                     </tr>
                     <tr>
-                      <td style="padding:13px 18px;color:#6b7280;font-weight:700;width:34%;border-bottom:1px solid #e5e7eb;">Gruppe</td>
-                      <td style="padding:13px 18px;color:#111827;border-bottom:1px solid #e5e7eb;">$groupTitle</td>
+                      <td style="padding:13px 16px;color:#64748b;font-weight:800;width:34%;border-bottom:1px solid #e5edf5;">Gruppe</td>
+                      <td style="padding:13px 16px;color:#111827;border-bottom:1px solid #e5edf5;">$groupTitle</td>
                     </tr>
                     <tr>
-                      <td style="padding:13px 18px;color:#6b7280;font-weight:700;width:34%;border-bottom:1px solid #e5e7eb;">Datum</td>
-                      <td style="padding:13px 18px;color:#111827;border-bottom:1px solid #e5e7eb;">$shiftDate</td>
+                      <td style="padding:13px 16px;color:#64748b;font-weight:800;width:34%;border-bottom:1px solid #e5edf5;">Datum</td>
+                      <td style="padding:13px 16px;color:#111827;border-bottom:1px solid #e5edf5;">$shiftDate</td>
                     </tr>
                     <tr>
-                      <td style="padding:13px 18px;color:#6b7280;font-weight:700;width:34%;border-bottom:1px solid #e5e7eb;">Zeit</td>
-                      <td style="padding:13px 18px;color:#111827;border-bottom:1px solid #e5e7eb;"><strong>$startTime – $endTime</strong></td>
+                      <td style="padding:13px 16px;color:#64748b;font-weight:800;width:34%;border-bottom:1px solid #e5edf5;">Zeit</td>
+                      <td style="padding:13px 16px;color:#111827;border-bottom:1px solid #e5edf5;"><strong>$startTime – $endTime</strong></td>
                     </tr>
                     <tr>
-                      <td style="padding:13px 18px;color:#6b7280;font-weight:700;width:34%;">Zeitzone</td>
-                      <td style="padding:13px 18px;color:#111827;">$timezone</td>
+                      <td style="padding:13px 16px;color:#64748b;font-weight:800;width:34%;">Zeitzone</td>
+                      <td style="padding:13px 16px;color:#111827;">$timezone</td>
                     </tr>
                   </table>
                 </div>
 
-                <div style="background:#ecfdf5;border:1px solid #bbf7d0;border-radius:16px;padding:16px 18px;margin:0 0 24px;">
-                  <p style="margin:0;font-size:15px;line-height:1.6;color:#065f46;">Öffne bitte die App und starte deine Arbeitszeit zum Beginn der Schicht.</p>
+                <div style="background:#eaf7ff;border:1px solid #c8eaff;border-radius:18px;padding:15px 16px;margin:0 0 22px;">
+                  <p style="margin:0;font-size:15px;line-height:1.6;color:#075985;font-weight:700;">Öffne bitte die App und starte deine Arbeitszeit zum Beginn der Schicht.</p>
                 </div>
 
                 <p style="margin:0;font-size:15px;line-height:1.6;color:#374151;">Viele Grüße<br/><strong>Dein ZeitErfassung Team</strong></p>
               </div>
             </div>
 
-            <p style="margin:18px 6px 0;font-size:12px;line-height:1.5;color:#6b7280;text-align:center;">Diese Nachricht wurde automatisch erstellt.</p>
+            <p style="margin:16px 6px 0;font-size:12px;line-height:1.5;color:#64748b;text-align:center;">Diese Nachricht wurde automatisch erstellt.</p>
           </div>
         </div>
     """.trimIndent()
