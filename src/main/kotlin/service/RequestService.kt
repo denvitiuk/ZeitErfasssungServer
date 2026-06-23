@@ -144,7 +144,7 @@ class RequestService(
         ).toRoutes()
     }
 
-    override suspend fun leaveBalance(userId: Long): RoutesLeaveBalance {
+    override suspend fun leaveBalance(userId: Long, companyId: Long): RoutesLeaveBalance {
         val lb: PortsLeaveBalance = delegate.leaveBalance(userId.toInt(), null)
         return RoutesLeaveBalance(
             totalDaysPerYear = lb.totalDaysPerYear,
@@ -154,7 +154,11 @@ class RequestService(
         )
     }
 
-    override suspend fun adminLeaveBalance(targetUserId: Long, year: Int): RoutesLeaveBalance {
+    override suspend fun adminLeaveBalance(
+        targetUserId: Long,
+        companyId: Long,
+        year: Int
+    ): RoutesLeaveBalance {
         val lb: PortsLeaveBalance = delegate.leaveBalance(targetUserId.toInt(), year)
         return RoutesLeaveBalance(
             totalDaysPerYear = lb.totalDaysPerYear,

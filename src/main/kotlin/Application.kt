@@ -72,6 +72,8 @@ import org.quartz.impl.StdSchedulerFactory
 import java.util.TimeZone
 import io.ktor.server.application.ApplicationStopped
 import io.ktor.server.request.path
+import io.ktor.server.request.httpMethod
+import java.util.Locale
 
 // In-memory cache for phone verification codes (5-minute TTL)
 val verificationCodeCache: Cache<String, String> = Caffeine.newBuilder()
@@ -83,6 +85,13 @@ fun main(args: Array<String>) {
 }
 
 fun Application.module() {
+    val appEnvironment = (
+        environment.config.propertyOrNull("app.environment")?.getString()
+            ?: System.getenv("APP_ENV")
+            ?: "development"
+        ).lowercase(Locale.US)
+    val isProduction = appEnvironment == "production"
+    val isTest = appEnvironment == "test"
     // 1. JSON serialization
     install(ContentNegotiation) {
         json(Json {
@@ -109,12 +118,16 @@ fun Application.module() {
             .map { it.trim() }
             .filter { it.isNotEmpty() }
 
-        if (allowedOrigins.isEmpty()) {
-            // Dev/local default
-            anyHost()
-        } else {
-            // Production allow-list
-            allowOrigins { origin -> allowedOrigins.any { it.equals(origin, ignoreCase = true) } }
+        when {
+            allowedOrigins.isNotEmpty() -> {
+                allowOrigins { origin -> allowedOrigins.any { it.equals(origin, ignoreCase = true) } }
+            }
+            isProduction -> {
+                throw IllegalStateException("CORS_ALLOWED_ORIGINS must be configured in production")
+            }
+            else -> {
+                anyHost()
+            }
         }
 
         // Credentials + proper preflight
@@ -157,9 +170,18 @@ fun Application.module() {
             }
         }
         exception<Throwable> { call, cause ->
+            val requestId = call.request.headers["X-Request-Id"] ?: java.util.UUID.randomUUID().toString()
+            this@module.environment.log.error(
+                "Unhandled error requestId=$requestId method=${call.request.httpMethod.value} path=${call.request.path()}",
+                cause
+            )
+            call.response.headers.append("X-Request-Id", requestId)
             call.respond(
                 HttpStatusCode.InternalServerError,
-                mapOf("error" to (cause.message ?: "Unbekannter Fehler"))
+                mapOf(
+                    "error" to "internal_server_error",
+                    "requestId" to requestId
+                )
             )
         }
         status(HttpStatusCode.Unauthorized) { call, _ ->
@@ -188,31 +210,53 @@ fun Application.module() {
 
     // 4. Load environment variables and Twilio configuration
     val env = dotenv {
+        filename = if (isTest) ".env.test" else ".env"
         ignoreIfMalformed = true
-        ignoreIfMissing   = true
+        ignoreIfMissing = true
     }
     val config = environment.config
-    val twilioSid   = config.propertyOrNull("twilio.accountSid")?.getString()
-        ?: env["TWILIO_SID"] ?: error("TWILIO_SID is not configured")
-    val verifyServiceSid = env["TWILIO_VERIFY_SERVICE_SID"]
-        ?: error("TWILIO_VERIFY_SERVICE_SID is not configured")
-    val twilioToken = config.propertyOrNull("twilio.authToken")?.getString()
-        ?: env["TWILIO_TOKEN"] ?: error("TWILIO_TOKEN is not configured")
-    val twilioFrom  = config.propertyOrNull("twilio.fromNumber")?.getString()
-        ?: env["TWILIO_PHONE_NUMBER"] ?: error("TWILIO_PHONE_NUMBER is not configured")
+    val twilioSid = if (isTest) {
+        "test-twilio-sid"
+    } else {
+        config.propertyOrNull("twilio.accountSid")?.getString()
+            ?: env["TWILIO_SID"] ?: error("TWILIO_SID is not configured")
+    }
+    val verifyServiceSid = if (isTest) {
+        "test-verify-service-sid"
+    } else {
+        env["TWILIO_VERIFY_SERVICE_SID"]
+            ?: error("TWILIO_VERIFY_SERVICE_SID is not configured")
+    }
+    val twilioToken = if (isTest) {
+        "test-twilio-token"
+    } else {
+        config.propertyOrNull("twilio.authToken")?.getString()
+            ?: env["TWILIO_TOKEN"] ?: error("TWILIO_TOKEN is not configured")
+    }
+    val twilioFrom = if (isTest) {
+        "+10000000000"
+    } else {
+        config.propertyOrNull("twilio.fromNumber")?.getString()
+            ?: env["TWILIO_PHONE_NUMBER"] ?: error("TWILIO_PHONE_NUMBER is not configured")
+    }
 
-    Twilio.init(twilioSid, twilioToken)
+    if (!isTest) {
+        Twilio.init(twilioSid, twilioToken)
+    }
 
     // 5. JWT authentication
     install(Authentication) {
         jwt("bearerAuth") {
             val cfg = this@module.environment.config
             val jwtSecret = cfg.propertyOrNull("ktor.jwt.secret")?.getString()
-                ?: env["JWT_SECRET"] ?: "dev-secret"
+                ?: env["JWT_SECRET"]
+                ?: if (isProduction) error("JWT_SECRET is not configured") else "dev-secret"
             val jwtIssuer = cfg.propertyOrNull("ktor.jwt.issuer")?.getString()
-                ?: env["JWT_ISSUER"] ?: "dev-issuer"
+                ?: env["JWT_ISSUER"]
+                ?: if (isProduction) error("JWT_ISSUER is not configured") else "dev-issuer"
             val jwtAudience = cfg.propertyOrNull("ktor.jwt.audience")?.getString()
-                ?: env["JWT_AUDIENCE"] ?: "dev-audience"
+                ?: env["JWT_AUDIENCE"]
+                ?: if (isProduction) error("JWT_AUDIENCE is not configured") else "dev-audience"
             realm = cfg.propertyOrNull("ktor.jwt.realm")?.getString()
                 ?: env["JWT_REALM"] ?: "zeiterfassung"
 
@@ -251,7 +295,7 @@ fun Application.module() {
     }
 
     // 6. Database initialization
-    configureDatabases()
+    configureDatabases(isTestMode = isTest)
 
     // --- Document Flow stubs (temporary wiring) ---
     val templateStorageStub = object : DocumentTemplateStorage {
@@ -346,12 +390,19 @@ fun Application.module() {
             )
         }
 
-        override suspend fun leaveBalance(userId: Long): LeaveBalanceDTO {
+        override suspend fun leaveBalance(
+            userId: Long,
+            companyId: Long
+        ): LeaveBalanceDTO {
             // Return zeros in stub so UI can render without crashing
             return LeaveBalanceDTO(0.0, 0.0, 0.0, 0.0)
         }
 
-        override suspend fun adminLeaveBalance(targetUserId: Long, year: Int): LeaveBalanceDTO {
+        override suspend fun adminLeaveBalance(
+            targetUserId: Long,
+            companyId: Long,
+            year: Int
+        ): LeaveBalanceDTO {
             return LeaveBalanceDTO(0.0, 0.0, 0.0, 0.0)
         }
 
@@ -383,15 +434,19 @@ fun Application.module() {
     environment.log.info("Storage provider: $storageProvider")
 
     val appDataSource = try {
-        buildHikariFromEnv(env)
+        buildHikariFromEnv(env, isTest)
     } catch (t: Throwable) {
         environment.log.error("Failed to init Hikari DataSource, DB-backed routes may be unavailable", t)
         null
     }
 
-    val appEventProcessorService = appDataSource?.let { dataSource ->
-        AppEventProcessorService(dataSource).also { service ->
-            service.start()
+    val appEventProcessorService = if (isTest) {
+        null
+    } else {
+        appDataSource?.let { dataSource ->
+            AppEventProcessorService(dataSource).also { service ->
+                service.start()
+            }
         }
     }
 
@@ -412,38 +467,48 @@ fun Application.module() {
 
     val (templateStorageImpl, requestServiceImpl, uploadServiceImpl) = triple
 
-    // 7. Quartz scheduler for exact-time proof (configurable time via EXACT_PROOF_TIME=HH:mm)
-    val scheduler = StdSchedulerFactory.getDefaultScheduler().apply { start() }
+    // 7. Quartz scheduler for exact-time proof. Disabled in tests to avoid background jobs.
+    val scheduler = if (isTest) {
+        null
+    } else {
+        StdSchedulerFactory.getDefaultScheduler().apply {
+            start()
 
-    val timeStr = env["EXACT_PROOF_TIME"] ?: "09:43"
-    val (proofHour, proofMinute) = timeStr.split(":").let {
-        val h = it.getOrNull(0)?.toIntOrNull() ?: 9
-        val m = it.getOrNull(1)?.toIntOrNull() ?: 43
-        h to m
-    }
-    val berlinTz = TimeZone.getTimeZone("Europe/Berlin")
+            val timeStr = env["EXACT_PROOF_TIME"] ?: "09:43"
+            val (proofHour, proofMinute) = timeStr.split(":").let {
+                val h = it.getOrNull(0)?.toIntOrNull() ?: 9
+                val m = it.getOrNull(1)?.toIntOrNull() ?: 43
+                h to m
+            }
+            val berlinTz = TimeZone.getTimeZone("Europe/Berlin")
 
-    scheduler.scheduleJob(
-        JobBuilder.newJob(ExactProofJob::class.java)
-            .withIdentity("exactProofJob", "proofs")
-            .build(),
-        TriggerBuilder.newTrigger()
-            .withSchedule(
-                CronScheduleBuilder.dailyAtHourAndMinute(proofHour, proofMinute)
-                    .inTimeZone(berlinTz)
+            scheduleJob(
+                JobBuilder.newJob(ExactProofJob::class.java)
+                    .withIdentity("exactProofJob", "proofs")
+                    .build(),
+                TriggerBuilder.newTrigger()
+                    .withSchedule(
+                        CronScheduleBuilder.dailyAtHourAndMinute(proofHour, proofMinute)
+                            .inTimeZone(berlinTz)
+                    )
+                    .build()
             )
-            .build()
-    )
+        }
+    }
 
     // Graceful shutdown for Quartz and background services
     environment.monitor.subscribe(ApplicationStopped) {
         appEventProcessorService?.stop()
-        scheduler.shutdown(true)
+        scheduler?.shutdown(true)
     }
 
     // Account deletion service (for in‑app account removal)
-    val appBaseUrl = environment.config.propertyOrNull("app.baseUrl")?.getString()
-        ?: env["APP_BASE_URL"] ?: "https://ratty-marian-denvitiuk-7c71a36f.koyeb.app"
+    val appBaseUrl = if (isTest) {
+        "http://localhost"
+    } else {
+        environment.config.propertyOrNull("app.baseUrl")?.getString()
+            ?: env["APP_BASE_URL"] ?: "https://ratty-marian-denvitiuk-7c71a36f.koyeb.app"
+    }
     val deletionService = AccountDeletionService(appBaseUrl)
 
     // 8. Routing
@@ -452,7 +517,9 @@ fun Application.module() {
         authRoutes(twilioFrom, verifyServiceSid)
 
         // Public static file serving for uploaded images (before/after)
-        staticFiles("/files", File("uploads"))
+        if (!isProduction) {
+            staticFiles("/files", File("uploads"))
+        }
 
         supportAutoReplyRoutes(env)
 
@@ -517,17 +584,39 @@ class ExactProofJob : Job {
     }
 }
 
-private fun buildHikariFromEnv(env: io.github.cdimascio.dotenv.Dotenv): DataSource {
-    val jdbcUrl = env["JDBC_DATABASE_URL_NEON"]
-        ?: env["JDBC_DATABASE_URL"]
-        ?: error("JDBC_DATABASE_URL_NEON or JDBC_DATABASE_URL must be set")
-    val user = env["DB_USER_NEON"]
-        ?: env["DB_USER"]
-        ?: error("DB_USER_NEON or DB_USER must be set")
-    val pass = env["DB_PASSWORD_NEON"]
-        ?: env["DB_PASSWORD"]
-        ?: error("DB_PASSWORD_NEON or DB_PASSWORD must be set")
-    val maxPool = (env["DB_MAX_POOL_NEON"] ?: env["DB_MAX_POOL"] ?: "10").toInt()
+private fun buildHikariFromEnv(
+    env: io.github.cdimascio.dotenv.Dotenv,
+    isTest: Boolean
+): DataSource {
+    val jdbcUrl = if (isTest) {
+        env["JDBC_DATABASE_URL_TEST"]
+            ?: error("JDBC_DATABASE_URL_TEST must be configured for test mode")
+    } else {
+        env["JDBC_DATABASE_URL_NEON"]
+            ?: env["JDBC_DATABASE_URL"]
+            ?: error("JDBC_DATABASE_URL_NEON or JDBC_DATABASE_URL must be set")
+    }
+    val user = if (isTest) {
+        env["DB_USER_TEST"]
+            ?: error("DB_USER_TEST must be configured for test mode")
+    } else {
+        env["DB_USER_NEON"]
+            ?: env["DB_USER"]
+            ?: error("DB_USER_NEON or DB_USER must be set")
+    }
+    val pass = if (isTest) {
+        env["DB_PASSWORD_TEST"]
+            ?: error("DB_PASSWORD_TEST must be configured for test mode")
+    } else {
+        env["DB_PASSWORD_NEON"]
+            ?: env["DB_PASSWORD"]
+            ?: error("DB_PASSWORD_NEON or DB_PASSWORD must be set")
+    }
+    val maxPool = if (isTest) {
+        (env["DB_MAX_POOL_TEST"] ?: "3").toInt()
+    } else {
+        (env["DB_MAX_POOL_NEON"] ?: env["DB_MAX_POOL"] ?: "10").toInt()
+    }
 
     val cfg = HikariConfig().apply {
         this.jdbcUrl = jdbcUrl

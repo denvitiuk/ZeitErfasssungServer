@@ -72,6 +72,13 @@ private fun readCompanyId(principal: JWTPrincipal): Int? =
     principal.payload.getClaim("companyId")?.asInt()
         ?: principal.payload.getClaim("companyId")?.asString()?.toIntOrNull()
 
+private fun ApplicationCall.isProductionEnvironment(): Boolean {
+    val configured = application.environment.config.propertyOrNull("app.environment")?.getString()
+        ?: System.getenv("APP_ENV")
+        ?: "development"
+    return configured.equals("production", ignoreCase = true)
+}
+
 /* === Роуты ================================================================ */
 fun Route.workPhotoRoutes() {
     authenticate("bearerAuth") {
@@ -88,6 +95,14 @@ fun Route.workPhotoRoutes() {
             post("/{projectId}") {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized)
+
+                if (call.isProductionEnvironment()) {
+                    return@post call.respond(
+                        HttpStatusCode.Gone,
+                        mapOf("error" to "work_photo_upload_not_available")
+                    )
+                }
+
                 val userId = readUserId(principal)
                     ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "no_user_in_token"))
 
@@ -116,6 +131,11 @@ fun Route.workPhotoRoutes() {
                 }
                 if (companyId == null) return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "project_not_found"))
                 if (!isMember) return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "not_project_member"))
+
+                val jwtCompanyId = readCompanyId(principal)
+                if (jwtCompanyId == null || jwtCompanyId != companyId) {
+                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "wrong_company"))
+                }
 
                 // Парсим multipart
                 var fileBytes: ByteArray? = null
@@ -237,6 +257,14 @@ fun Route.workPhotoRoutes() {
             post("/upload") {
                 val principal = call.principal<JWTPrincipal>()
                     ?: return@post call.respond(HttpStatusCode.Unauthorized)
+
+                if (call.isProductionEnvironment()) {
+                    return@post call.respond(
+                        HttpStatusCode.Gone,
+                        mapOf("error" to "work_photo_upload_not_available")
+                    )
+                }
+
                 val userId = readUserId(principal)
                     ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "no_user_in_token"))
 
@@ -287,6 +315,11 @@ fun Route.workPhotoRoutes() {
                         .any()
                 }
                 if (!isMember) return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "not_project_member"))
+
+                val jwtCompanyId = readCompanyId(principal)
+                if (jwtCompanyId == null || jwtCompanyId != allowedCompany) {
+                    return@post call.respond(HttpStatusCode.Forbidden, mapOf("error" to "wrong_company"))
+                }
 
                 // Нормализация kind/type
                 val kind = when (type?.lowercase()) {

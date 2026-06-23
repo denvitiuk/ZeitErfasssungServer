@@ -34,6 +34,13 @@ private data class InviteCodeResponse(val code: String)
 private data class InviteCodeSetRequest(val code: String)
 
 @Serializable
+private data class PublicCompanyDTO(
+    val id: Int,
+    val name: String,
+    val createdAt: String
+)
+
+@Serializable
 private data class CompanyNameUpdateRequest(val name: String)
 @Serializable
 data class ApiError(val error: String, val detail: String? = null)
@@ -205,11 +212,10 @@ fun Route.companiesRoutes() {
                         else -> base.selectAll()
                     }.limit(limit)
                     query.map {
-                        Company(
-                            it[Companies.id].value,
-                            it[Companies.name],
-                            it[Companies.inviteCode],
-                            it[Companies.createdAt].toString()
+                        PublicCompanyDTO(
+                            id = it[Companies.id].value,
+                            name = it[Companies.name],
+                            createdAt = it[Companies.createdAt].toString()
                         )
                     }
                 }
@@ -254,11 +260,10 @@ fun Route.companiesRoutes() {
                     ApiError("invalid_code", "No company found for the provided code")
                 )
 
-                val company = Company(
-                    row[Companies.id].value,
-                    row[Companies.name],
-                    row[Companies.inviteCode],
-                    row[Companies.createdAt].toString()
+                val company = PublicCompanyDTO(
+                    id = row[Companies.id].value,
+                    name = row[Companies.name],
+                    createdAt = row[Companies.createdAt].toString()
                 )
                 call.respond(HttpStatusCode.OK, company)
             } catch (e: ContentTransformationException) {
@@ -281,6 +286,18 @@ fun Route.companiesRoutes() {
                 HttpStatusCode.BadRequest, ApiError("code_required")
             )
             val code = normalizeCode(raw)
+            // Rate limit block
+            val clientKey =
+                call.request.headers["X-Forwarded-For"]?.split(',')?.firstOrNull()?.trim()
+                    ?: call.request.headers["X-Real-IP"]
+                    ?: call.request.headers[HttpHeaders.Host]
+                    ?: "unknown"
+            if (!InviteCodeRateLimiter.allow(clientKey)) {
+                return@get call.respond(
+                    HttpStatusCode.TooManyRequests,
+                    ApiError("rate_limited", "Too many attempts. Try again in a minute")
+                )
+            }
             if (code.isEmpty()) {
                 return@get call.respond(HttpStatusCode.BadRequest, ApiError("code_required"))
             }
@@ -295,11 +312,10 @@ fun Route.companiesRoutes() {
                 ApiError("invalid_code", "No company found for the provided code")
             )
 
-            val company = Company(
-                row[Companies.id].value,
-                row[Companies.name],
-                row[Companies.inviteCode],
-                row[Companies.createdAt].toString()
+            val company = PublicCompanyDTO(
+                id = row[Companies.id].value,
+                name = row[Companies.name],
+                createdAt = row[Companies.createdAt].toString()
             )
             call.respond(HttpStatusCode.OK, company)
         }
@@ -987,11 +1003,10 @@ fun Route.companiesRoutes() {
                         .slice(Companies.id, Companies.name, Companies.inviteCode, Companies.createdAt)
                         .select { Companies.id eq org.jetbrains.exposed.dao.id.EntityID(id, Companies) }
                         .map {
-                            Company(
-                                it[Companies.id].value,
-                                it[Companies.name],
-                                it[Companies.inviteCode],
-                                it[Companies.createdAt].toString()
+                            PublicCompanyDTO(
+                                id = it[Companies.id].value,
+                                name = it[Companies.name],
+                                createdAt = it[Companies.createdAt].toString()
                             )
                         }
                         .singleOrNull()

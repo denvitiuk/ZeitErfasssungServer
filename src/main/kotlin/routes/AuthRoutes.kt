@@ -59,6 +59,7 @@ import org.jetbrains.exposed.dao.id.IntIdTable
 import org.jetbrains.exposed.sql.Column
 import org.jetbrains.exposed.sql.and
 import java.io.File
+import java.io.ByteArrayOutputStream
 import java.time.LocalDateTime
 import java.util.UUID
 import kotlin.collections.mapOf
@@ -201,6 +202,71 @@ private fun shouldThrottle(phone: String): Boolean {
         false
     }
 }
+
+private fun ApplicationCall.isProductionEnvironment(): Boolean {
+    val configured = application.environment.config.propertyOrNull("app.environment")?.getString()
+        ?: System.getenv("APP_ENV")
+        ?: "development"
+    return configured.equals("production", ignoreCase = true)
+}
+
+private const val LINK_COMPANY_ATTEMPT_WINDOW_MS = 15 * 60 * 1000L
+private const val LINK_COMPANY_MAX_ATTEMPTS = 5
+private data class LinkCompanyAttemptWindow(
+    val startedAtMs: Long,
+    val attempts: Int
+)
+private val linkCompanyAttempts = ConcurrentHashMap<String, LinkCompanyAttemptWindow>()
+
+private fun isLinkCompanyRateLimited(userId: Int): Boolean {
+    val now = System.currentTimeMillis()
+    val current = linkCompanyAttempts[userId.toString()]
+    if (current == null || now - current.startedAtMs >= LINK_COMPANY_ATTEMPT_WINDOW_MS) {
+        linkCompanyAttempts[userId.toString()] = LinkCompanyAttemptWindow(now, 1)
+        return false
+    }
+
+    if (current.attempts >= LINK_COMPANY_MAX_ATTEMPTS) {
+        return true
+    }
+
+    linkCompanyAttempts[userId.toString()] = current.copy(attempts = current.attempts + 1)
+    return false
+}
+
+private fun resetLinkCompanyAttempts(userId: Int) {
+    linkCompanyAttempts.remove(userId.toString())
+}
+
+private const val LOGIN_ATTEMPT_WINDOW_MS = 15 * 60 * 1000L
+private const val LOGIN_MAX_ATTEMPTS = 10
+private data class LoginAttemptWindow(
+    val startedAtMs: Long,
+    val attempts: Int
+)
+private val loginAttempts = ConcurrentHashMap<String, LoginAttemptWindow>()
+
+private fun isLoginRateLimited(email: String): Boolean {
+    val key = email.trim().lowercase(Locale.US)
+    val now = System.currentTimeMillis()
+    val current = loginAttempts[key]
+
+    if (current == null || now - current.startedAtMs >= LOGIN_ATTEMPT_WINDOW_MS) {
+        loginAttempts[key] = LoginAttemptWindow(now, 1)
+        return false
+    }
+
+    if (current.attempts >= LOGIN_MAX_ATTEMPTS) {
+        return true
+    }
+
+    loginAttempts[key] = current.copy(attempts = current.attempts + 1)
+    return false
+}
+
+private fun resetLoginAttempts(email: String) {
+    loginAttempts.remove(email.trim().lowercase(Locale.US))
+}
 // --- End helpers ---
 
 private data class RefreshCfg(val validityMs: Long, val pepper: String)
@@ -213,11 +279,13 @@ private fun refreshCfg(call: ApplicationCall): RefreshCfg {
         ?: env["REFRESH_VALIDITY_MS"]?.toLongOrNull()
         ?: 1000L * 60 * 60 * 24 * 30 // 30 days
 
-    // Pepper is required for hashing; fallback to JWT secret in dev to avoid breaking local setups.
     val pepper = cfg.propertyOrNull("auth.refresh.pepper")?.getString()
         ?: env["REFRESH_PEPPER"]
-        ?: cfg.propertyOrNull("ktor.jwt.secret")?.getString()
-        ?: "dev-pepper"
+        ?: if (call.isProductionEnvironment()) {
+            error("REFRESH_PEPPER is not configured")
+        } else {
+            cfg.propertyOrNull("ktor.jwt.secret")?.getString() ?: "dev-pepper"
+        }
 
     return RefreshCfg(validityMs = validityMs, pepper = pepper)
 }
@@ -325,22 +393,39 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             val oldHash = hashRefreshToken(raw, cfg.pepper)
 
             val result = transaction {
+                // Atomically claim the old token before issuing a replacement.
+                // With this conditional UPDATE, only one concurrent refresh request can succeed.
+                val claimed = RefreshSessions.update({
+                    (RefreshSessions.tokenHash eq oldHash) and
+                        (RefreshSessions.revokedAtMs.isNull()) and
+                        (RefreshSessions.expiresAtMs greater now)
+                }) {
+                    it[revokedAtMs] = now
+                }
+
+                if (claimed != 1) {
+                    return@transaction null
+                }
+
                 val sessionRow = RefreshSessions
-                    .select { (RefreshSessions.tokenHash eq oldHash) and (RefreshSessions.revokedAtMs.isNull()) }
+                    .select { RefreshSessions.tokenHash eq oldHash }
                     .limit(1)
                     .singleOrNull()
-                    ?: return@transaction null
+                    ?: error("refresh_session_missing_after_claim")
 
-                val expiresAt = sessionRow[RefreshSessions.expiresAtMs]
-                if (expiresAt <= now) {
-                    RefreshSessions.update({ RefreshSessions.tokenHash eq oldHash }) {
+                val userId = sessionRow[RefreshSessions.userId].value
+                val user = Users.select { Users.id eq userId }.singleOrNull()
+                    ?: error("refresh_user_not_found")
+
+                if (!user[Users.isActive] || user[Users.status] != "active") {
+                    RefreshSessions.update({
+                        (RefreshSessions.userId eq sessionRow[RefreshSessions.userId]) and
+                            (RefreshSessions.revokedAtMs.isNull())
+                    }) {
                         it[revokedAtMs] = now
                     }
                     return@transaction null
                 }
-
-                val userId = sessionRow[RefreshSessions.userId].value
-                val user = Users.select { Users.id eq userId }.singleOrNull() ?: return@transaction null
 
                 val companyId = user[Users.companyId]?.value ?: 0
                 val isCompanyAdmin = user[Users.isCompanyAdmin]
@@ -368,7 +453,6 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 }
 
                 RefreshSessions.update({ RefreshSessions.tokenHash eq oldHash }) {
-                    it[revokedAtMs] = now
                     it[replacedByHash] = newHash
                 }
 
@@ -436,7 +520,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             }
 
             // Demo/test number: no real SMS
-            if (phone == "+491234567890") {
+            if (!call.isProductionEnvironment() && phone == "+491234567890") {
                 return@post call.respond(HttpStatusCode.OK, SentCodeResponse(sent = true))
             }
 
@@ -491,7 +575,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             }
 
             // Magic test path
-            if (phone == "+491234567890" && code == "000000") {
+            if (!call.isProductionEnvironment() && phone == "+491234567890" && code == "000000") {
                 transaction {
                     Users.update({
                         (Users.phone eq phone) and
@@ -653,12 +737,27 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     mapOf("error" to "E-Mail und Passwort dürfen nicht leer sein")
                 )
             }
+
+            if (isLoginRateLimited(dto.email)) {
+                return@post call.respond(
+                    HttpStatusCode.TooManyRequests,
+                    mapOf("error" to "Too many login attempts. Please try again later.")
+                )
+            }
+
             val user = transaction {
                 Users.select { Users.email eq dto.email }.firstOrNull()
             } ?: return@post call.respond(
                 HttpStatusCode.Unauthorized,
                 mapOf("error" to "Ungültige E-Mail oder Passwort")
             )
+
+            if (!user[Users.isActive] || user[Users.status] != "active") {
+                return@post call.respond(
+                    HttpStatusCode.Unauthorized,
+                    mapOf("error" to "Ungültige E-Mail oder Passwort")
+                )
+            }
 
             val hashed = user[Users.password] ?: return@post call.respond(
                 HttpStatusCode.Unauthorized,
@@ -701,6 +800,8 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     it[deviceId] = call.request.headers["X-Device-Id"]
                 }
             }
+
+            resetLoginAttempts(dto.email)
 
             call.respond(
                 HttpStatusCode.OK,
@@ -805,35 +906,69 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             }
         }
 
-        // Upload user avatar
+
+        // Avatar uploads intentionally stay disabled in production until private object storage is wired.
+        // Koyeb local storage is ephemeral and must not be used as the source of truth for user files.
         route("/profile/avatar") {
             post {
+                if (call.isProductionEnvironment()) {
+                    return@post call.respond(
+                        HttpStatusCode.Gone,
+                        ErrorResponse("avatar_upload_not_available")
+                    )
+                }
+
                 val principal = call.principal<JWTPrincipal>()!!
                 val userId = principal.payload.getClaim("id").asString().toInt()
 
-                // Ensure upload directory exists
-                val uploadDir = File("uploads/avatars").apply { if (!exists()) mkdirs() }
+                var uploadedBytes: ByteArray? = null
+                var uploadedContentType: String? = null
+                var fileCount = 0
 
-                var savedFilename: String? = null
                 call.receiveMultipart().forEachPart { part ->
-                    if (part is PartData.FileItem) {
-                        val ext = File(part.originalFileName ?: "").extension
-                        val filename = "${UUID.randomUUID()}${if (ext.isNotBlank()) ".$ext" else ""}"
-                        val file = File(uploadDir, filename)
-                        part.streamProvider().use { input -> file.outputStream().buffered().use { input.copyTo(it) } }
-                        savedFilename = filename
+                    try {
+                        if (part is PartData.FileItem) {
+                            fileCount += 1
+                            if (fileCount == 1) {
+                                val contentType = part.contentType?.withoutParameters()?.toString()?.lowercase(Locale.US)
+                                val bytes = readAvatarBytesWithLimit(part)
+                                if (bytes != null && contentType != null && isSupportedAvatarImage(bytes, contentType)) {
+                                    uploadedBytes = bytes
+                                    uploadedContentType = contentType
+                                }
+                            }
+                        }
+                    } finally {
+                        part.dispose()
                     }
-                    part.dispose()
                 }
-                if (savedFilename == null) {
-                    return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "No file provided"))
+
+                if (fileCount != 1 || uploadedBytes == null || uploadedContentType == null) {
+                    return@post call.respond(
+                        HttpStatusCode.BadRequest,
+                        ErrorResponse("invalid_avatar_file")
+                    )
                 }
-                val avatarUrl = "https://your.cdn.host/avatars/$savedFilename"
+
+                val extension = when (uploadedContentType) {
+                    "image/jpeg" -> "jpg"
+                    "image/png" -> "png"
+                    "image/webp" -> "webp"
+                    else -> return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("invalid_avatar_file"))
+                }
+
+                val uploadDir = File("uploads/avatars").apply { if (!exists()) mkdirs() }
+                val filename = "${UUID.randomUUID()}.$extension"
+                val file = File(uploadDir, filename)
+                file.outputStream().buffered().use { it.write(uploadedBytes) }
+
+                val avatarUrl = "/files/avatars/$filename"
                 transaction {
                     Users.update({ Users.id eq userId }) {
                         it[Users.avatarUrl] = avatarUrl
                     }
                 }
+
                 call.respond(HttpStatusCode.OK, mapOf("avatar_url" to avatarUrl))
             }
         }
@@ -841,23 +976,16 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
         // Change password
         route("/change-password") {
             post {
-                // 1) Read and log raw JSON body
                 val bodyText = call.receiveText()
-                println("🔄 [ChangePasswordRoute] Received raw body: $bodyText")
-                // Deserialize
                 val req = kotlinx.serialization.json.Json
                     .decodeFromString<ChangePasswordRequest>(bodyText)
 
-                // 2) Authenticate and log userId
                 val principal = call.principal<JWTPrincipal>()!!
                 val userId = principal.payload.getClaim("id").asString().toInt()
-                println("🔑 [ChangePasswordRoute] Authenticated userId: $userId")
 
-                // 3) Perform transaction with detailed logs
                 val response = transaction {
                     val row = Users.select { Users.id eq userId }.singleOrNull()
                     if (row == null) {
-                        println("⚠️ [ChangePasswordRoute] user_not_found for id $userId")
                         return@transaction ChangePasswordResponse("user_not_found") to HttpStatusCode.NotFound
                     }
 
@@ -865,7 +993,6 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     val result = BCrypt.verifyer()
                         .verify(req.currentPassword.toCharArray(), hashed.toCharArray())
                     if (!result.verified) {
-                        println("⚠️ [ChangePasswordRoute] invalid_current_password for id $userId")
                         return@transaction ChangePasswordResponse("invalid_current_password") to HttpStatusCode.Unauthorized
                     }
 
@@ -874,12 +1001,17 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     Users.update({ Users.id eq userId }) {
                         it[Users.password] = newHash
                     }
-                    println("✅ [ChangePasswordRoute] Password updated successfully for id $userId")
+
+                    RefreshSessions.update({
+                        (RefreshSessions.userId eq EntityID(userId, Users)) and
+                            (RefreshSessions.revokedAtMs.isNull())
+                    }) {
+                        it[revokedAtMs] = System.currentTimeMillis()
+                    }
+
                     ChangePasswordResponse("ok") to HttpStatusCode.OK
                 }
 
-                // 4) Log and respond
-                println("🔄 [ChangePasswordRoute] Responding with status ${response.second} and body ${response.first}")
                 call.respond(response.second, response.first)
             }
         }
@@ -890,8 +1022,12 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 val principal = call.principal<JWTPrincipal>()!!
                 val userId = principal.payload.getClaim("id").asString().toInt()
 
+                if (isLinkCompanyRateLimited(userId)) {
+                    return@post call.respond(HttpStatusCode.TooManyRequests, ErrorResponse("too_many_attempts"))
+                }
+
                 val req = call.receive<LinkCompanyRequest>()
-                val code = req.code.trim()
+                val code = req.code.trim().uppercase(Locale.US)
                 if (code.isEmpty()) {
                     return@post call.respond(HttpStatusCode.BadRequest, ErrorResponse("code_required"))
                 }
@@ -968,13 +1104,29 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     )
                 }
 
-                // 2) Attach user to company, make first user admin
+                // 2) Attach user to company and make the first linked user admin.
+                // Lock the company row so two concurrent requests cannot both become the first admin.
                 transaction {
-                    // attach
-                    Users.update({ Users.id eq userId }) {
-                        it[Users.companyId] = companyId
+                    exec(
+                        "SELECT id FROM companies WHERE id = ${companyId.value} FOR UPDATE"
+                    )
+
+                    val latestUser = Users
+                        .select { Users.id eq userId }
+                        .singleOrNull()
+                        ?: error("user_not_found")
+
+                    val latestCompanyId = latestUser[Users.companyId]
+                    if (latestCompanyId != null && latestCompanyId != companyId) {
+                        error("already_linked_to_another_company")
                     }
-                    // first in company becomes admin
+
+                    if (latestCompanyId == null) {
+                        Users.update({ Users.id eq userId }) {
+                            it[Users.companyId] = companyId
+                        }
+                    }
+
                     val hasAdmin = Users
                         .select { (Users.companyId eq companyId) and (Users.isCompanyAdmin eq true) }
                         .any()
@@ -983,7 +1135,9 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                             it[Users.isCompanyAdmin] = true
                         }
                     }
-                    call.application.environment.log.info("link-company: user=$userId -> company=${companyId.value}, first_admin=${!hasAdmin}")
+                    call.application.environment.log.info(
+                        "link-company: user=$userId -> company=${companyId.value}, first_admin=${!hasAdmin}"
+                    )
                 }
 
                 // 3) Issue updated JWT + refresh token with fresh claims
@@ -1014,6 +1168,8 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     }
                 }
 
+                resetLinkCompanyAttempts(userId)
+
                 val isAdminNow = row[Users.isCompanyAdmin]
                 call.respond(
                     HttpStatusCode.OK,
@@ -1030,4 +1186,40 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             }
         }
     }
+}
+
+private const val MAX_AVATAR_BYTES = 5L * 1024L * 1024L
+private val allowedAvatarContentTypes = setOf("image/jpeg", "image/png", "image/webp")
+
+private fun isSupportedAvatarImage(bytes: ByteArray, contentType: String): Boolean {
+    if (contentType !in allowedAvatarContentTypes) return false
+
+    return when (contentType) {
+        "image/jpeg" -> bytes.size >= 3 &&
+            bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() && bytes[2] == 0xFF.toByte()
+        "image/png" -> bytes.size >= 8 &&
+            bytes.copyOfRange(0, 8).contentEquals(
+                byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+            )
+        "image/webp" -> bytes.size >= 12 &&
+            bytes.copyOfRange(0, 4).contentEquals("RIFF".toByteArray()) &&
+            bytes.copyOfRange(8, 12).contentEquals("WEBP".toByteArray())
+        else -> false
+    }
+}
+
+private fun readAvatarBytesWithLimit(part: PartData.FileItem): ByteArray? {
+    val buffer = ByteArrayOutputStream()
+    part.streamProvider().use { input ->
+        val chunk = ByteArray(DEFAULT_BUFFER_SIZE)
+        var total = 0L
+        while (true) {
+            val read = input.read(chunk)
+            if (read <= 0) break
+            total += read
+            if (total > MAX_AVATAR_BYTES) return null
+            buffer.write(chunk, 0, read)
+        }
+    }
+    return buffer.toByteArray()
 }

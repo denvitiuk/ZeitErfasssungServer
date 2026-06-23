@@ -770,6 +770,18 @@ fun Route.trackingRoutes() {
             val requestedUserId = call.request.queryParameters["userId"]?.toLongOrNull()
             val targetUserId: Long = if (requestedUserId != null) {
                 requireAdmin(callerCtx)
+
+                val targetCompanyId = transaction {
+                    queryOne(
+                        "SELECT company_id FROM users WHERE id = ?",
+                        listOf(requestedUserId)
+                    ) { rs -> rs.getInt("company_id") }
+                } ?: notFound("User not found")
+
+                if (targetCompanyId != callerCtx.companyId) {
+                    forbidden("Wrong company")
+                }
+
                 requestedUserId
             } else {
                 callerId

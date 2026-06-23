@@ -1230,6 +1230,24 @@ fun Route.workerJoinRoutes() {
                     if (workerUserId == null) error("join_request_not_found")
                     if (currentStatus != "pending") error("join_request_not_pending")
 
+                    var workerCompanyId: Int? = null
+                    exec(
+                        """
+                        SELECT company_id
+                        FROM users
+                        WHERE id = ${sqlIntOrNull(workerUserId)}
+                        FOR UPDATE
+                        """.trimIndent()
+                    ) { rs ->
+                        if (rs.next()) {
+                            workerCompanyId = resultSetIntOrNull(rs.getObject("company_id"))
+                        }
+                    }
+
+                    if (workerCompanyId != null && workerCompanyId != companyId) {
+                        error("worker_linked_to_another_company")
+                    }
+
                     exec(
                         """
                         UPDATE users
@@ -1307,6 +1325,13 @@ fun Route.workerJoinRoutes() {
                 when {
                     message.contains("join_request_not_found") -> call.respond(HttpStatusCode.NotFound, ApiError("join_request_not_found", "Join request was not found"))
                     message.contains("join_request_not_pending") -> call.respond(HttpStatusCode.BadRequest, ApiError("join_request_not_pending", "Only pending join requests can be approved"))
+                    message.contains("worker_linked_to_another_company") -> call.respond(
+                        HttpStatusCode.Conflict,
+                        ApiError(
+                            "worker_linked_to_another_company",
+                            "Worker is already linked to another company"
+                        )
+                    )
                     else -> {
                         call.application.log.error("Failed to approve join request $requestId for company $companyId", e)
                         call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "internal_error", "message" to (e.message ?: e::class.simpleName.orEmpty())))
@@ -1473,6 +1498,31 @@ fun Route.workerJoinRoutes() {
                     val approvedIds = pendingRows.map { it.first }
                     val skippedIds = requestedIds.filterNot { it in approvedIds }
 
+                    if (pendingRows.isNotEmpty()) {
+                        val pendingUserIdsSql = pendingRows
+                            .map { it.second }
+                            .distinct()
+                            .joinToString(",")
+
+                        var foreignLinkedWorkerExists = false
+                        exec(
+                            """
+                            SELECT 1
+                            FROM users
+                            WHERE id IN ($pendingUserIdsSql)
+                              AND company_id IS NOT NULL
+                              AND company_id <> $companyId
+                            FOR UPDATE
+                            """.trimIndent()
+                        ) { rs ->
+                            foreignLinkedWorkerExists = rs.next()
+                        }
+
+                        if (foreignLinkedWorkerExists) {
+                            error("worker_linked_to_another_company")
+                        }
+                    }
+
                     pendingRows.forEach { (_, workerUserId, expectedEmployeeId) ->
                         exec(
                             """
@@ -1523,6 +1573,16 @@ fun Route.workerJoinRoutes() {
 
                 call.respond(HttpStatusCode.OK, result)
             } catch (e: Exception) {
+                if (e.message.orEmpty().contains("worker_linked_to_another_company")) {
+                    return@post call.respond(
+                        HttpStatusCode.Conflict,
+                        ApiError(
+                            "worker_linked_to_another_company",
+                            "One or more workers are already linked to another company"
+                        )
+                    )
+                }
+
                 call.application.log.error("Failed to bulk approve join requests for company $companyId", e)
                 call.respond(
                     HttpStatusCode.InternalServerError,
@@ -1718,6 +1778,24 @@ fun Route.workerJoinRoutes() {
                         if (companyId == null) error("company_not_found")
                     }
 
+                    var currentUserCompanyId: Int? = null
+                    exec(
+                        """
+                        SELECT company_id
+                        FROM users
+                        WHERE id = $userId
+                        FOR UPDATE
+                        """.trimIndent()
+                    ) { rs ->
+                        if (rs.next()) {
+                            currentUserCompanyId = resultSetIntOrNull(rs.getObject("company_id"))
+                        }
+                    }
+
+                    if (currentUserCompanyId != null && currentUserCompanyId != companyId) {
+                        error("already_linked_to_another_company")
+                    }
+
                     exec(
                         """
                         SELECT auto_approve_expected_employees
@@ -1760,6 +1838,28 @@ fun Route.workerJoinRoutes() {
                     val shouldAutoApprove = expectedEmployeeId != null && autoApproveExpectedEmployees
                     val initialRequestStatus = if (shouldAutoApprove) "approved" else "pending"
 
+                    if (joinLinkId != null) {
+                        var claimedJoinLink = false
+                        exec(
+                            """
+                            UPDATE join_links
+                            SET used_count = used_count + 1,
+                                updated_at = now()
+                            WHERE id = ${sqlIntOrNull(joinLinkId)}
+                              AND is_active = true
+                              AND (expires_at IS NULL OR expires_at >= now())
+                              AND (max_uses IS NULL OR used_count < max_uses)
+                            RETURNING id
+                            """.trimIndent()
+                        ) { rs ->
+                            claimedJoinLink = rs.next()
+                        }
+
+                        if (!claimedJoinLink) {
+                            error("join_link_inactive")
+                        }
+                    }
+
                     exec(
                         """
                         INSERT INTO join_requests (
@@ -1801,16 +1901,6 @@ fun Route.workerJoinRoutes() {
                         """.trimIndent()
                     )
 
-                    if (joinLinkId != null) {
-                        exec(
-                            """
-                            UPDATE join_links
-                            SET used_count = used_count + 1,
-                                updated_at = now()
-                            WHERE id = ${sqlIntOrNull(joinLinkId)}
-                            """.trimIndent()
-                        )
-                    }
 
                     if (shouldAutoApprove) {
                         exec(
@@ -1878,6 +1968,13 @@ fun Route.workerJoinRoutes() {
                 when {
                     message.contains("join_link_not_found") -> call.respond(HttpStatusCode.NotFound, ApiError("join_link_not_found", "Join link was not found"))
                     message.contains("join_link_inactive") -> call.respond(HttpStatusCode.BadRequest, ApiError("join_link_inactive", "Join link is inactive, expired or fully used"))
+                    message.contains("already_linked_to_another_company") -> call.respond(
+                        HttpStatusCode.Conflict,
+                        ApiError(
+                            "already_linked_to_another_company",
+                            "Your account is already linked to another company"
+                        )
+                    )
                     message.contains("company_not_found_or_search_disabled") -> call.respond(
                         HttpStatusCode.NotFound,
                         ApiError("company_not_found_or_search_disabled", "Company was not found or company search is disabled")
@@ -1898,222 +1995,111 @@ fun Route.publicWorkerJoinRoutes() {
 
 
     get("/join/{token}") {
-
         val token = call.parameters["token"]?.trim().orEmpty()
-
         if (token.isBlank()) {
-
             return@get call.respondText(
-
                 joinPageHtml(
-
                     title = "Invalid invite link",
-
                     headline = "Invite link is missing",
-
                     body = "This invitation link is incomplete. Please ask your company administrator to send a new invite.",
-
                     deepLink = null,
-
                     active = false
-
                 ),
-
                 ContentType.Text.Html,
-
                 HttpStatusCode.BadRequest
-
             )
-
         }
-
         try {
-
             val preview = transaction {
-
                 var response: JoinLinkPreviewResponse? = null
-
                 exec(
-
                     """
-
                     SELECT
-
                         jl.company_id,
-
                         c.name AS company_name,
-
                         jl.project_id,
-
                         p.title AS project_title,
-
                         jl.type,
-
                         jl.requires_approval,
-
                         jl.is_active,
-
                         (jl.expires_at IS NOT NULL AND jl.expires_at < now()) AS expired,
-
                         jl.max_uses,
-
                         jl.used_count
-
                     FROM join_links jl
-
                     JOIN companies c ON c.id = jl.company_id
-
                     LEFT JOIN projects p ON p.id = jl.project_id
-
                     WHERE jl.token = ${sqlStringOrNull(token)}
-
                     LIMIT 1
-
                     """.trimIndent()
-
                 ) { rs ->
-
                     if (rs.next()) {
-
                         val maxUses = resultSetIntOrNull(rs.getObject("max_uses"))
-
                         val usedCount = rs.getInt("used_count")
-
                         val maxUsesReached = maxUses != null && usedCount >= maxUses
-
                         val expired = rs.getBoolean("expired")
-
                         val isActive = rs.getBoolean("is_active") && !expired && !maxUsesReached
-
                         response = JoinLinkPreviewResponse(
-
                             companyId = rs.getInt("company_id"),
-
                             companyName = rs.getString("company_name"),
-
                             projectId = resultSetIntOrNull(rs.getObject("project_id")),
-
                             projectTitle = rs.getString("project_title"),
-
                             type = rs.getString("type"),
-
                             requiresApproval = rs.getBoolean("requires_approval"),
-
                             active = isActive,
-
                             expired = expired
-
                         )
-
                     }
-
                 }
-
                 response
-
             }
 
-            if (preview == null) {
-
-                return@get call.respondText(
-
-                    joinPageHtml(
-
-                        title = "Invite not found",
-
-                        headline = "Invite link was not found",
-
-                        body = "This invite may have been deleted or copied incorrectly. Please ask your company administrator for a new link.",
-
-                        deepLink = null,
-
-                        active = false
-
-                    ),
-
-                    ContentType.Text.Html,
-
-                    HttpStatusCode.NotFound
-
-                )
-
+            val isUsableInvite = preview?.active == true
+            val companyName = preview?.companyName?.ifBlank { "your company" } ?: "your company"
+            val projectText = if (isUsableInvite) {
+                preview?.projectTitle
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { " Project: $it." }
+                    .orEmpty()
+            } else {
+                ""
             }
-
-            val companyName = preview.companyName.ifBlank { "your company" }
-
-            val projectText = preview.projectTitle
-
-                ?.takeIf { it.isNotBlank() }
-
-                ?.let { " Project: $it." }
-
-                .orEmpty()
-
             val deepLink = "zeiterfassung://join?token=${token.encodeURLParameter()}"
 
             call.respondText(
-
                 joinPageHtml(
-
-                    title = "Join $companyName",
-
-                    headline = if (preview.active) "Join $companyName" else "Invite link is not active",
-
-                    body = if (preview.active) {
-
+                    title = if (isUsableInvite) "Join $companyName" else "Invite unavailable",
+                    headline = if (isUsableInvite) "Join $companyName" else "Invite unavailable",
+                    body = if (isUsableInvite) {
                         "You were invited to join $companyName in ZeitErfassung.$projectText Open the app to continue."
-
                     } else {
-
-                        "This invite link is expired, inactive or already fully used. Please ask your company administrator for a new invite."
-
+                        "This invite is unavailable. Please ask your company administrator for a new link."
                     },
-
-                    deepLink = if (preview.active) deepLink else null,
-
-                    active = preview.active
-
+                    deepLink = if (isUsableInvite) deepLink else null,
+                    active = isUsableInvite
                 ),
-
                 ContentType.Text.Html,
-
                 HttpStatusCode.OK
-
             )
-
         } catch (e: Exception) {
-
             call.application.log.error("Failed to render public join page", e)
-
             call.respondText(
-
                 joinPageHtml(
-
                     title = "Join page error",
-
                     headline = "Something went wrong",
-
                     body = "The invite page could not be loaded. Please try again later or contact your company administrator.",
-
                     deepLink = null,
-
                     active = false
-
                 ),
-
                 ContentType.Text.Html,
-
                 HttpStatusCode.InternalServerError
-
             )
-
         }
-
     }
 
     // This must stay outside authenticate("bearerAuth") so workers can open invite links before login.
     route("/join-links") {
-        // Returns safe company/project preview data for a token.
+        // Returns only the display-safe preview needed before login.
+        // Internal tenant IDs and invitation policy fields must not be exposed publicly.
         get("/{token}") {
             val token = call.parameters["token"]?.trim().orEmpty()
             if (token.isBlank()) {
@@ -2168,8 +2154,15 @@ fun Route.publicWorkerJoinRoutes() {
                 if (preview == null) {
                     return@get call.respond(HttpStatusCode.NotFound, ApiError("join_link_not_found", "Join link was not found"))
                 }
-
-                call.respond(HttpStatusCode.OK, preview)
+                call.respond(
+                    HttpStatusCode.OK,
+                    mapOf(
+                        "companyName" to preview.companyName,
+                        "projectTitle" to preview.projectTitle,
+                        "active" to preview.active,
+                        "expired" to preview.expired
+                    )
+                )
             } catch (e: Exception) {
                 call.application.log.error("Failed to preview join link", e)
                 call.respond(HttpStatusCode.InternalServerError, ApiError("internal_error"))

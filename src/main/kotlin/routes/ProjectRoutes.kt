@@ -99,6 +99,17 @@ private fun requireSameCompanyOr404(projectId: Int, expectedCompanyId: Int): Res
         ?.takeIf { it[Projects.companyId].value == expectedCompanyId }
 }
 
+private fun userBelongsToCompany(userId: Int, expectedCompanyId: Int): Boolean = transaction {
+    Users
+        .slice(Users.id)
+        .select {
+            (Users.id eq EntityID(userId, Users)) and
+                (Users.companyId eq EntityID(expectedCompanyId, Companies))
+        }
+        .limit(1)
+        .any()
+}
+
 private fun ResultRow.toProjectDTO(membersCount: Int? = null): ProjectDTO = ProjectDTO(
     id          = this[Projects.id].value,
     companyId   = this[Projects.companyId].value,
@@ -584,6 +595,9 @@ fun Route.projectsRoutes() {
                 if (body.role != null && body.role !in 0..10) {
                     return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_role"))
                 }
+                if (!userBelongsToCompany(body.userId, companyId)) {
+                    return@post call.respond(HttpStatusCode.NotFound, ApiErrorProject("user_not_found", "User not found in this company"))
+                }
 
                 try {
                     transaction {
@@ -668,10 +682,24 @@ fun Route.projectsRoutes() {
                 if (body.userIds.any { it <= 0 }) {
                     return@post call.respond(HttpStatusCode.BadRequest, ApiErrorProject("invalid_user_id"))
                 }
+                val requestedUserIds = body.userIds.distinct()
+                val validUserIds = transaction {
+                    Users
+                        .slice(Users.id)
+                        .select {
+                            (Users.id inList requestedUserIds.map { EntityID(it, Users) }) and
+                                (Users.companyId eq EntityID(companyId, Companies))
+                        }
+                        .map { it[Users.id].value }
+                        .toSet()
+                }
+                if (validUserIds.size != requestedUserIds.size) {
+                    return@post call.respond(HttpStatusCode.NotFound, ApiErrorProject("user_not_found", "One or more users do not belong to this company"))
+                }
 
                 try {
                     transaction {
-                        val targetIds = body.userIds.distinct().map { EntityID(it, Users) }.toSet()
+                        val targetIds = requestedUserIds.map { EntityID(it, Users) }.toSet()
                         val currentIds = ProjectMembers
                             .slice(ProjectMembers.userId)
                             .select { ProjectMembers.projectId eq row[Projects.id] }

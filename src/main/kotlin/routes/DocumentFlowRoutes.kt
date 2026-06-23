@@ -4,14 +4,12 @@ import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.auth.*
 import io.ktor.server.auth.jwt.*
-import io.ktor.server.request.*
 import io.ktor.server.plugins.origin
+import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.Serializable
 
-import java.net.URLDecoder
-import java.nio.charset.StandardCharsets
 
 // --- Public DTOs & Enums ---
 
@@ -294,8 +292,12 @@ interface DocumentRequestService {
         payload: UpdateDocumentSignatureSettingsPayload
     ): DocumentSignatureSettingsDTO
 
-    suspend fun leaveBalance(userId: Long): LeaveBalanceDTO
-    suspend fun adminLeaveBalance(targetUserId: Long, year: Int): LeaveBalanceDTO
+    suspend fun leaveBalance(userId: Long, companyId: Long): LeaveBalanceDTO
+    suspend fun adminLeaveBalance(
+        targetUserId: Long,
+        companyId: Long,
+        year: Int
+    ): LeaveBalanceDTO
     suspend fun adjustLeaveEntitlement(
         adminId: Long,
         companyId: Long,
@@ -345,14 +347,24 @@ fun Route.registerDocumentFlowRoutes(
 
             // GET /templates/{id}
             get("/{id}") {
-                if (call.requireAuthOrRespond() == null) return@get
+                val claims = call.requireAuthOrRespond() ?: return@get
                 val id = call.parameters["id"]?.toLongOrNull()
                     ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_id")
-                val t = templateStorage.getTemplate(id)
-                    ?: return@get call.respondError(HttpStatusCode.NotFound, "not_found")
-                call.respond(t)
-            }
 
+                val template = templateStorage.getTemplate(id)
+                    ?: return@get call.respondError(HttpStatusCode.NotFound, "not_found")
+
+                val allowedTemplates = templateStorage.listTemplates(
+                    claims.companyId,
+                    TemplateQuery(includeCompanySpecific = true)
+                )
+                val canReadTemplate = allowedTemplates.any { it.id == template.id }
+                if (!canReadTemplate) {
+                    return@get call.respondError(HttpStatusCode.NotFound, "not_found")
+                }
+
+                call.respond(template)
+            }
             // POST /templates (только админ). Тело — TemplateDTO (meta); сам файл загружается через /uploads/presign + PUT в сторедж.
             post {
                 val claims = call.requireCompanyAdminOrRespond() ?: return@post
@@ -550,7 +562,18 @@ fun Route.registerDocumentFlowRoutes(
                     ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_id")
                 val year = call.request.queryParameters["year"]?.toIntOrNull()
                     ?: java.time.LocalDate.now().year
-                val bal = requestService.adminLeaveBalance(targetId, year)
+                val bal = try {
+                    requestService.adminLeaveBalance(
+                        targetUserId = targetId,
+                        companyId = claims.companyId!!,
+                        year = year
+                    )
+                } catch (e: IllegalStateException) {
+                    if (e.message == "user_not_found_in_company") {
+                        return@get call.respondError(HttpStatusCode.NotFound, "not_found")
+                    }
+                    throw e
+                }
                 call.respond(bal)
             }
 
@@ -579,7 +602,12 @@ fun Route.registerDocumentFlowRoutes(
         // Leave balance for current user
         get("/leave/balance") {
             val claims = call.requireAuthOrRespond() ?: return@get
-            val balance = requestService.leaveBalance(claims.userId)
+            val companyId = claims.companyId
+                ?: return@get call.respondError(HttpStatusCode.BadRequest, "no_company")
+            val balance = requestService.leaveBalance(
+                userId = claims.userId,
+                companyId = companyId
+            )
             call.respond(balance)
         }
 
@@ -610,89 +638,23 @@ fun Route.registerDocumentFlowRoutes(
         // Universal storage download by storageKey (supports keys like "pg:6")
         // Variant 1: /storage?key=pg:6
         get("/storage") {
-            if (call.requireAuthOrRespond() == null) return@get
+            val claims = call.requireCompanyAdminOrRespond() ?: return@get
             val raw = call.request.queryParameters["key"]
                 ?: return@get call.respondError(HttpStatusCode.BadRequest, "missing_key")
-            handleStorageKey(call, raw, uploadService)
+            call.respondError(HttpStatusCode.Gone, "direct_storage_download_disabled")
         }
 
         // Variant 2: /storage/{key...} — captures the whole tail (e.g., "pg:6")
         get("/storage/{key...}") {
-            if (call.requireAuthOrRespond() == null) return@get
-            val raw = call.parameters.getAll("key")?.joinToString("/") ?: ""
-            if (raw.isBlank()) return@get call.respondError(HttpStatusCode.BadRequest, "missing_key")
-            handleStorageKey(call, raw, uploadService)
+            val claims = call.requireCompanyAdminOrRespond() ?: return@get
+            call.respondError(HttpStatusCode.Gone, "direct_storage_download_disabled")
         }
 
         // File download for Postgres-backed template blobs, e.g. storageKey = "pg:{id}"
         get("/files/pg/{id}") {
-            if (call.requireAuthOrRespond() == null) return@get
-            val id = call.parameters["id"]?.toLongOrNull()
-                ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_id")
-
-            val obj = uploadService.downloadPgObject(id)
-                ?: return@get call.respondError(HttpStatusCode.NotFound, "not_found")
-
-            val ct = runCatching { ContentType.parse(obj.contentType) }
-                .getOrElse { ContentType.Application.OctetStream }
-
-            obj.fileName?.let { fname ->
-                call.response.headers.append(
-                    HttpHeaders.ContentDisposition,
-                    ContentDisposition.Attachment
-                        .withParameter(ContentDisposition.Parameters.FileName, fname)
-                        .toString()
-                )
-            }
-
-            call.respondBytes(obj.bytes, contentType = ct)
+            val claims = call.requireCompanyAdminOrRespond() ?: return@get
+            call.respondError(HttpStatusCode.Gone, "direct_storage_download_disabled")
         }
     }
 }
 
-private suspend fun handleStorageKey(
-    call: ApplicationCall,
-    rawKey: String,
-    uploadService: DocumentUploadService
-) {
-    val decoded = URLDecoder.decode(rawKey, StandardCharsets.UTF_8)
-    val parts = decoded.split(":", limit = 2)
-    if (parts.size != 2) {
-        call.respondError(HttpStatusCode.BadRequest, "bad_key")
-        return
-    }
-
-    val (scheme, idStr) = parts
-    when (scheme.lowercase()) {
-        "pg" -> {
-            val id = idStr.toLongOrNull()
-            if (id == null) {
-                call.respondError(HttpStatusCode.BadRequest, "invalid_id")
-                return
-            }
-
-            val obj = uploadService.downloadPgObject(id)
-            if (obj == null) {
-                call.respondError(HttpStatusCode.NotFound, "not_found")
-                return
-            }
-
-            val ct = runCatching { ContentType.parse(obj.contentType) }
-                .getOrElse { ContentType.Application.OctetStream }
-
-            obj.fileName?.let { fname ->
-                call.response.headers.append(
-                    HttpHeaders.ContentDisposition,
-                    ContentDisposition.Attachment
-                        .withParameter(ContentDisposition.Parameters.FileName, fname)
-                        .toString()
-                )
-            }
-
-            call.respondBytes(obj.bytes, contentType = ct)
-        }
-        else -> {
-            call.respondError(HttpStatusCode.NotFound, "not_found")
-        }
-    }
-}
