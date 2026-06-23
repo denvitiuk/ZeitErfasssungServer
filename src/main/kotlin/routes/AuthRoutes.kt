@@ -730,6 +730,11 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
     route("/login") {
         post {
             val dto = call.receive<LoginDTO>()
+            val requestStartedAtNanos = System.nanoTime()
+            var userLookupMs = 0L
+            var bcryptVerifyMs = 0L
+            var jwtIssueMs = 0L
+            var refreshInsertMs = 0L
             // Server-seitige Validierung: Pflichtfelder dürfen nicht leer sein
             if (dto.email.isBlank() || dto.password.isBlank()) {
                 return@post call.respond(
@@ -745,12 +750,18 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 )
             }
 
+            val userLookupStartedAtNanos = System.nanoTime()
             val user = transaction {
                 Users.select { Users.email eq dto.email }.firstOrNull()
-            } ?: return@post call.respond(
-                HttpStatusCode.Unauthorized,
-                mapOf("error" to "Ungültige E-Mail oder Passwort")
-            )
+            }
+            userLookupMs = (System.nanoTime() - userLookupStartedAtNanos) / 1_000_000
+
+            if (user == null) {
+                return@post call.respond(
+                    HttpStatusCode.Unauthorized,
+                    mapOf("error" to "Ungültige E-Mail oder Passwort")
+                )
+            }
 
             if (!user[Users.isActive] || user[Users.status] != "active") {
                 return@post call.respond(
@@ -763,7 +774,9 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 HttpStatusCode.Unauthorized,
                 mapOf("error" to "Ungültige E-Mail oder Passwort")
             )
+            val bcryptVerifyStartedAtNanos = System.nanoTime()
             val result = BCrypt.verifyer().verify(dto.password.toCharArray(), hashed)
+            bcryptVerifyMs = (System.nanoTime() - bcryptVerifyStartedAtNanos) / 1_000_000
             if (!result.verified) {
                 return@post call.respond(
                     HttpStatusCode.Unauthorized,
@@ -776,6 +789,7 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
             val isCompanyAdmin = user[Users.isCompanyAdmin]
             val isGlobalAdmin = user[Users.isGlobalAdmin]
 
+            val jwtIssueStartedAtNanos = System.nanoTime()
             val (jwt, jwtExpiresInMs) = issueJwt(
                 call = call,
                 userId = user[Users.id].value,
@@ -783,12 +797,14 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                 isCompanyAdmin = isCompanyAdmin,
                 isGlobalAdmin = isGlobalAdmin
             )
+            jwtIssueMs = (System.nanoTime() - jwtIssueStartedAtNanos) / 1_000_000
 
             val rCfg = refreshCfg(call)
             val refreshToken = generateRefreshToken()
             val refreshHash = hashRefreshToken(refreshToken, rCfg.pepper)
             val now = System.currentTimeMillis()
 
+            val refreshInsertStartedAtNanos = System.nanoTime()
             transaction {
                 RefreshSessions.insert {
                     it[userId] = user[Users.id]
@@ -800,8 +816,16 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
                     it[deviceId] = call.request.headers["X-Device-Id"]
                 }
             }
+            refreshInsertMs = (System.nanoTime() - refreshInsertStartedAtNanos) / 1_000_000
 
             resetLoginAttempts(dto.email)
+
+            val totalMs = (System.nanoTime() - requestStartedAtNanos) / 1_000_000
+            println(
+                "⏱️ [login] email=${dto.email.trim().lowercase(Locale.US)} " +
+                    "userLookupMs=$userLookupMs bcryptVerifyMs=$bcryptVerifyMs " +
+                    "jwtIssueMs=$jwtIssueMs refreshInsertMs=$refreshInsertMs totalMs=$totalMs"
+            )
 
             call.respond(
                 HttpStatusCode.OK,
@@ -814,94 +838,79 @@ fun Route.authRoutes(fromNumber: String, verifyServiceSid: String) {
     authenticate("bearerAuth") {
         route("/profile") {
             get {
-                // Extract user ID from JWT token
+                val requestStartedAtNanos = System.nanoTime()
                 val principal = call.principal<JWTPrincipal>()!!
                 val userId = principal.payload.getClaim("id").asString().toInt()
 
-                // Query user data
-                val row = transaction {
-                    Users.select { Users.id eq userId }.single()
-                }
+                val profileOrNull: ProfileResponse? = transaction {
+                    val loadedProfile = exec(
+                        """
+                        SELECT
+                          u.first_name,
+                          u.last_name,
+                          u.email,
+                          u.phone,
+                          u.employee_number,
+                          u.avatar_url,
+                          u.created_at,
+                          CASE
+                            WHEN COALESCE(u.is_global_admin, false) THEN 'globalAdmin'
+                            WHEN COALESCE(u.is_company_admin, false) THEN 'companyAdmin'
+                            ELSE 'user'
+                          END AS role,
+                          c.name AS company_name,
+                          COALESCE(cjs.simplified_worker_flow_enabled, false) AS simplified_worker_flow_enabled,
+                          COALESCE(cps.pause_start_time::text, '$DEFAULT_PAUSE_START_TIME') AS pause_start_time,
+                          COALESCE(cps.pause_end_time::text, '$DEFAULT_PAUSE_END_TIME') AS pause_end_time,
+                          COALESCE(cps.pause_duration_minutes, $DEFAULT_PAUSE_DURATION_MINUTES) AS pause_duration_minutes,
+                          COALESCE(cps.timezone, '$DEFAULT_PAUSE_TIMEZONE') AS pause_timezone
+                        FROM users u
+                        LEFT JOIN companies c ON c.id = u.company_id
+                        LEFT JOIN company_join_settings cjs ON cjs.company_id = c.id
+                        LEFT JOIN company_pause_settings cps ON cps.company_id = c.id
+                        WHERE u.id = $userId
+                        LIMIT 1
+                        """.trimIndent()
+                    ) { rs ->
+                        check(rs.next()) { "User not found: $userId" }
 
-                // Fetch company name (unwrap nullable companyId and query by Int)
-                val companyName = transaction {
-                    row[Users.companyId]?.let { companyId ->
-                        Companies.select { Companies.id eq companyId }
-                            .map { it[Companies.name] }
-                            .singleOrNull()
+                        val createdAt = rs.getTimestamp("created_at")
+                            ?.toLocalDateTime()
+                            ?.format(DateTimeFormatter.ofPattern("LLLL yyyy", Locale.GERMAN))
+                            ?: ""
+
+                        ProfileResponse(
+                            first_name = rs.getString("first_name") ?: "",
+                            last_name = rs.getString("last_name") ?: "",
+                            email = rs.getString("email") ?: "",
+                            phone = rs.getString("phone") ?: "",
+                            employee_number = rs.getObject("employee_number")?.toString() ?: "",
+                            avatar_url = rs.getString("avatar_url"),
+                            created_at = createdAt,
+                            role = rs.getString("role") ?: "user",
+                            company = rs.getString("company_name"),
+                            simplifiedWorkerFlowEnabled = rs.getBoolean("simplified_worker_flow_enabled"),
+                            pauseStartTime = normalizeProfilePauseTime(
+                                value = rs.getString("pause_start_time"),
+                                fallback = DEFAULT_PAUSE_START_TIME
+                            ),
+                            pauseEndTime = normalizeProfilePauseTime(
+                                value = rs.getString("pause_end_time"),
+                                fallback = DEFAULT_PAUSE_END_TIME
+                            ),
+                            pauseDurationMinutes = rs.getInt("pause_duration_minutes").takeIf { !rs.wasNull() }
+                                ?: DEFAULT_PAUSE_DURATION_MINUTES,
+                            pauseTimezone = rs.getString("pause_timezone") ?: DEFAULT_PAUSE_TIMEZONE
+                        )
                     }
+
+                    loadedProfile
                 }
+                val profile: ProfileResponse = profileOrNull ?: error("User not found: $userId")
 
-                // Company-level worker flow and pause settings.
-                // Defaults are used when the user has no company or no settings row yet.
-                val workerFlowSettings = transaction {
-                    row[Users.companyId]?.value?.let { companyId ->
-                        exec(
-                            """
-                            SELECT
-                                COALESCE(cjs.simplified_worker_flow_enabled, false) AS simplified_worker_flow_enabled,
-                                COALESCE(cps.pause_start_time::text, '$DEFAULT_PAUSE_START_TIME') AS pause_start_time,
-                                COALESCE(cps.pause_end_time::text, '$DEFAULT_PAUSE_END_TIME') AS pause_end_time,
-                                COALESCE(cps.pause_duration_minutes, $DEFAULT_PAUSE_DURATION_MINUTES) AS pause_duration_minutes,
-                                COALESCE(cps.timezone, '$DEFAULT_PAUSE_TIMEZONE') AS pause_timezone
-                            FROM companies c
-                            LEFT JOIN company_join_settings cjs ON cjs.company_id = c.id
-                            LEFT JOIN company_pause_settings cps ON cps.company_id = c.id
-                            WHERE c.id = $companyId
-                            LIMIT 1
-                            """.trimIndent()
-                        ) { rs ->
-                            if (rs.next()) {
-                                ProfileWorkerFlowSettings(
-                                    simplifiedWorkerFlowEnabled = rs.getBoolean("simplified_worker_flow_enabled"),
-                                    pauseStartTime = normalizeProfilePauseTime(
-                                        value = rs.getString("pause_start_time"),
-                                        fallback = DEFAULT_PAUSE_START_TIME
-                                    ),
-                                    pauseEndTime = normalizeProfilePauseTime(
-                                        value = rs.getString("pause_end_time"),
-                                        fallback = DEFAULT_PAUSE_END_TIME
-                                    ),
-                                    pauseDurationMinutes = rs.getInt("pause_duration_minutes").takeIf { !rs.wasNull() }
-                                        ?: DEFAULT_PAUSE_DURATION_MINUTES,
-                                    pauseTimezone = rs.getString("pause_timezone") ?: DEFAULT_PAUSE_TIMEZONE
-                                )
-                            } else {
-                                ProfileWorkerFlowSettings()
-                            }
-                        } ?: ProfileWorkerFlowSettings()
-                    } ?: ProfileWorkerFlowSettings()
-                }
+                val totalMs = (System.nanoTime() - requestStartedAtNanos) / 1_000_000
+                println("⏱️ [profile] userId=$userId totalMs=$totalMs")
 
-                // Determine role string
-                val role = when {
-                    row[Users.isGlobalAdmin] -> "globalAdmin"
-                    row[Users.isCompanyAdmin] -> "companyAdmin"
-                    else -> "user"
-                }
-
-                // Format registration date in German month-year
-                val createdAt = row[Users.createdAt]
-                    .format(DateTimeFormatter.ofPattern("LLLL yyyy", Locale.GERMAN))
-
-                // Build and send response
-                val employeeNumber = row[Users.employeeNumber].toString()
-                val profile = ProfileResponse(
-                    first_name = row[Users.firstName] ?: "",
-                    last_name  = row[Users.lastName]  ?: "",
-                    email      = row[Users.email]     ?: "",
-                    phone = row[Users.phone] ?: "",
-                    employee_number = employeeNumber,
-                    avatar_url = row.getOrNull(Users.avatarUrl),
-                    created_at = createdAt,
-                    role = role,
-                    company = companyName,
-                    simplifiedWorkerFlowEnabled = workerFlowSettings.simplifiedWorkerFlowEnabled,
-                    pauseStartTime = workerFlowSettings.pauseStartTime,
-                    pauseEndTime = workerFlowSettings.pauseEndTime,
-                    pauseDurationMinutes = workerFlowSettings.pauseDurationMinutes,
-                    pauseTimezone = workerFlowSettings.pauseTimezone
-                )
                 call.respond(HttpStatusCode.OK, profile)
             }
         }

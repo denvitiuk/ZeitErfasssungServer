@@ -16,6 +16,10 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import org.jetbrains.exposed.sql.TextColumnType
 import org.jetbrains.exposed.sql.Transaction
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -165,6 +169,12 @@ data class UserContext(
 private data class MatchingZeitPlanAssignment(
     val assignmentId: UUID,
     val shiftId: UUID
+)
+
+private data class StartTrackingResult(
+    val sessionId: UUID,
+    val startedAt: String,
+    val createdNew: Boolean
 )
 
 private fun ApplicationCall.requireUserId(): Long {
@@ -363,15 +373,25 @@ private object TrackingHub {
         )
     }
 
-    // Broadcast to local subscribers AND publish to Postgres so other instances can deliver too.
+    // Deliver to local subscribers before replying. Cross-instance fan-out is queued separately.
+    // PgTrackingBus.publish already treats failures as non-fatal, so this preserves the current
+    // best-effort delivery semantics without making the worker wait for pg_notify.
     suspend fun broadcast(sessionId: UUID, msg: String) {
         broadcastLocal(sessionId, msg, source = "local")
-        PgTrackingBus.publish(sessionId, msg)
+        PgTrackingBus.publishAsync(sessionId, msg)
     }
 }
 
 private object PgTrackingBus {
     private const val CHANNEL = "tracking_events"
+
+    private val publisherScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    fun publishAsync(sessionId: UUID, msg: String) {
+        publisherScope.launch {
+            publish(sessionId, msg)
+        }
+    }
 
     @Volatile private var started = false
 
@@ -568,10 +588,37 @@ fun Route.trackingRoutes() {
         // USER: start tracking (one active session per user enforced by DB)
         post("/sessions/start") {
             val userId = call.requireUserId()
-            val ctx = loadUserContext(userId)
+            val requestStartedAtNanos = System.nanoTime()
+            var contextMs = 0L
+            var existingSessionMs = 0L
+            var zeitPlanLookupMs = 0L
+            var insertSessionMs = 0L
+            var updateAssignmentMs = 0L
+            var attendanceLogMs = 0L
 
-            val existing = transaction {
-                queryOne(
+            val result = transaction {
+                var stageStartedAtNanos = System.nanoTime()
+                val ctx = queryOne(
+                    """
+                    SELECT
+                      id,
+                      company_id,
+                      COALESCE(is_global_admin, false) OR COALESCE(is_company_admin, false) AS is_admin
+                    FROM users
+                    WHERE id = ?
+                    """.trimIndent(),
+                    listOf(userId)
+                ) { rs ->
+                    UserContext(
+                        userId = rs.getLong("id"),
+                        companyId = rs.getInt("company_id"),
+                        isAdmin = rs.getBoolean("is_admin")
+                    )
+                } ?: error("User not found: $userId")
+                contextMs = (System.nanoTime() - stageStartedAtNanos) / 1_000_000
+                stageStartedAtNanos = System.nanoTime()
+
+                val existing = queryOne(
                     """
                     SELECT id, started_at
                     FROM tracking_sessions
@@ -583,18 +630,23 @@ fun Route.trackingRoutes() {
                 ) { rs ->
                     Pair(rs.getObject("id", UUID::class.java), rs.getString("started_at"))
                 }
-            }
+                existingSessionMs = (System.nanoTime() - stageStartedAtNanos) / 1_000_000
 
-            if (existing != null) {
-                call.respond(StartSessionResp(existing.first.toString(), existing.second))
-                return@post
-            }
+                if (existing != null) {
+                    return@transaction StartTrackingResult(
+                        sessionId = existing.first,
+                        startedAt = existing.second,
+                        createdNew = false
+                    )
+                }
 
-            val created = transaction {
+                stageStartedAtNanos = System.nanoTime()
                 val matchingAssignment = findMatchingZeitPlanAssignment(
                     userId = userId,
                     companyId = ctx.companyId
                 )
+                zeitPlanLookupMs = (System.nanoTime() - stageStartedAtNanos) / 1_000_000
+                stageStartedAtNanos = System.nanoTime()
 
                 val createdSession = queryOne(
                     """
@@ -618,8 +670,10 @@ fun Route.trackingRoutes() {
                 ) { rs ->
                     Pair(rs.getObject("id", UUID::class.java), rs.getString("started_at"))
                 }!!
+                insertSessionMs = (System.nanoTime() - stageStartedAtNanos) / 1_000_000
 
                 if (matchingAssignment != null) {
+                    stageStartedAtNanos = System.nanoTime()
                     execUpdate(
                         """
                         UPDATE zeitplan_shift_assignments
@@ -634,24 +688,54 @@ fun Route.trackingRoutes() {
                         """.trimIndent(),
                         listOf(matchingAssignment.assignmentId, userId, ctx.companyId)
                     )
+                    updateAssignmentMs = (System.nanoTime() - stageStartedAtNanos) / 1_000_000
                     println("🧩 [zeitplan/start] userId=$userId assignmentId=${matchingAssignment.assignmentId} shiftId=${matchingAssignment.shiftId}")
                 }
 
-                createdSession
+                stageStartedAtNanos = System.nanoTime()
+                execUpdate(
+                    """
+                    INSERT INTO logs (user_id, action, "timestamp")
+                    VALUES (?, ?, ?::timestamptz)
+                    """.trimIndent(),
+                    listOf(userId, "in", createdSession.second)
+                )
+                attendanceLogMs = (System.nanoTime() - stageStartedAtNanos) / 1_000_000
+                println("🧾 [logs/tracking-start] userId=$userId action=in timestamp=${createdSession.second}")
+
+                StartTrackingResult(
+                    sessionId = createdSession.first,
+                    startedAt = createdSession.second,
+                    createdNew = true
+                )
             }
-            insertAttendanceLogForSession(userId, "in", "now()", "tracking-start")
-            call.respond(StartSessionResp(created.first.toString(), created.second))
+
+            val totalMs = (System.nanoTime() - requestStartedAtNanos) / 1_000_000
+            println(
+                "⏱️ [tracking/start] userId=$userId created=${result.createdNew} " +
+                    "contextMs=$contextMs existingSessionMs=$existingSessionMs " +
+                    "zeitPlanLookupMs=$zeitPlanLookupMs insertSessionMs=$insertSessionMs " +
+                    "updateAssignmentMs=$updateAssignmentMs attendanceLogMs=$attendanceLogMs " +
+                    "totalMs=$totalMs"
+            )
+
+            call.respond(StartSessionResp(result.sessionId.toString(), result.startedAt))
         }
 
         // USER: stop tracking
         post("/sessions/{id}/stop") {
             val userId = call.requireUserId()
+            val requestStartedAtNanos = System.nanoTime()
+            var ownershipCheckMs = 0L
+            var stopSessionMs = 0L
+            var updateAssignmentMs = 0L
+            var attendanceLogMs = 0L
+            var broadcastMs = 0L
             val sessionId = parseUuid(call.parameters["id"])
 
-            requireOwnedActiveSession(sessionId, userId)
-
+            val stopSessionStartedAtNanos = System.nanoTime()
             val stopped = transaction {
-                queryOne(
+                val updated = queryOne(
                     """
                     UPDATE tracking_sessions
                     SET is_active = FALSE, ended_at = now()
@@ -664,52 +748,94 @@ fun Route.trackingRoutes() {
                         rs.getString("ended_at"),
                         rs.getObject("zeitplan_assignment_id", UUID::class.java)
                     )
-                } ?: conflict("Session already stopped")
-            }
-
-            val endedAt = stopped.first
-            val zeitPlanAssignmentId = stopped.second
-
-            if (zeitPlanAssignmentId != null) {
-                transaction {
-                    execUpdate(
-                        """
-                        UPDATE zeitplan_shift_assignments
-                        SET
-                          status = 'COMPLETED',
-                          completed_at = ?::timestamptz,
-                          updated_at = now()
-                        WHERE id = ?
-                          AND user_id = ?
-                          AND status = 'STARTED'
-                        """.trimIndent(),
-                        listOf(endedAt, zeitPlanAssignmentId, userId)
-                    )
                 }
-                println("🧩 [zeitplan/stop] userId=$userId assignmentId=$zeitPlanAssignmentId completedAt=$endedAt")
-            }
-            try {
-                transaction {
+
+                if (updated != null) {
+                    val attendanceLogStartedAtNanos = System.nanoTime()
                     execUpdate(
                         """
                         INSERT INTO logs (user_id, action, "timestamp")
                         VALUES (?, ?, ?::timestamptz)
                         """.trimIndent(),
-                        listOf(userId, "out", endedAt)
+                        listOf(userId, "out", updated.first)
                     )
+                    attendanceLogMs = (System.nanoTime() - attendanceLogStartedAtNanos) / 1_000_000
+                    val zeitPlanAssignmentId = updated.second
+                    if (zeitPlanAssignmentId != null) {
+                        val assignmentStartedAtNanos = System.nanoTime()
+                        execUpdate(
+                            """
+                            UPDATE zeitplan_shift_assignments
+                            SET
+                              status = 'COMPLETED',
+                              completed_at = ?::timestamptz,
+                              updated_at = now()
+                            WHERE id = ?
+                              AND user_id = ?
+                              AND status = 'STARTED'
+                            """.trimIndent(),
+                            listOf(updated.first, zeitPlanAssignmentId, userId)
+                        )
+                        updateAssignmentMs =
+                            (System.nanoTime() - assignmentStartedAtNanos) / 1_000_000
+                    }
+                    return@transaction updated
                 }
-                println("🧾 [logs/tracking-stop] userId=$userId action=out timestamp=$endedAt")
-            } catch (t: Throwable) {
-                println("⚠️ [logs/tracking-stop] failed userId=$userId action=out: ${t.message}")
+
+                // The successful path needs no separate ownership SELECT.
+                // Only diagnose the exact error after UPDATE found no matching active session.
+                val ownershipStartedAtNanos = System.nanoTime()
+                val row = queryOne(
+                    """
+                    SELECT user_id, is_active
+                    FROM tracking_sessions
+                    WHERE id = ?
+                    """.trimIndent(),
+                    listOf(sessionId)
+                ) { rs ->
+                    Pair(rs.getLong("user_id"), rs.getBoolean("is_active"))
+                } ?: notFound("Session not found")
+                ownershipCheckMs = (System.nanoTime() - ownershipStartedAtNanos) / 1_000_000
+
+                if (row.first != userId) {
+                    forbidden("Not your session")
+                }
+                if (!row.second) {
+                    conflict("Session is not active")
+                }
+
+                // Covers the narrow race where the session changed after the diagnostic SELECT.
+                conflict("Session already stopped")
             }
-            // Keep legacy logs in sync so existing timesheet/PDF flows that read from logs keep working.
+            stopSessionMs = (System.nanoTime() - stopSessionStartedAtNanos) / 1_000_000
+
+            val endedAt = stopped.first
+            val zeitPlanAssignmentId = stopped.second
+
+            if (zeitPlanAssignmentId != null) {
+                println(
+                    "🧩 [zeitplan/stop] userId=$userId " +
+                        "assignmentId=$zeitPlanAssignmentId completedAt=$endedAt"
+                )
+            }
+            // The legacy "out" log is inserted atomically with tracking_sessions above.
             val evt = StoppedEvent(
                 sessionId = sessionId.toString(),
                 userId = userId,
                 tsEpochSeconds = Instant.now().epochSecond
             )
+            val broadcastStartedAtNanos = System.nanoTime()
             TrackingHub.broadcast(sessionId, json.encodeToString(evt))
+            broadcastMs = (System.nanoTime() - broadcastStartedAtNanos) / 1_000_000
             println("🛑 [tracking/stop] userId=${userId} sessionId=${sessionId}")
+
+            val totalMs = (System.nanoTime() - requestStartedAtNanos) / 1_000_000
+            println(
+                "⏱️ [tracking/stop] userId=$userId " +
+                    "ownershipCheckMs=$ownershipCheckMs stopSessionMs=$stopSessionMs " +
+                    "updateAssignmentMs=$updateAssignmentMs attendanceLogMs=$attendanceLogMs " +
+                    "broadcastMs=$broadcastMs totalMs=$totalMs"
+            )
 
             call.respond(StopSessionResp(sessionId.toString(), endedAt))
         }
@@ -721,19 +847,59 @@ fun Route.trackingRoutes() {
             validateTrackPoint(req)
             val sessionId = parseUuid(req.sessionId, "sessionId")
 
-            requireOwnedActiveSession(sessionId, userId)
-
             val ts = req.tsEpochSeconds ?: Instant.now().epochSecond
             val tsIso = Instant.ofEpochSecond(ts).toString()
             val pointId: Long = transaction {
-                queryOne(
+                val insertedPointId = queryOne(
                     """
                     INSERT INTO tracking_points (session_id, latitude, longitude, speed_mps, heading_deg, ts)
-                    VALUES (?, ?, ?, ?::real, ?::real, ?::timestamptz)
+                    SELECT ?, ?, ?, ?::real, ?::real, ?::timestamptz
+                    WHERE EXISTS (
+                      SELECT 1
+                      FROM tracking_sessions
+                      WHERE id = ?
+                        AND user_id = ?
+                        AND is_active = TRUE
+                    )
                     RETURNING id
                     """.trimIndent(),
-                    listOf(sessionId, req.lat, req.lon, req.speedMps, req.headingDeg, tsIso)
-                ) { rs -> rs.getLong("id") }!!
+                    listOf(
+                        sessionId,
+                        req.lat,
+                        req.lon,
+                        req.speedMps,
+                        req.headingDeg,
+                        tsIso,
+                        sessionId,
+                        userId
+                    )
+                ) { rs -> rs.getLong("id") }
+
+                if (insertedPointId != null) {
+                    return@transaction insertedPointId
+                }
+
+                // Keep the existing API semantics for invalid, чужая, and stopped sessions.
+                val row = queryOne(
+                    """
+                    SELECT user_id, is_active
+                    FROM tracking_sessions
+                    WHERE id = ?
+                    """.trimIndent(),
+                    listOf(sessionId)
+                ) { rs ->
+                    Pair(rs.getLong("user_id"), rs.getBoolean("is_active"))
+                } ?: notFound("Session not found")
+
+                if (row.first != userId) {
+                    forbidden("Not your session")
+                }
+                if (!row.second) {
+                    conflict("Session is not active")
+                }
+
+                // Covers the narrow race where the session changes after the diagnostic SELECT.
+                conflict("Session is not active")
             }
 
             val evt = PointEvent(
@@ -752,42 +918,57 @@ fun Route.trackingRoutes() {
             call.respond(HttpStatusCode.OK)
         }
 
-        // USER: list own sessions for a specific day (history). Date is in YYYY-MM-DD.
-        // Includes sessions that OVERLAP the day (started before midnight but ended today, etc.).
-        // Debug helper: if caller is admin, can pass ?userId=38 to inspect an employee.
         get("/me/sessions") {
+            val requestStartedAtNanos = System.nanoTime()
             val callerId = call.requireUserId()
-            val callerCtx = loadUserContext(callerId)
 
             val dateStr = call.request.queryParameters["date"]
                 ?: throw BadRequestException("Missing date (YYYY-MM-DD)")
 
-            // basic validation
-            try { LocalDate.parse(dateStr) } catch (_: Throwable) {
+            try {
+                LocalDate.parse(dateStr)
+            } catch (_: Throwable) {
                 throw BadRequestException("Invalid date format. Expected YYYY-MM-DD")
             }
 
             val requestedUserId = call.request.queryParameters["userId"]?.toLongOrNull()
-            val targetUserId: Long = if (requestedUserId != null) {
-                requireAdmin(callerCtx)
-
-                val targetCompanyId = transaction {
-                    queryOne(
-                        "SELECT company_id FROM users WHERE id = ?",
-                        listOf(requestedUserId)
-                    ) { rs -> rs.getInt("company_id") }
-                } ?: notFound("User not found")
-
-                if (targetCompanyId != callerCtx.companyId) {
-                    forbidden("Wrong company")
-                }
-
-                requestedUserId
-            } else {
-                callerId
-            }
 
             val rows = transaction {
+                val targetUserId = if (requestedUserId != null) {
+                    val callerCtx = queryOne(
+                        """
+                        SELECT
+                          id,
+                          company_id,
+                          COALESCE(is_global_admin, false) OR COALESCE(is_company_admin, false) AS is_admin
+                        FROM users
+                        WHERE id = ?
+                        """.trimIndent(),
+                        listOf(callerId)
+                    ) { rs ->
+                        UserContext(
+                            userId = rs.getLong("id"),
+                            companyId = rs.getInt("company_id"),
+                            isAdmin = rs.getBoolean("is_admin")
+                        )
+                    } ?: error("User not found: $callerId")
+
+                    requireAdmin(callerCtx)
+
+                    val targetCompanyId = queryOne(
+                        "SELECT company_id FROM users WHERE id = ?",
+                        listOf(requestedUserId)
+                    ) { rs -> rs.getInt("company_id") } ?: notFound("User not found")
+
+                    if (targetCompanyId != callerCtx.companyId) {
+                        forbidden("Wrong company")
+                    }
+
+                    requestedUserId
+                } else {
+                    callerId
+                }
+
                 val stmt = connection.prepareStatement(
                     """
                     SELECT
@@ -796,20 +977,23 @@ fun Route.trackingRoutes() {
                       s.started_at,
                       s.ended_at,
                       s.is_active,
-                      (
-                        SELECT MAX(p.ts)
-                        FROM tracking_points p
-                        WHERE p.session_id = s.id
-                      ) AS last_point_ts
+                      last_point.ts AS last_point_ts
                     FROM tracking_sessions s
+                    LEFT JOIN LATERAL (
+                      SELECT p.ts
+                      FROM tracking_points p
+                      WHERE p.session_id = s.id
+                      ORDER BY p.ts DESC
+                      LIMIT 1
+                    ) last_point ON TRUE
                     WHERE s.user_id = ?
-                      -- Overlap filter: session intersects [dayStart, dayEnd)
                       AND s.started_at < ((?::date) + interval '1 day')
                       AND COALESCE(s.ended_at, now()) >= (?::date)
                     ORDER BY s.started_at DESC
                     """.trimIndent(),
                     false
                 )
+
                 try {
                     stmt.set(1, targetUserId)
                     stmt.set(2, dateStr)
@@ -836,6 +1020,9 @@ fun Route.trackingRoutes() {
                     stmt.closeIfPossible()
                 }
             }
+
+            val totalMs = (System.nanoTime() - requestStartedAtNanos) / 1_000_000
+            println("⏱️ [tracking/me/sessions] callerId=$callerId targetUserId=${requestedUserId ?: callerId} totalMs=$totalMs")
 
             call.respond(rows)
         }
@@ -904,8 +1091,15 @@ fun Route.trackingRoutes() {
         // Returns both active and stopped sessions started on that date, scoped to admin's company.
         get("/sessions") {
             val adminId = call.requireUserId()
+            val requestStartedAtNanos = System.nanoTime()
+            var contextMs = 0L
+            var autoHealMs = 0L
+            var queryMs = 0L
+
+            val contextStartedAtNanos = System.nanoTime()
             val ctx = loadUserContext(adminId)
             requireAdmin(ctx)
+            contextMs = (System.nanoTime() - contextStartedAtNanos) / 1_000_000
 
             val dateStr = call.request.queryParameters["date"]
                 ?: throw BadRequestException("Missing date (YYYY-MM-DD)")
@@ -918,6 +1112,7 @@ fun Route.trackingRoutes() {
             val rows = transaction {
                 // Auto-heal: if attendance logs say the user is OUT, the tracking session must not remain active.
                 // This prevents "zombie" active sessions (e.g. 98 hours) when stop was not called.
+                val autoHealStartedAtNanos = System.nanoTime()
                 execUpdate(
                     """
                     WITH last_log AS (
@@ -948,6 +1143,9 @@ fun Route.trackingRoutes() {
                     """.trimIndent(),
                     listOf(ctx.companyId)
                 )
+
+                autoHealMs = (System.nanoTime() - autoHealStartedAtNanos) / 1_000_000
+                val queryStartedAtNanos = System.nanoTime()
 
                 val stmt = connection.prepareStatement(
                     """
@@ -994,12 +1192,19 @@ fun Route.trackingRoutes() {
                                 )
                             )
                         }
+                        queryMs = (System.nanoTime() - queryStartedAtNanos) / 1_000_000
                         out
                     }
                 } finally {
                     stmt.closeIfPossible()
                 }
             }
+
+            val totalMs = (System.nanoTime() - requestStartedAtNanos) / 1_000_000
+            println(
+                "⏱️ [tracking/admin-sessions] adminId=$adminId companyId=${ctx.companyId} " +
+                    "contextMs=$contextMs autoHealMs=$autoHealMs queryMs=$queryMs totalMs=$totalMs"
+            )
 
             call.respond(rows)
         }
@@ -1478,3 +1683,4 @@ private object UserHub {
         }
     }
 }
+

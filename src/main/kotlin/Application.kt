@@ -613,7 +613,7 @@ private fun buildHikariFromEnv(
             ?: error("DB_PASSWORD_NEON or DB_PASSWORD must be set")
     }
     val maxPool = if (isTest) {
-        (env["DB_MAX_POOL_TEST"] ?: "3").toInt()
+        (env["DB_MAX_POOL_TEST"] ?: "10").toInt()
     } else {
         (env["DB_MAX_POOL_NEON"] ?: env["DB_MAX_POOL"] ?: "10").toInt()
     }
