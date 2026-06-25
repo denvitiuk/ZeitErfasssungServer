@@ -213,21 +213,34 @@ private fun Transaction.findMatchingZeitPlanAssignment(
 ): MatchingZeitPlanAssignment? {
     return queryOne(
         """
-        SELECT
-          a.id AS assignment_id,
-          a.shift_id AS shift_id
-        FROM zeitplan_shift_assignments a
-        JOIN zeitplan_shifts s ON s.id = a.shift_id
-        JOIN zeitplan_plans p ON p.id = a.plan_id
-        WHERE a.user_id = ?
-          AND a.company_id = ?
-          AND a.status IN ('PLANNED', 'NOTIFIED', 'SEEN')
-          AND s.status IN ('PLANNED', 'ACTIVE')
-          AND p.status = 'ACTIVE'
-          AND s.shift_date = (now() AT TIME ZONE s.timezone)::date
-          AND (now() AT TIME ZONE s.timezone)::time BETWEEN (s.start_time - INTERVAL '2 hours')
-                                                       AND (s.end_time + INTERVAL '2 hours')
-        ORDER BY ABS(EXTRACT(EPOCH FROM (((now() AT TIME ZONE s.timezone)::time - s.start_time)))) ASC
+        WITH candidate_assignments AS (
+          SELECT
+            a.id AS assignment_id,
+            a.shift_id AS shift_id,
+            ((s.shift_date::timestamp + s.start_time) AT TIME ZONE s.timezone) AS shift_start_at,
+            (
+              (
+                (s.shift_date + CASE WHEN s.end_time <= s.start_time THEN 1 ELSE 0 END)::timestamp
+                + s.end_time
+              ) AT TIME ZONE s.timezone
+            ) AS shift_end_at
+          FROM zeitplan_shift_assignments a
+          JOIN zeitplan_shifts s ON s.id = a.shift_id
+          JOIN zeitplan_plans p ON p.id = a.plan_id
+          WHERE a.user_id = ?
+            AND a.company_id = ?
+            AND a.status IN ('PLANNED', 'NOTIFIED', 'SEEN')
+            AND s.status IN ('PLANNED', 'ACTIVE')
+            AND p.status = 'ACTIVE'
+            AND s.shift_date BETWEEN
+              ((now() AT TIME ZONE s.timezone)::date - 1)
+              AND ((now() AT TIME ZONE s.timezone)::date + 1)
+        )
+        SELECT assignment_id, shift_id
+        FROM candidate_assignments
+        WHERE now() BETWEEN (shift_start_at - INTERVAL '2 hours')
+                        AND (shift_end_at + INTERVAL '2 hours')
+        ORDER BY ABS(EXTRACT(EPOCH FROM (now() - shift_start_at))) ASC
         LIMIT 1
         """.trimIndent(),
         listOf(userId, companyId)
@@ -547,6 +560,7 @@ data class UserSessionDto(
     val isActive: Boolean,
     val lastPointTs: String? = null
 )
+
 
 @Serializable
 data class TimesheetDetailedSessionDto(

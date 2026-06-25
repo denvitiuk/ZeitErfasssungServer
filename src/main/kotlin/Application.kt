@@ -422,6 +422,16 @@ fun Application.module() {
         override suspend fun presign(userId: Long, companyId: Long?, req: PresignRequest): PresignResponse {
             throw UnsupportedOperationException("presign uploads: not wired yet (STORAGE_PROVIDER=pg)")
         }
+        override suspend fun upload(
+            userId: Long,
+            companyId: Long,
+            purpose: UploadPurpose,
+            fileName: String,
+            contentType: String,
+            bytes: ByteArray
+        ): AttachmentRef {
+            throw UnsupportedOperationException("upload: not wired yet (STORAGE_PROVIDER=pg)")
+        }
         override suspend fun downloadPgObject(id: Long): DownloadedObject? {
             // Stub implementation for compilation when STORAGE_PROVIDER=pg but DS is not wired
             return null

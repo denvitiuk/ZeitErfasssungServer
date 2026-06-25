@@ -9,6 +9,11 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.Serializable
+import io.ktor.http.content.*
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+
+
 
 
 // --- Public DTOs & Enums ---
@@ -203,6 +208,24 @@ data class DownloadedObject(
     val fileName: String? = null
 )
 
+private fun readBytesWithLimit(input: InputStream, maxBytes: Int): ByteArray? {
+    val output = ByteArrayOutputStream(minOf(maxBytes, 64 * 1024))
+    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+    var total = 0
+
+    while (true) {
+        val read = input.read(buffer)
+        if (read < 0) break
+
+        total += read
+        if (total > maxBytes) return null
+
+        output.write(buffer, 0, read)
+    }
+
+    return output.toByteArray()
+}
+
 // --- Error body (единый формат ошибок) ---
 
 @Serializable
@@ -307,9 +330,18 @@ interface DocumentRequestService {
         reason: String?
     ): LeaveBalanceDTO
 }
-
 interface DocumentUploadService {
     suspend fun presign(userId: Long, companyId: Long?, req: PresignRequest): PresignResponse
+
+    suspend fun upload(
+        userId: Long,
+        companyId: Long,
+        purpose: UploadPurpose,
+        fileName: String,
+        contentType: String,
+        bytes: ByteArray
+    ): AttachmentRef
+
     suspend fun downloadPgObject(id: Long): DownloadedObject?
 }
 
