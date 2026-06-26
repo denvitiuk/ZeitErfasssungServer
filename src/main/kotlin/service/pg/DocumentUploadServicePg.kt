@@ -1,6 +1,7 @@
 package com.yourcompany.zeiterfassung.service.pg
 
 import com.yourcompany.zeiterfassung.routes.DownloadedObject
+import com.yourcompany.zeiterfassung.routes.AttachmentRef
 
 import com.yourcompany.zeiterfassung.routes.DocumentUploadService
 import com.yourcompany.zeiterfassung.routes.PresignRequest
@@ -48,6 +49,42 @@ class DocumentUploadServicePg(
             expiresInSeconds = ttlSeconds,
             method = "POST",
             headers = emptyMap()
+        )
+    }
+
+    override suspend fun upload(
+        userId: Long,
+        companyId: Long,
+        purpose: UploadPurpose,
+        fileName: String,
+        contentType: String,
+        bytes: ByteArray
+    ): AttachmentRef {
+        require(bytes.isNotEmpty()) { "file must not be empty" }
+        require(bytes.size.toLong() <= maxSizeBytes) {
+            "file too large: max $maxSizeBytes bytes"
+        }
+        require(contentType.lowercase() in allowedContentTypes) {
+            "unsupported content type: $contentType"
+        }
+        require(fileName.isNotBlank()) { "file name is required" }
+
+        val blobId = newSuspendedTransaction {
+            DocumentFileBlobsTable.insertAndGetId {
+                it[data] = bytes
+                it[DocumentFileBlobsTable.contentType] = contentType.lowercase()
+                it[DocumentFileBlobsTable.fileName] = fileName.trim()
+                it[sizeBytes] = bytes.size.toLong()
+                it[ownerUserId] = userId.toInt()
+                it[DocumentFileBlobsTable.companyId] = companyId.toInt()
+            }.value
+        }
+
+        return AttachmentRef(
+            "pg:$blobId",
+            contentType.lowercase(),
+            fileName.trim(),
+            bytes.size.toLong()
         )
     }
 
