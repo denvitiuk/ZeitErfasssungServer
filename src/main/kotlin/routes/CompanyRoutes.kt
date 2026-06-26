@@ -433,7 +433,13 @@ fun Route.companiesRoutes() {
                     val list = transaction {
                         Users
                             .slice(Users.id, Users.firstName, Users.lastName, Users.birthDate, Users.phoneVerified)
-                            .select { Users.companyId eq EntityID(companyId, Companies) }
+                            .select {
+                                (Users.companyId eq EntityID(companyId, Companies)) and
+                                (Users.isCompanyAdmin eq false) and
+                                (Users.isGlobalAdmin eq false) and
+                                (Users.isActive eq true) and
+                                Users.deletedAt.isNull()
+                            }
                             .orderBy(Users.lastName to SortOrder.ASC)
                             .map {
                                 CompanyUserDTO(
