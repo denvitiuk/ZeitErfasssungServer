@@ -402,7 +402,15 @@ fun Route.companiesRoutes() {
                     val projectId = parseOptionalProjectId(call.request.queryParameters["projectId"])
 
                     val employeesCount = transaction {
-                        Users.select { Users.companyId eq EntityID(companyId, Companies) }.count()
+                        Users
+                            .select {
+                                (Users.companyId eq EntityID(companyId, Companies)) and
+                                (Users.isCompanyAdmin eq false) and
+                                (Users.isGlobalAdmin eq false) and
+                                (Users.isActive eq true) and
+                                Users.deletedAt.isNull()
+                            }
+                            .count()
                     }.toInt()
 
                     val activeSessions = countActiveSessions(companyId, projectId)
